@@ -55,7 +55,7 @@ set -e
 # Get the latest WROLPi code.  Use the branch requested.
 apt install -y git
 git --version
-git clone https://github.com/lrnselfreliance/wrolpi.git /opt/wrolpi || :
+git clone https://github.com/natevns08/wrolpi.git /opt/wrolpi || :
 (cd /opt/wrolpi && git fetch && git checkout "${BRANCH}" && git reset --hard origin/"${BRANCH}") || exit 4
 
 if [ ${rpi} == true ]; then
