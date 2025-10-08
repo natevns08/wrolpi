@@ -4,35 +4,40 @@ import datetime
 import functools
 import glob
 import json
-import multiprocessing
 import os
 import pathlib
 import re
 import shutil
 import subprocess
+import urllib.parse
+from collections import OrderedDict
 from itertools import zip_longest
 from pathlib import Path
-from typing import List, Tuple, Union, Dict, Generator
+from typing import List, Tuple, Union, Dict, Generator, Iterable, Set
 
 import cachetools.func
 import psycopg2
 from sqlalchemy import asc
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from wrolpi import flags
 from wrolpi.cmd import which
 from wrolpi.common import get_media_directory, wrol_mode_check, logger, limit_concurrent, \
     partition, cancelable_wrapper, \
-    get_files_and_directories, chunks_by_stem, apply_modelers, apply_refresh_cleanup, background_task, walk
-from wrolpi.dates import now, from_timestamp
+    get_files_and_directories, chunks_by_stem, apply_modelers, apply_refresh_cleanup, background_task, walk, \
+    get_wrolpi_config, \
+    timer, chunks, unique_by_predicate, get_paths_in_media_directory, TRACE_LEVEL, get_relative_to_media_directory
+from wrolpi.dates import now, from_timestamp, months_selector_to_where, date_range_to_where
 from wrolpi.db import get_db_session, get_db_curs, mogrify, optional_session
+from wrolpi.downloader import download_manager, Download
 from wrolpi.errors import InvalidFile, UnknownDirectory, UnknownFile, UnknownTag, FileConflict, FileGroupIsTagged, \
-    NoPrimaryFile
+    NoPrimaryFile, InvalidDirectory, IgnoredDirectoryError
 from wrolpi.events import Events
 from wrolpi.files.models import FileGroup, Directory
-from wrolpi.lang import ISO_639_CODES
-from wrolpi.tags import TagFile, Tag, tag_names_to_file_group_sub_select
-from wrolpi.vars import PYTEST
+from wrolpi.lang import ISO_639_CODES, ISO_3166_CODES
+from wrolpi.tags import TagFile, Tag, tag_append_sub_select_where, save_tags_config
+from wrolpi.vars import PYTEST, IS_MACOS
 
 try:
     import magic
@@ -46,8 +51,9 @@ except ImportError:
 logger = logger.getChild(__name__)
 
 __all__ = ['list_directories_contents', 'delete', 'split_path_stem_and_suffix', 'refresh_files', 'search_files',
-           'get_mimetype', 'split_file_name_words', 'get_primary_file', 'get_file_statistics', 'estimate_search',
-           'move', 'rename', 'delete_directory', 'handle_file_group_search_results']
+           'get_mimetype', 'split_file_name_words', 'get_primary_file', 'get_file_statistics',
+           'search_file_suggestion_count', 'glob_shared_stem', 'upsert_file', 'get_unique_files_by_stem',
+           'move', 'rename', 'delete_directory', 'handle_file_group_search_results', 'get_file_location_href']
 
 
 @optional_session
@@ -63,10 +69,18 @@ def get_file_tag_names(file: pathlib.Path, session: Session = None) -> List[str]
 
 def _get_file_dict(file: pathlib.Path) -> Dict:
     media_directory = get_media_directory()
+    try:
+        size = file.stat().st_size
+    except PermissionError:
+        size = None
+    try:
+        mimetype = get_mimetype(file)
+    except PermissionError:
+        mimetype = None
     return dict(
         path=file.relative_to(media_directory),
-        size=file.stat().st_size,
-        mimetype=get_mimetype(file),
+        size=size,
+        mimetype=mimetype,
         tags=get_file_tag_names(file),
     )
 
@@ -76,20 +90,37 @@ def get_file_dict(file: str) -> Dict:
     return _get_file_dict(media_directory / file)
 
 
+@optional_session
+async def set_file_viewed(file: pathlib.Path, session: Session = None):
+    """Change FileGroup.viewed to the current datetime."""
+    try:
+        fg = FileGroup.find_by_path(file, session)
+    except UnknownFile:
+        fg = FileGroup.from_paths(session, file)
+        fg.do_model(session)
+    fg.set_viewed()
+    session.commit()
+
+
 @cachetools.func.ttl_cache(10_000, 30.0)
 def _get_directory_dict(directory: pathlib.Path,
                         directories_cache: str,  # Used to cache by requested directories.
                         ) -> Dict:
     media_directory = get_media_directory()
+    try:
+        is_empty = not next(directory.iterdir(), False)
+    except PermissionError:
+        is_empty = False
     return dict(
         path=f'{directory.relative_to(media_directory)}/',
-        is_empty=not next(directory.iterdir(), False),
+        is_empty=is_empty,
     )
 
 
 def _get_recursive_directory_dict(directory: pathlib.Path, directories: List[pathlib.Path]) -> Dict:
     directories_cache = str(sorted(directories))
     d = _get_directory_dict(directory, directories_cache)
+
     if directory in directories:
         children = dict()
         for path in directory.iterdir():
@@ -103,7 +134,7 @@ def _get_recursive_directory_dict(directory: pathlib.Path, directories: List[pat
     return d
 
 
-IGNORED_DIRECTORIES = ('lost+found',)
+HIDDEN_DIRECTORIES = ('lost+found',)
 
 
 def list_directories_contents(directories_: List[str]) -> Dict:
@@ -123,7 +154,7 @@ def list_directories_contents(directories_: List[str]) -> Dict:
 
     paths = dict()
     for path in media_directory.iterdir():
-        if path.is_dir() and path.name in IGNORED_DIRECTORIES:
+        if path.is_dir() and path.name in HIDDEN_DIRECTORIES:
             # Never show ignored directories.
             continue
         if path.is_dir():
@@ -171,6 +202,9 @@ async def delete(*paths: Union[str, pathlib.Path]):
                     # File that will be deleted is in a Tagged FileGroup.
                     raise FileGroupIsTagged(f"Cannot delete {file_group} because it is tagged")
     for path in paths:
+        ignored_directories = get_wrolpi_config().ignored_directories
+        if ignored_directories and str(path) in ignored_directories:
+            remove_ignored_directory(path)
         if path.is_dir():
             delete_directory(path, recursive=True)
         else:
@@ -224,6 +258,10 @@ def _mimetype_suffix_map(path: Path, mimetype: str):
     if mimetype == 'application/x-subrip':
         # Fallback to old mimetype.
         return 'text/srt'
+    if mimetype == 'application/zip' and suffix == '.docx':
+        return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    if mimetype == 'video/x-ms-asf' and suffix == '.wma':
+        return 'audio/x-ms-wma'
     return mimetype
 
 
@@ -248,35 +286,78 @@ def get_mimetype(path: Path) -> str:
 # Special suffixes within WROLPi.
 SUFFIXES = {
     '.info.json',
+    '.live_chat.json',
+    '.readability.html',
     '.readability.json',
     '.readability.txt',
-    '.readability.html',
-    '.live_chat.json'
 }
 SUFFIXES |= {f'.{i}.srt' for i in ISO_639_CODES}
 SUFFIXES |= {f'.{i}.vtt' for i in ISO_639_CODES}
+EXTRA_SUFFIXES = set()
+for six_ in ISO_639_CODES.keys():
+    EXTRA_SUFFIXES |= {f'.{six_}-{i}.srt' for i in ISO_3166_CODES}
+    EXTRA_SUFFIXES |= {f'.{six_}-{i}.vtt' for i in ISO_3166_CODES}
+    EXTRA_SUFFIXES |= {f'.{i}-auto.srt' for i in ISO_639_CODES}
+    EXTRA_SUFFIXES |= {f'.{i}-auto.vtt' for i in ISO_639_CODES}
+
+PART_PARSER = re.compile(r'(.+?)(\.f[\d]{2,3})?(\.info)?(\.\w{3,4})(\.part)', re.IGNORECASE)
 
 
 @functools.lru_cache(maxsize=10_000)
 def split_path_stem_and_suffix(path: Union[pathlib.Path, str], full: bool = False) -> Tuple[str, str]:
     """Get the path's stem and suffix.
 
-    This function handles WROLPi suffixes like .info.json."""
-    if isinstance(path, str):
-        path = pathlib.Path(path)
+    This function handles WROLPi suffixes like .info.json.
 
-    full_ = str(path)  # May or may not be absolute.
-    suffix = next(filter(lambda i: full_.endswith(i), SUFFIXES), path.suffix)
-    if suffix and full:
-        return f'{path.parent}/{path.name[:-1 * len(suffix)]}', suffix
-    elif suffix:
-        return path.name[:-1 * len(suffix)], suffix
+    >>> split_path_stem_and_suffix('/foo/bar.txt')
+    ('bar', '.txt')
+    >>> split_path_stem_and_suffix('/foo/bar.txt', full=True)
+    ('/foo/bar', '.txt')
+    >>> split_path_stem_and_suffix('/foo/bar.info.json', full=True)
+    ('/foo/bar', '.info.json')
+    """
+    path = pathlib.Path(path) if isinstance(path, str) else path
+
+    if path.suffix == '.part':
+        # yt-dlp uses part files while downloading, include those in a FileGroup.
+        stem, info, format_num, suffix, part = PART_PARSER.match(path.name).groups()
+        info = info or ''
+        format_num = format_num or ''
+        stem = f'{path.parent}/{stem}' if full else stem
+        return stem, f'{info}{format_num}{suffix}{part}'
+
+    # May or may not be absolute.  Convert to lowercase so any suffix case can be matched.
+    full_ = str(path).lower()
+    # Get the special matching suffix, if any.  Match against `.en.srt` but could return `.EN.SRT`
+    suffix = next(filter(lambda i: full_.endswith(i), SUFFIXES), None)
+    if not suffix and (full_.endswith('.srt') or full_.endswith('.vtt')):
+        # Special handling for numerous language/region codes.
+        suffix = next(filter(lambda i: full_.endswith(i), EXTRA_SUFFIXES), path.suffix)
+    # Fallback to pathlib's suffix.
+    suffix = suffix or path.suffix
+    # Return the suffix from the path's name in the original case.
+    if suffix:
+        idx = -1 * len(suffix)
+        if full:
+            return f'{path.parent}/{path.name[:idx]}', path.name[idx:]
+        else:
+            return path.name[:idx], path.name[idx:]
 
     # Path has no suffix.
     if full:
         return f'{path.parent}/{path.name}', ''
     else:
         return path.name, ''
+
+
+def get_unique_files_by_stem(files: List[pathlib.Path] | Tuple[pathlib.Path, ...] | Set[pathlib.Path]) \
+        -> List[pathlib.Path]:
+    """Returns the first of each Path with a unique stem.  Used to detect if a group of files share a stem."""
+    results = unique_by_predicate(files, lambda i: split_path_stem_and_suffix(i)[0])
+    if logger.isEnabledFor(TRACE_LEVEL):
+        logger.trace(f'get_unique_files_by_stem {files=}')
+        logger.trace(f'get_unique_files_by_stem {results=}')
+    return results
 
 
 refresh_logger = logger.getChild('refresh')
@@ -301,7 +382,7 @@ def _paths_to_files_dict(group: List[pathlib.Path]) -> List[dict]:
     return files
 
 
-def get_primary_file(files: Union[Tuple[pathlib.Path], List[pathlib.Path]]) -> pathlib.Path:
+def get_primary_file(files: Union[Tuple[pathlib.Path], Iterable[pathlib.Path]]) -> pathlib.Path:
     """Given a list of files, return the file that we can model or index.
 
     @raise NoPrimaryFile: If not primary file can be found."""
@@ -313,7 +394,17 @@ def get_primary_file(files: Union[Tuple[pathlib.Path], List[pathlib.Path]]) -> p
         # Only one file is always the primary.
         return files[0]
 
-    file_mimetypes = [(i, get_mimetype(i)) for i in files]
+    file_mimetypes = list()
+    for idx, i in enumerate(files):
+        try:
+            file_mimetypes.append((i, get_mimetype(i)))
+        except FileNotFoundError:
+            # File was deleted.
+            pass
+
+    if not file_mimetypes:
+        raise FileNotFoundError(f'Cannot find primary file.  All files are no longer accessible: {files[0]}')
+
     # EPUB has high priority.
     mimetypes = {i[1] for i in file_mimetypes}
     has_epub = any(i.startswith('application/epub') for i in mimetypes)
@@ -431,6 +522,17 @@ def _upsert_files(files: List[pathlib.Path], idempotency: datetime.datetime):
                              (list(map(str, non_primary_files)),))
 
 
+def remove_files_in_ignored_directories(files: List[pathlib.Path]) -> List[pathlib.Path]:
+    """Return a new list which does not contain any file paths that are in ignored directories."""
+    ignored_directories = list(map(str, get_wrolpi_config().ignored_directories))
+    for idx, ignored_directory in enumerate(ignored_directories):
+        ignored_directory = pathlib.Path(ignored_directory)
+        if not ignored_directory.is_absolute():
+            ignored_directories[idx] = str(get_media_directory() / ignored_directory)
+    files = [i for i in files if not any(str(i).startswith(j) for j in ignored_directories)]
+    return files
+
+
 async def refresh_discover_paths(paths: List[pathlib.Path], idempotency: datetime.datetime = None):
     """Discover all files in the directories provided in paths, as well as all files in paths.
 
@@ -465,8 +567,16 @@ async def refresh_discover_paths(paths: List[pathlib.Path], idempotency: datetim
                 # Directory may have been deleted during refresh.
                 logger.warning(f'Cannot refresh directory because it is missing: {directory}', exc_info=e)
                 continue
+            except PermissionError as e:
+                # Directory may have been deleted during refresh.
+                logger.warning(f'Do not have permission to refresh directory: {directory}', exc_info=e)
+                continue
             directories.extend(new_directories)
             files.extend(new_files)
+
+            # Remove any files in ignored directories.
+            files = remove_files_in_ignored_directories(files)
+
             refresh_logger.debug(f'Discovered {len(new_files)} files in {directory}')
             if len(files) >= 100:
                 # Wait until there are enough files to perform the upsert.
@@ -510,30 +620,30 @@ async def refresh_discover_paths(paths: List[pathlib.Path], idempotency: datetim
         curs.execute(stmt)
 
 
-REFRESH = multiprocessing.Manager().dict()
-
-
 @limit_concurrent(1)  # Only one refresh at a time.
 @wrol_mode_check
 @cancelable_wrapper
 async def refresh_files(paths: List[pathlib.Path] = None, send_events: bool = True):
     """Find, model, and index all files in the media directory."""
+    from wrolpi.api_utils import api_app
     if isinstance(paths, str):
         paths = [pathlib.Path(paths), ]
     if isinstance(paths, pathlib.Path):
         paths = [paths, ]
 
     idempotency = now()
-    REFRESH['idempotency'] = idempotency
+    api_app.shared_ctx.refresh['idempotency'] = idempotency
 
     refreshing_all_files = False
 
-    with flags.refreshing:
+    with flags.refreshing, timer('refresh_files', 'info'):
+        api_app.shared_ctx.refresh['counted_files'] = 0
         if not paths:
             refresh_logger.warning('Refreshing all files')
             refreshing_all_files = True
         else:
-            refresh_logger.warning(f'Refreshing {", ".join(list(map(str, paths)))}')
+            refresh_msg = ", ".join(list(map(str, paths)))
+            refresh_logger.warning(f'Refreshing {refresh_msg[:1000]}')
         if send_events:
             Events.send_global_refresh_started()
 
@@ -546,13 +656,17 @@ async def refresh_files(paths: List[pathlib.Path] = None, send_events: bool = Tr
             with flags.refresh_counting:
                 while directories:
                     directory = directories.pop()
-                    files, dirs = get_files_and_directories(directory)
+                    try:
+                        files, dirs = get_files_and_directories(directory)
+                    except PermissionError as e:
+                        refresh_logger.error(f'Error refreshing {directory}', exc_info=e)
+                        continue
                     directories.extend(dirs)
                     found_directories |= set(dirs)
-                    REFRESH['counted_files'] = REFRESH.get('counted_files', 0) + len(files)
+                    add_files_to_refresh_count(len(files))
                     # Sleep to catch cancel.
                     await asyncio.sleep(0)
-                refresh_logger.info(f'Counted {REFRESH["counted_files"]} files')
+                refresh_logger.info(f'Counted {api_app.shared_ctx.refresh["counted_files"]} files')
 
         with flags.refresh_discovery:
             await refresh_discover_paths(paths, idempotency)
@@ -578,7 +692,7 @@ async def refresh_files(paths: List[pathlib.Path] = None, send_events: bool = Tr
             with get_db_session() as session:
                 parent_directories = {i[0] for i in session.query(Directory.path).filter(Directory.path.in_(paths))}
                 parent_directories |= set(filter(lambda i: i.is_dir(), paths))
-            await upsert_directories(parent_directories, found_directories)
+            upsert_directories(parent_directories, found_directories)
 
             if send_events:
                 Events.send_global_after_refresh_completed()
@@ -590,6 +704,8 @@ async def refresh_files(paths: List[pathlib.Path] = None, send_events: bool = Tr
             flags.refresh_complete.set()
         if send_events:
             Events.send_refresh_completed()
+
+    api_app.shared_ctx.refresh['counted_files'] = 0
 
 
 async def apply_indexers():
@@ -627,7 +743,7 @@ async def apply_indexers():
                 break
 
 
-async def upsert_directories(parent_directories, directories):
+def upsert_directories(parent_directories, directories):
     """
     Insert/update/delete directories provided.  Deletes all children of `parent_directories` which are not in
     `directories`.
@@ -636,8 +752,7 @@ async def upsert_directories(parent_directories, directories):
     directories = list(directories) + list(parent_directories)
 
     # Only insert directories that are children of `media_directory` and exist.
-    media_directory = get_media_directory()
-    directories = [i for i in directories if i.is_dir() and i != media_directory]
+    directories = get_paths_in_media_directory([i for i in directories if i.is_dir()])
 
     if directories:
         # Insert any directories that were created, update any directories which previously existed.
@@ -672,55 +787,47 @@ async def search_directories_by_name(name: str, excluded: List[str] = None, limi
 
 
 def search_files(search_str: str, limit: int, offset: int, mimetypes: List[str] = None, model: str = None,
-                 tags: List[str] = None, headline: bool = False) -> \
+                 tag_names: List[str] = None, headline: bool = False, months: List[int] = None,
+                 from_year: int = None, to_year: int = None, any_tag: bool = False, order: str = None) -> \
         Tuple[List[dict], int]:
     """Search the FileGroup table.
 
     Order the returned Files by their rank if `search_str` is provided.  Return all files if
     `search_str` is empty.
 
-    Parameters:
-        search_str: Search the ts_vector of the file.  Returns all files if this is empty.
-        limit: Return only this many files.
-        offset: Offset the query.
-        mimetypes: Only return files that match these mimetypes.
-        model: Only return files that match this model.
-        tags: A list of tag names.
-        headline: Includes Postgresql headline if True.
+    @param any_tag: The file must have some tag.
+    @param to_year: The file must be published on or before this year.
+    @param from_year: The file must be published on or after this year.
+    @param search_str: Search the ts_vector of the file.  Returns all files if this is empty.
+    @param limit: Return only this many files.
+    @param offset: Offset the query.
+    @param mimetypes: Only return files that match these mimetypes.
+    @param model: Only return files that match this model.
+    @param tag_names: A list of tag names.
+    @param headline: Includes Postgresql headline if True.
+    @param months: A list of integers representing the index of the month of the year, starting at 1.
+    @param order: Used to change results from most relevant to recently viewed.
     """
-    params = dict(offset=offset, limit=limit)
+    params = dict(offset=offset, limit=limit, search_str=search_str, url_search_str=f'%{search_str}%')
     wheres = []
     selects = []
     order_by = '1 ASC'
     joins = []
 
     if search_str:
-        params['search_str'] = search_str
+        # Search by textsearch column.
         wheres.append('textsearch @@ websearch_to_tsquery(%(search_str)s)')
         selects.append('ts_rank(textsearch, websearch_to_tsquery(%(search_str)s))')
         order_by = '2 DESC'
 
-    if mimetypes:
-        mimetype_wheres = []
-        for idx, mimetype in enumerate(mimetypes):
-            key = f'mimetype{idx}'
-            if len(mimetype.split('/')) == 1:
-                params[key] = f'{mimetype}/%'
-            else:
-                params[key] = f'{mimetype}%'
-            mimetype_wheres.append(f'mimetype LIKE %({key})s')
-        mimetype_wheres = ' OR '.join(mimetype_wheres)
-        wheres.append(f'({mimetype_wheres})')
-
+    wheres, params = mimetypes_to_sql_wheres(wheres, params, mimetypes)
     if model:
         params['model'] = model
         wheres.append('model = %(model)s')
 
-    if tags:
-        # Filter all FileGroups by those that have been tagged with the provided tag names.
-        tags_stmt, params_ = tag_names_to_file_group_sub_select(tags)
-        params.update(params_)
-        wheres.append(f'fg.id = ANY({tags_stmt})')
+    wheres, params = tag_append_sub_select_where(wheres, params, tag_names, any_tag)
+    wheres, params = months_selector_to_where(wheres, params, months)
+    wheres, params = date_range_to_where(wheres, params, from_year, to_year)
 
     if search_str and headline:
         headline = ''',
@@ -731,6 +838,15 @@ def search_files(search_str: str, limit: int, offset: int, mimetypes: List[str] 
     else:
         headline = ''
 
+    if order == 'viewed':
+        order_by = 'viewed DESC NULLS LAST, 1 ASC'
+    elif order == '-viewed':
+        order_by = 'viewed ASC NULLS LAST, 1 ASC'
+
+    if order and not search_str:
+        # Only filter out unviewed files if search_str is not provided.
+        wheres.append('viewed IS NOT NULL')
+
     wheres = '\n AND '.join(wheres)
     selects = f"{', '.join(selects)}, " if selects else ""
     join = '\n'.join(joins)
@@ -740,7 +856,6 @@ def search_files(search_str: str, limit: int, offset: int, mimetypes: List[str] 
         FROM file_group fg
         {join}
         {f"WHERE {wheres}" if wheres else ""}
-        GROUP BY fg.id
         ORDER BY {order_by}
         OFFSET %(offset)s LIMIT %(limit)s
     '''
@@ -811,44 +926,44 @@ def glob_shared_stem(path: pathlib.Path) -> List[pathlib.Path]:
     >>> glob_shared_stem(pathlib.Path('foo.mp4'))
     ['foo.mp4', 'foo.png', 'foo.info.json']
     """
-    if isinstance(path, str):
-        path = pathlib.Path(path)
+    path = path if isinstance(path, pathlib.Path) else pathlib.Path(path)
 
     stem, suffix = split_path_stem_and_suffix(path)
     escaped_stem = glob.escape(stem)
-    paths = [pathlib.Path(i) for i in path.parent.glob(f'{escaped_stem}*') if
-             split_path_stem_and_suffix(i)[0] == stem]
+    paths = [pathlib.Path(i) for i in path.parent.glob(f'{escaped_stem}*')
+             if i == path or i.name.startswith(f'{stem}.')]
     return paths
 
 
-def get_matching_directories(path: Union[str, Path]) -> List[str]:
+def get_matching_directories(path: Union[str, Path]) -> List[pathlib.Path]:
     """
-    Return a list of directory strings that start with the provided path.  If the path is a directory, return it's
+    Return a list of directory strings that start with the provided path. If the path is a directory, return its
     subdirectories, if the directory contains no subdirectories, return the directory.
     """
-    path = str(path)
+    path: pathlib.Path = pathlib.Path(path) if isinstance(path, str) else path
+    path = path.resolve()
 
-    ignored_directories = {}
+    ignored_directories = {pathlib.Path(i).resolve() for i in get_wrolpi_config().ignored_directories}
 
-    if os.path.isdir(path):
+    if path.is_dir():
         # The provided path is a directory, return its subdirectories, or itself if no subdirectories exist
-        paths = [os.path.join(path, i) for i in os.listdir(path)]
-        paths = sorted(i for i in paths if os.path.isdir(i) and i not in ignored_directories)
+        paths = list(path.iterdir())
+        paths = sorted(i for i in paths if i.is_dir() and i not in ignored_directories)
         if len(paths) == 0:
-            return [path]
+            return [get_real_path_name(path.resolve())]
         return paths
 
-    head, tail = os.path.split(path)
-    paths = os.listdir(head)
-    paths = [os.path.join(head, i) for i in paths]
-    pattern = path.lower()
+    paths = path.parent.iterdir()
+    prefix = path.name.lower()
     paths = sorted(
-        i for i in paths if os.path.isdir(i) and i.lower().startswith(pattern) and i not in ignored_directories)
+        i for i in paths if i.is_dir() and i.name.lower().startswith(prefix) and i.resolve() not in ignored_directories
+    )
+    paths = unique_by_predicate(paths, None)
 
     return paths
 
 
-WHITESPACE = re.compile(r'[\s_]')
+WHITESPACE = re.compile(r'[\s_\[\]()]')
 
 
 def split_file_name_words(name: str) -> str:
@@ -874,7 +989,7 @@ def split_file_name_words(name: str) -> str:
         if suffix:
             words.append(suffix.lstrip('.'))
 
-        words = ' '.join(words)
+        words = ' '.join(i for i in words if i)
         return words
     except Exception as e:
         logger.error(f'Failed to split filename into words: {name}', exc_info=e)
@@ -884,20 +999,23 @@ def split_file_name_words(name: str) -> str:
 def get_file_statistics():
     with get_db_curs() as curs:
         curs.execute('''
-        SELECT
-            -- All items in file_group.files are real individual files.
-            SUM(json_array_length(files)) AS "total_count",
-            COUNT(id) FILTER (WHERE file_group.mimetype = 'application/pdf') AS "pdf_count",
-            COUNT(id) FILTER (WHERE file_group.mimetype = 'application/zip') AS "zip_count",
-            COUNT(id) FILTER (WHERE file_group.mimetype LIKE 'video/%') AS "video_count",
-            COUNT(id) FILTER (WHERE file_group.mimetype LIKE 'image/%') AS "image_count",
-            COUNT(id) FILTER (WHERE file_group.mimetype LIKE 'audio/%') AS "audio_count",
-            COUNT(id) FILTER (WHERE file_group.mimetype = 'application/epub+zip' OR file_group.mimetype = 'application/x-mobipocket-ebook') AS "ebook_count",
-            SUM(size)::BIGINT AS "total_size",
-            (SELECT COUNT(*) FROM archive) AS archive_count
-        FROM
-            file_group
-        ''')
+                     SELECT
+                         -- All items in file_group.files are real individual files.
+                         SUM(json_array_length(files))                                                                             AS "total_count",
+                         COUNT(id) FILTER (WHERE file_group.mimetype = 'application/pdf')                                          AS "pdf_count",
+                         COUNT(id) FILTER (WHERE file_group.mimetype = 'application/zip')                                          AS "zip_count",
+                         COUNT(id) FILTER (WHERE file_group.mimetype LIKE 'video/%')                                               AS "video_count",
+                         COUNT(id) FILTER (WHERE file_group.mimetype LIKE 'image/%')                                               AS "image_count",
+                         COUNT(id) FILTER (WHERE file_group.mimetype LIKE 'audio/%')                                               AS "audio_count",
+                         COUNT(id) FILTER (WHERE file_group.mimetype = 'application/epub+zip' OR file_group.mimetype =
+                                                                                                 'application/x-mobipocket-ebook') AS "ebook_count",
+                         (SELECT COUNT(DISTINCT tag_file.file_group_id) FROM tag_file)                                             AS "tagged_files",
+                         (SELECT COUNT(DISTINCT tag_zim.zim_entry) FROM tag_zim)                                                   AS "tagged_zims",
+                         (SELECT COUNT(*) FROM tag)                                                                                AS "tags_count",
+                         SUM(size)::BIGINT                                                                                         AS "total_size",
+                         (SELECT COUNT(*) FROM archive)                                                                            AS archive_count
+                     FROM file_group
+                     ''')
         statistics = dict(curs.fetchall()[0])
         statistics['total_count'] = statistics['total_count'] or 0
         statistics['total_size'] = statistics['total_size'] or 0
@@ -941,13 +1059,11 @@ async def _get_tag_and_file_group(file_group_id: int, file_group_primary_path: s
             raise UnknownFile(f'Cannot find FileGroup with id {file_group_id}')
     elif file_group_primary_path:
         path = get_media_directory() / file_group_primary_path
-        file_group: FileGroup = session.query(FileGroup).filter_by(primary_path=str(path)).one_or_none()
+
+        file_group = FileGroup.get_by_path(path, session=session)
+        # Create the FileGroup, if possible.
         if not file_group and path.is_file():
-            # File may not have been refreshed.
-            await refresh_discover_paths([path])
-            session.flush()
-            file_group: FileGroup = session.query(FileGroup).filter_by(primary_path=str(path)).one_or_none()
-            background_task(refresh_files([path]))
+            file_group = FileGroup.from_paths(session, path)
 
         if not file_group:
             raise UnknownFile(f'Cannot find FileGroup with primary_path {repr(str(file_group_primary_path))}')
@@ -959,7 +1075,7 @@ async def _get_tag_and_file_group(file_group_id: int, file_group_primary_path: s
         if not tag:
             raise UnknownTag(f'Cannot find Tag with id {tag_id}')
     elif tag_name:
-        tag: Tag = Tag.find_by_name(tag_name, session)
+        tag: Tag = Tag.get_by_name(tag_name, session)
         if not tag:
             raise UnknownTag(f'Cannot find Tag with name {tag_name}')
     else:
@@ -972,7 +1088,7 @@ async def _get_tag_and_file_group(file_group_id: int, file_group_primary_path: s
 async def add_file_group_tag(file_group_id: int, file_group_primary_path: str, tag_name: str, tag_id: int,
                              session: Session = None) -> TagFile:
     file_group, tag = await _get_tag_and_file_group(file_group_id, file_group_primary_path, tag_name, tag_id, session)
-    tag_file = file_group.add_tag(tag, session)
+    tag_file = file_group.add_tag(tag.id, session)
     return tag_file
 
 
@@ -980,7 +1096,7 @@ async def add_file_group_tag(file_group_id: int, file_group_primary_path: str, t
 async def remove_file_group_tag(file_group_id: int, file_group_primary_path: str, tag_name: str, tag_id: int,
                                 session: Session = None):
     file_group, tag = await _get_tag_and_file_group(file_group_id, file_group_primary_path, tag_name, tag_id, session)
-    file_group.remove_tag(tag, session)
+    file_group.untag(tag.id, session)
 
 
 @dataclasses.dataclass
@@ -997,7 +1113,7 @@ class RefreshProgress:
     total_file_groups: int = 0
     unindexed: int = 0
 
-    def __json__(self):
+    def __json__(self) -> dict:
         d = dict(
             counted_files=self.counted_files,
             counting=self.counting,
@@ -1015,28 +1131,30 @@ class RefreshProgress:
 
 
 def get_refresh_progress() -> RefreshProgress:
-    idempotency = REFRESH.get('idempotency')
+    from wrolpi.api_utils import api_app
+
+    idempotency = api_app.shared_ctx.refresh.get('idempotency')
     if idempotency:
         stmt = '''
-            SELECT
-                -- Sum all the files in each FileGroup.
-                SUM(json_array_length(files)) FILTER (WHERE idempotency=%(idempotency)s) AS "total_file_groups",
-                COUNT(id) FILTER (WHERE indexed IS TRUE AND idempotency=%(idempotency)s) AS "indexed",
-                COUNT(id) FILTER (WHERE indexed IS FALSE) AS "unindexed",
-                COUNT(id) FILTER (WHERE model IS NOT NULL AND idempotency=%(idempotency)s) AS "modeled"
-            FROM file_group
-        '''
+               SELECT
+                   -- Sum all the files in each FileGroup.
+                   SUM(json_array_length(files)) FILTER (WHERE idempotency = %(idempotency)s)   AS "total_file_groups",
+                   COUNT(id) FILTER (WHERE indexed IS TRUE AND idempotency = %(idempotency)s)   AS "indexed",
+                   COUNT(id) FILTER (WHERE indexed IS FALSE)                                    AS "unindexed",
+                   COUNT(id) FILTER (WHERE model IS NOT NULL AND idempotency = %(idempotency)s) AS "modeled"
+               FROM file_group \
+               '''
     else:
         # Idempotency has not yet been declared.
         stmt = '''
-            SELECT
-                -- Sum all the files in each FileGroup.
-                SUM(json_array_length(files)) AS "total_file_groups",
-                COUNT(id) FILTER (WHERE indexed IS TRUE) AS "indexed",
-                COUNT(id) FILTER (WHERE indexed IS FALSE) AS "unindexed",
-                COUNT(id) FILTER (WHERE model IS NOT NULL) AS "modeled"
-            FROM file_group
-        '''
+               SELECT
+                   -- Sum all the files in each FileGroup.
+                   SUM(json_array_length(files))              AS "total_file_groups",
+                   COUNT(id) FILTER (WHERE indexed IS TRUE)   AS "indexed",
+                   COUNT(id) FILTER (WHERE indexed IS FALSE)  AS "unindexed",
+                   COUNT(id) FILTER (WHERE model IS NOT NULL) AS "modeled"
+               FROM file_group \
+               '''
 
     with get_db_curs() as curs:
         curs.execute(stmt, dict(idempotency=idempotency))
@@ -1044,7 +1162,7 @@ def get_refresh_progress() -> RefreshProgress:
         # TODO counts are wrong if we are not refreshing all files.
 
         progress = RefreshProgress(
-            counted_files=REFRESH.get('counted_files', 0),
+            counted_files=api_app.shared_ctx.refresh.get('counted_files', 0),
             counting=flags.refresh_counting.is_set(),
             discovery=flags.refresh_discovery.is_set(),
             indexed=int(results['indexed'] or 0),
@@ -1060,31 +1178,54 @@ def get_refresh_progress() -> RefreshProgress:
     return progress
 
 
-async def estimate_search(search_str: str, tag_names: List[str]):
+def mimetypes_to_sql_wheres(wheres: List[str], params: dict, mimetypes: List[str]) -> Tuple[List[str], dict]:
+    if mimetypes:
+        local_wheres = list()
+        for idx, mimetype in enumerate(mimetypes):
+            key = f'mimetype{idx}'
+            if len(mimetype.split('/')) == 1:
+                params[key] = f'{mimetype}/%'
+            else:
+                params[key] = f'{mimetype}%'
+            local_wheres.append(f'mimetype LIKE %({key})s')
+        wheres.append(f'({" OR ".join(local_wheres)})')
+    return wheres, params
+
+
+async def search_file_suggestion_count(search_str: str, tag_names: List[str], mimetypes: List[str],
+                                       months: List[int] = None, from_year: int = None, to_year: int = None,
+                                       any_tag: bool = False):
+    """
+    Return FileGroup count of what will be returned if the search is actually performed.
+    """
+    wheres = []
+    joins = list()
+    params = dict(search_str=search_str, tag_names=tag_names, mimetypes=mimetypes)
+    group_by = ''
+    having = ''
+
+    if search_str:
+        # Search by textsearch, and by matching url.
+        wheres.append('fg.textsearch @@ websearch_to_tsquery(%(search_str)s)')
+
+    wheres, params = tag_append_sub_select_where(wheres, params, tag_names, any_tag)
+    wheres, params = mimetypes_to_sql_wheres(wheres, params, mimetypes)
+    wheres, params = months_selector_to_where(wheres, params, months)
+    wheres, params = date_range_to_where(wheres, params, from_year, to_year)
+
+    joins = "\n".join(joins)
+    wheres = 'WHERE ' + "\nAND ".join(wheres) if wheres else ''
+    stmt = f'''
+        SELECT COUNT(*) OVER() AS estimate
+        FROM file_group fg
+            {joins}
+        {wheres}
+        {group_by}
+        {having}
+    '''
+    logger.debug(stmt, params)
+
     with get_db_curs() as curs:
-        if search_str and tag_names:
-            params = dict(search_str=search_str, tag_names=tag_names)
-            stmt = '''
-            SELECT COUNT(*) OVER() AS estimate
-            FROM file_group
-                LEFT JOIN tag_file tf on file_group.id = tf.file_group_id
-            WHERE textsearch @@ websearch_to_tsquery(%(search_str)s)
-                AND tf.tag_id IN (select id from tag where name = ANY(%(tag_names)s))
-            '''
-        elif tag_names:
-            params = dict(tag_names=tag_names)
-            stmt = '''
-            SELECT COUNT(*) OVER() AS estimate
-            FROM file_group
-                LEFT JOIN tag_file tf on file_group.id = tf.file_group_id
-            WHERE tf.tag_id IN (select id from tag where name = ANY(%(tag_names)s))'''
-        else:
-            params = dict(search_str=search_str)
-            stmt = '''
-            SELECT COUNT(*) OVER() AS estimate
-            FROM file_group
-            WHERE textsearch @@ websearch_to_tsquery(%(search_str)s)
-            '''
         curs.execute(stmt, params)
         result = curs.fetchone()
         if result:
@@ -1092,7 +1233,17 @@ async def estimate_search(search_str: str, tag_names: List[str]):
         return 0
 
 
-def _move(destination: pathlib.Path, *sources: pathlib.Path) -> List[Tuple[pathlib.Path, pathlib.Path]]:
+MOVE_CHUNK_SIZE = 100
+
+
+def add_files_to_refresh_count(count: int):
+    from wrolpi.api_utils import api_app
+    count = api_app.shared_ctx.refresh.get('counted_files', 0) + count
+    api_app.shared_ctx.refresh['counted_files'] = count
+
+
+async def _move(destination: pathlib.Path, *sources: pathlib.Path, session: Session) \
+        -> OrderedDict[pathlib.Path, pathlib.Path]:
     media_directory = get_media_directory()
     for source in sources:
         if not str(source).startswith(str(media_directory)):
@@ -1101,69 +1252,165 @@ def _move(destination: pathlib.Path, *sources: pathlib.Path) -> List[Tuple[pathl
         raise FileNotFoundError(f'{destination} is not within the media directory')
 
     destination_existed = destination.is_dir()
+    destination.mkdir(parents=True, exist_ok=True)
 
-    # [ (pathlib.Path('source'), pathlib.Path('destination')), ... ]
-    plan = list()
-    unique_paths = set()
-    # Get all files that need to be moved.  Check for destination conflicts.
-    for source in sources:
-        if source.is_dir():
-            # Recursively move the directory's files.
-            for path in walk(source):
-                new_file = destination / path.relative_to(media_directory)
-                if new_file.exists():
-                    raise FileConflict(f'Cannot move {path} to {new_file} because it already exists')
-                if path not in unique_paths:
-                    plan.append((path, new_file))
-                    unique_paths.add(path)
-        elif source.is_file():
-            # Move all files associated with the source file.
-            for file in glob_shared_stem(source):
-                new_file = destination / file.name
-                if new_file.exists():
-                    raise FileConflict(f'Cannot move {file} to {new_file} because it already exists')
-                if file not in unique_paths:
-                    plan.append((file, new_file))
-                    unique_paths.add(file)
+    # The files that will be moved.  [ (old_file, new_file), ... ]
+    plan: Dict[pathlib.Path, pathlib.Path] = dict()
+    # Directories that will need to be cleaned up.
+    old_directories = unique_by_predicate(i if i.is_dir() else i.parent for i in sources)
 
-    logger.info(f'Executing move plan with {len(plan)} steps.')
+    def add_file_group_to_plan(file_group_: FileGroup):
+        primary_path_ = file_group_.primary_path
+        if primary_path_ not in plan:
+            new_primary_path_ = destination / primary_path_.name
+            if new_primary_path_.exists():
+                raise FileExistsError(f'Cannot move file because it already exists: {new_primary_path_}')
+            plan[primary_path_] = new_primary_path_
 
-    # Track the steps performed so they can be reversed.
-    revert_plan = list()
+    def add_source_file_group_to_plan(file_group_: FileGroup, source_: pathlib.Path):
+        primary_path_ = file_group_.primary_path
+        if primary_path_ not in plan:
+            new_primary_path_ = destination / source_.name / primary_path_.relative_to(source)
+            if new_primary_path_.exists():
+                raise FileExistsError(f'Cannot move file because it already exists: {new_primary_path_}')
+            plan[primary_path_] = new_primary_path_
 
-    def do_plan(plan_):
-        # Move deepest files first.
-        plan_ = sorted(plan_, key=lambda i: (len(i[0].parents), i[0].name), reverse=True)
-        for old_file, new_file in plan_:  # noqa
-            new_file.parent.mkdir(parents=True, exist_ok=True)
-            logger.debug(f'Moving {old_file} to {new_file}')
-            # if not new_file.exists():
-            shutil.move(str(old_file), str(new_file))
-            logger.debug(f'Moved {old_file} to {new_file}')
-            revert_plan.append((new_file, old_file))
-        # Move is complete.
-        return plan_
+    # Sources may be a list of files, we only want to issue a query for one file in each FileGroup.
+    sources = get_unique_files_by_stem(sources)
+    logger.info(f'move got {len(sources)} to move')
 
-    try:
-        plan = do_plan(plan)
+    with flags.refresh_counting:
         for source in sources:
-            if source.is_dir():
-                delete_directory(source)
-        logger.info(f'Move execution completed')
-        return plan
-    except Exception as e:
-        logger.error(f'Move failed', exc_info=e)
-        # Move files back.
-        do_plan(revert_plan)
-        # Delete the directories that were created.
-        directories = sorted(walk(destination), key=lambda i: len(i.parents), reverse=True)
-        for path in directories:
-            if path.is_dir():
-                delete_directory(path)
-        # Remove destination only if it did not exist at the start.
-        if destination.is_dir() and destination_existed is False:
-            delete_directory(destination)
-        raise
+            if source.is_file():
+                # Get any FileGroups that share the source's stem.
+                files = glob_shared_stem(source)
+                file_groups = session.query(FileGroup).filter(FileGroup.primary_path.in_(files)).all()
+                if not file_groups:
+                    # No FileGroups for this source file, create one.
+                    try:
+                        fg = FileGroup.from_paths(session, *files)
+                        file_groups = [fg, ]
+                    except NoPrimaryFile:
+                        for file in files:
+                            fg = FileGroup.from_paths(session, file)
+                            add_file_group_to_plan(fg)
+                add_files_to_refresh_count(len(file_groups))
+                for fg in file_groups:
+                    add_file_group_to_plan(fg)
+                # Sleep to catch cancel.
+                await asyncio.sleep(0)
+            elif source.is_dir():
+                stmt = 'SELECT primary_path FROM file_group WHERE primary_path LIKE :like'
+                for (primary_path,) in session.execute(stmt, dict(like=f'{source}%')):
+                    primary_path = pathlib.Path(primary_path)
+                    if primary_path not in plan:
+                        new_primary_path = destination / source.name / primary_path.relative_to(source)
+                        if new_primary_path.exists():
+                            raise FileExistsError(f'Cannot move file because it already exists: {new_primary_path}')
+                        plan[primary_path] = new_primary_path
+                        add_files_to_refresh_count(1)
+
+                    # Sleep to catch cancel.
+                    await asyncio.sleep(0)
+
+                # Move directories of this source.
+                for directory in (i for i in walk(source) if i.is_dir()):
+                    new_directory = destination / source.name / directory.relative_to(source)
+                    plan[directory] = new_directory
+
+                # Find any files in this directory that are not yet in the DB and add them to the plan.
+                files = {i for i in walk(source) if i.is_file()}
+                if missing_files := files - set(plan.keys()):
+                    for paths in group_files_by_stem(missing_files):
+                        try:
+                            # Only create the FileGroup if a primary_path can be found.
+                            get_primary_file(paths)
+                            file_group = FileGroup.from_paths(session, *paths)
+                            add_files_to_refresh_count(1)
+                            add_source_file_group_to_plan(file_group, source)
+                        except NoPrimaryFile:
+                            # No primary path for these paths, create FileGroups for each.
+                            add_files_to_refresh_count(1)
+                            for file in paths:
+                                fg = FileGroup.from_paths(session, file)
+                                add_source_file_group_to_plan(fg, source)
+
+                        # Sleep to catch cancel.
+                        await asyncio.sleep(0)
+            else:
+                raise UnknownFile(f'Unknown path type, cannot move: {source}')
+
+    # Sort plan by the deepest files first.
+    plan: OrderedDict = OrderedDict(sorted(plan.items(), key=lambda i: (len(i[0].parents), i[0].name), reverse=True))
+
+    # Revert plan is built out as files are moved.
+    revert_plan = OrderedDict()
+    new_directories = set()
+
+    def do_plan(plan_: OrderedDict[pathlib.Path, pathlib.Path]):
+        """Apply the move plan to all the FileGroups.
+
+        @warning: Cannot be cancelled!"""
+        # Move FileGroups in groups.
+        for chunk in chunks(plan_.items(), MOVE_CHUNK_SIZE):
+            old_paths = [i for i, j in chunk]
+            old_files, old_directories_ = partition(lambda i: i.is_file(), old_paths)
+            file_groups_ = session.query(FileGroup).filter(FileGroup.primary_path.in_(old_files)).all()
+            if len(file_groups_) != len(old_files):
+                # We ensured there are FileGroups while building the plan, maybe user deleted a file?
+                raise RuntimeError('Could not get all FileGroups for move')
+
+            for file_group_ in file_groups_:
+                old_file = file_group_.primary_path
+                new_primary_path_ = plan_[old_file]
+                parent = new_primary_path_.parent
+                parent.mkdir(parents=True, exist_ok=True)
+                if parent not in new_directories:
+                    new_directories.add(parent)
+                file_group_.move(new_primary_path_)
+                revert_plan[new_primary_path_] = old_file
+            for directory_ in old_directories_:
+                delete_directory(directory_)
+
+            existing_directories = {i[0] for i in session.query(Directory.path)}
+            missing_directories = new_directories - existing_directories
+            for directory_ in missing_directories:
+                session.add(Directory(path=directory_, name=directory_.name))
+
+            # Don't forget what has moved.
+            session.flush(file_groups_)
+
+    with flags.refresh_discovery:
+        try:
+            do_plan(plan)
+            for source in sources:
+                if source.is_dir():
+                    delete_directory(source)
+            logger.info(f'Move execution completed')
+        except Exception as e:
+            logger.error(f'Move failed', exc_info=e)
+            new_directories = set()
+            # Move files back.  Get copy because do_plan will change the revert plan.
+            do_plan(revert_plan.copy())
+            # Delete the directories that were created.
+            directories = sorted(walk(destination), key=lambda i: len(i.parents), reverse=True)
+            for path in directories:
+                if path.is_dir():
+                    delete_directory(path)
+            # Remove destination only if it did not exist at the start.
+            if destination.is_dir() and destination_existed is False:
+                delete_directory(destination)
+            raise
+
+        # Clean up any old Directory records.
+        for old_directory in old_directories:
+            # Delete directories that do no exist, or are empty.
+            if not old_directory.is_dir() or next(old_directory.iterdir(), None) is None:
+                directories = session.query(Directory).filter(Directory.path.like(str(old_directory)))
+                for directory in directories:
+                    session.delete(directory)
+
+    return plan
 
 
 def delete_directory(directory: pathlib.Path, recursive: bool = False):
@@ -1177,7 +1424,7 @@ def delete_directory(directory: pathlib.Path, recursive: bool = False):
                 .join(TagFile, TagFile.file_group_id == FileGroup.id) \
                 .limit(1).one_or_none()
             if tagged:
-                raise FileGroupIsTagged()
+                raise FileGroupIsTagged(f'Cannot delete {tagged} because it is tagged')
         shutil.rmtree(directory)
     else:
         directory.rmdir()
@@ -1186,39 +1433,37 @@ def delete_directory(directory: pathlib.Path, recursive: bool = False):
         curs.execute(stmt, (str(directory),))
 
 
-async def move(destination: pathlib.Path, *sources: pathlib.Path) -> List[Tuple[pathlib.Path, pathlib.Path]]:
+@optional_session
+async def move(destination: pathlib.Path, *sources: pathlib.Path, session: Session = None) \
+        -> OrderedDict[pathlib.Path, pathlib.Path]:
     """Moves a file or directory (recursively), preserving applied Tags.
 
     If the move fails at any point, the files will be returned to their previous locations.
 
-    Returns a list of tuples, the first Path in the tuple is the file's old location, the second Path is where the file
-    was moved.
+    Returns an OrderedDict, the key is the file's old location, the value is where the file was moved.
     """
-    # Move the files first, if this fails it will revert itself and raise an error.
-    plan = _move(destination, *sources)
+    if not session:
+        raise RuntimeError('`session` is required')
 
-    # Files were moved, migrate any Tags.
-    plan_map = {old: new for old, new in plan}
-    with get_db_session(commit=True) as session:
-        old_file_paths = list(plan_map.keys())
-        old_files: List[Tuple[FileGroup, TagFile]] = session.query(FileGroup, TagFile) \
-            .filter(FileGroup.primary_path.in_(old_file_paths)) \
-            .join(TagFile, TagFile.file_group_id == FileGroup.id).all()
-        logger.info(f'Moving {len(old_files)} tagged files')
-        for old_file, _ in old_files:
-            try:
-                new_file_path = plan_map[old_file.primary_path]
-                logger.info(f'Moving tagged file {old_file.primary_path} to {new_file_path}')
-                old_file.move(new_file_path, move_files=False)
-            except KeyError as e:
-                # Got a duplicate?
-                logger.error('Error during tag migration', exc_info=e)
-        session.commit()
+    with flags.refreshing:
+        from wrolpi.api_utils import api_app
+        api_app.shared_ctx.refresh['counted_files'] = 0
 
-    if PYTEST:
-        await refresh_files([destination, *sources])
-    else:
-        background_task(refresh_files([destination, *sources]))
+        # Move the files, if this fails it will revert itself and raise an error.
+        with timer('moving files', 'info'):
+            plan = await _move(destination, *sources, session=session)
+            session.commit()
+
+        with flags.refresh_indexing:
+            await apply_indexers()
+
+        with flags.refresh_modeling:
+            await apply_modelers()
+
+        with flags.refresh_cleanup:
+            await apply_refresh_cleanup()
+            # Save tags now that files have been moved.
+            save_tags_config.activate_switch()
 
     return plan
 
@@ -1232,7 +1477,7 @@ async def rename_file(path: pathlib.Path, new_name: str) -> pathlib.Path:
         raise FileConflict(f'Cannot rename {path} because {new_path} already exists')
 
     with get_db_session(commit=True) as session:
-        fg = session.query(FileGroup).filter(FileGroup.primary_path == path).one_or_none()
+        fg: FileGroup = session.query(FileGroup).filter(FileGroup.primary_path == path).one_or_none()
         if not fg:
             # File wasn't yet in the DB.
             fg = FileGroup.from_paths(session, path)
@@ -1241,24 +1486,176 @@ async def rename_file(path: pathlib.Path, new_name: str) -> pathlib.Path:
     return new_path
 
 
-async def rename_directory(directory: pathlib.Path, new_name: str) -> pathlib.Path:
+async def rename_directory(directory: pathlib.Path, new_name: str, session: Session = None, send_events: bool = False) \
+        -> pathlib.Path:
     """Rename a directory.  This is done by moving all files into the new directory, and removing the old directory."""
+    if not session:
+        raise RuntimeError('`session` is required')
+
     new_directory = directory.with_name(new_name)
     if new_directory.exists():
         raise FileConflict(f'Cannot rename {directory} to {new_directory} because it already exists.')
 
     # Move all paths into the new directory.
     paths = list(directory.iterdir())
-    await move(new_directory, *paths)
+    try:
+        await move(new_directory, *paths, session=session)
+        if send_events:
+            Events.send_file_move_completed(f'Directory has been renamed: {directory}')
+    except Exception:
+        if send_events:
+            Events.send_file_move_failed(f'Directory rename has failed: {directory}')
+        raise
     # Remove the old directory.
     delete_directory(directory)
 
     return new_directory
 
 
-async def rename(path: pathlib.Path, new_name: str) -> pathlib.Path:
+@optional_session
+async def rename(path: pathlib.Path, new_name: str, session: Session = None, send_events: bool = False) -> pathlib.Path:
     """Rename a directory or file.  Preserve any tags."""
+    if not session:
+        raise RuntimeError('`session` is required')
+
     if path.is_dir():
-        return await rename_directory(path, new_name)
+        return await rename_directory(path, new_name, session=session, send_events=send_events)
 
     return await rename_file(path, new_name)
+
+
+def add_ignore_directory(directory: Union[pathlib.Path, str]):
+    """Add a directory to the `ignored_directories` in the WROLPi config.  This directory will be ignored when
+    refreshing."""
+    media_directory = get_media_directory()
+
+    directory = pathlib.Path(directory)
+
+    from modules.videos.common import get_videos_directory
+    from modules.archive.lib import get_archive_directory
+    from modules.videos.common import get_no_channel_directory
+    special_directories = [
+        get_media_directory(),
+        get_videos_directory(),
+        get_archive_directory(),
+        get_no_channel_directory(),
+    ]
+
+    if directory in special_directories:
+        raise InvalidDirectory('Refusing to ignore special directory')
+
+    if not str(directory).startswith(str(media_directory)):
+        raise InvalidDirectory('Cannot ignore directory not in media directory')
+
+    wrolpi_config = get_wrolpi_config()
+    ignored_directories = wrolpi_config.ignored_directories if wrolpi_config.ignored_directories else list()
+
+    if str(directory) in ignored_directories:
+        logger.warning(f'Directory is already ignored: {directory}')
+        return
+
+    ignored_directories.append(str(directory))
+    wrolpi_config.ignored_directories = ignored_directories
+
+
+def remove_ignored_directory(directory: Union[pathlib.Path, str]):
+    """Remove a directory from the `ignored_directories` in the WROLPi config."""
+    directory = str(pathlib.Path(directory)).rstrip('/')
+    ignored_directories = get_wrolpi_config().ignored_directories
+    if directory in ignored_directories:
+        ignored_directories.remove(directory)
+        get_wrolpi_config().ignored_directories = ignored_directories
+    else:
+        raise UnknownDirectory('Directory is not ignored')
+
+
+async def upsert_file(file: pathlib.Path | str, tag_names: List[str] = None) -> FileGroup:
+    """Insert/update all files in the provided file's FileGroup."""
+    if not file or not file.is_file():
+        raise InvalidFile(f'Cannot upsert file that does not exist: {file}')
+
+    # Update/Insert all files in the FileGroup.
+    paths = glob_shared_stem(pathlib.Path(file))
+    # Remove any ignored files.
+    paths = remove_files_in_ignored_directories(paths)
+    if not paths:
+        logger.warning('upsert_file called, but all files are in ignored directories!')
+        raise IgnoredDirectoryError(f'all files are in ignored directories: {file}')
+
+    for i in range(2):
+        # Try multiple times because uploads happen concurrently and may conflict.
+        # TODO convert uploads to synchronous in UI.
+        with get_db_session() as session:
+            file_group = FileGroup.from_paths(session, *paths)
+            # Re-index the contents of the file.
+            try:
+                session.flush([file_group, ])
+                file_group_id = file_group.id
+                session.commit()
+                break
+            except IntegrityError:
+                # Another process inserted this FileGroup.
+                logger.error(f'upsert_file failed because FileGroup already exists, trying again... {file}')
+                continue
+    else:
+        raise RuntimeError(f'upsert_file failed to create FileGroup every try! {file}')
+
+    logger.debug(f'upsert_file: {file_group}')
+    try:
+        with get_db_session(commit=True) as session:
+            file_group = FileGroup.find_by_id(file_group_id, session)
+            file_group.do_model(session)
+    except Exception as e:
+        logger.error(f'Failed to model FileGroup: {file_group}', exc_info=e)
+        if PYTEST:
+            raise
+
+    # If user uploads a file, then remove it from the download skip list so comments can be downloaded.  Modify the
+    # download (if any) so that the user can click on it and view the uploaded file.
+    if url := file_group.url if file_group and file_group.url else None:
+        if download_manager.is_skipped(url):
+            download_manager.remove_from_skip_list(url)
+        with get_db_session() as session:
+            if download := Download.get_by_url(url, session):
+                # Mark download as completed
+                download.complete()
+                # Link the download to the location of the uploaded file.
+                model = file_group.get_model_record()
+                download.location = model.location if model else file_group.location
+                session.commit()
+
+    upsert_directories([], file.parents)
+
+    session.commit()
+
+    if tag_names:
+        with get_db_session(commit=True) as session:
+            file_group = FileGroup.find_by_id(file_group_id, session)
+            for tag_name in tag_names:
+                if tag_name not in file_group.tag_names:
+                    tag = Tag.get_by_name(tag_name)
+                    file_group.add_tag(tag.id)
+
+    file_group.flush()
+    return file_group
+
+
+def get_file_location_href(file: pathlib.Path) -> str:
+    """Return the location a file can be viewed at on the UI."""
+    parent = str(get_relative_to_media_directory(file.parent))
+    preview = str(get_relative_to_media_directory(file))
+    if parent == '.':
+        # File is in the top of the media directory, App already shows top directory open.
+        query = urllib.parse.urlencode(dict(preview=str(preview)))
+    else:
+        query = urllib.parse.urlencode(dict(folders=str(parent), preview=str(preview)))
+    return f'/files?{query}'
+
+
+def get_real_path_name(path: pathlib.Path) -> pathlib.Path:
+    """Return the real path name of a file.  This is used to get the real path of a file on macOS."""
+    if IS_MACOS:
+        for path_ in path.parent.iterdir():
+            if path_.name.lower() == path.name.lower():
+                return path_
+    return path

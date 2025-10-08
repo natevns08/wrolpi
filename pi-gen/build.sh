@@ -2,7 +2,7 @@
 # https://github.com/RPI-Distro/pi-gen
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-BUILD_DIR=/tmp/wrolpi-build
+BUILD_DIR=/tmp/wrolpi-build-pi-gen
 
 VERSION=$(cat "${SCRIPT_DIR}/../wrolpi/version.txt")
 
@@ -12,8 +12,8 @@ if [ $EUID != 0 ]; then
   exit $?
 fi
 
-if [ ! -f "${SCRIPT_DIR}/stage2/04-wrolpi/files/gis-map.dump.gz" ]; then
-  echo "stage2/04-wrolpi/files/gis-map.dump.gz does not exist!"
+if [ ! -f "${SCRIPT_DIR}/stage2/04-wrolpi/files/map-db-gis.dump" ]; then
+  echo "stage2/04-wrolpi/files/map-db-gis.dump does not exist!"
   exit 1
 fi
 
@@ -33,7 +33,7 @@ rsync -a "${SCRIPT_DIR}"/stage2/* "${BUILD_DIR}/stage2/"
 
 # We only need to build the Lite and Desktop images.
 rm "${BUILD_DIR}"/stage*/EXPORT*
-echo 'IMG_SUFFIX="-lite"' > "${BUILD_DIR}/stage2/EXPORT_IMAGE"
+#echo 'IMG_SUFFIX="-lite"' > "${BUILD_DIR}/stage2/EXPORT_IMAGE"
 echo 'IMG_SUFFIX="-desktop"' > "${BUILD_DIR}/stage5/EXPORT_IMAGE"
 
 # Build the images.
@@ -45,7 +45,13 @@ grep "03-run-chroot.sh completed" "${SCRIPT_DIR}/build.log" >/dev/null 2>&1 || (
 grep "04-run-chroot.sh completed" "${SCRIPT_DIR}/build.log" >/dev/null 2>&1 || (echo "script 4 failed!" && exit 1)
 
 # Move the built images out of the build directory.
-mv "${BUILD_DIR}"/deploy/*lite*xz "${SCRIPT_DIR}"/WROLPi-v"${VERSION}"-aarch64-lite.img.xz
+#mv "${BUILD_DIR}"/deploy/*lite*xz "${SCRIPT_DIR}"/WROLPi-v"${VERSION}"-aarch64-lite.img.xz
 mv "${BUILD_DIR}"/deploy/*desktop*xz "${SCRIPT_DIR}"/WROLPi-v"${VERSION}"-aarch64-desktop.img.xz
 chmod 644 "${SCRIPT_DIR}"/*xz
-chown 1000:1000 "${SCRIPT_DIR}"/*xz
+chown -R 1000:1000 "${SCRIPT_DIR}"
+
+rm -rf "${BUILD_DIR}"
+
+set +x
+
+echo "Build completed successfully"

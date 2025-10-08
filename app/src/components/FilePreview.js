@@ -4,10 +4,12 @@ import {Grid, Header as SHeader, Image,} from "semantic-ui-react";
 import {TagsSelector} from "../Tags";
 import {Media} from "../contexts/contexts";
 import {encodeMediaPath} from "./Common";
-import {fetchFile, tagFileGroup, untagFileGroup} from "../api";
+import {getFile, tagFileGroup, untagFileGroup} from "../api";
 import {StlViewer} from "react-stl-viewer";
 import {Button, Modal, ModalActions, ModalContent, ModalHeader} from "./Theme";
 import {toast} from "react-semantic-toasts-2";
+import {useOneQuery} from "../hooks/customHooks";
+import {ShareButton} from "./Share";
 
 function getMediaPathURL(previewFile) {
     if (previewFile['primary_path']) {
@@ -143,15 +145,67 @@ export const FilePreviewContext = React.createContext({
 const MAXIMUM_TEXT_SIZE = 5_000_000;
 
 export function FilePreviewProvider({children}) {
+    // Data about the file that is being previewed.
     const [previewFile, setPreviewFile] = React.useState(null);
+    // A modal is only displayed once we have data about the file.
     const [previewModal, setPreviewModal] = React.useState(null);
     const [callbacks, setCallbacks] = React.useState(null);
+    // The file path from the `preview` URL query.
+    const [previewQuery, setPreviewQuery] = useOneQuery('preview');
+    const [errorModalOpen, setErrorModalOpen] = React.useState(false);
+
+    const handleErrorModalClose = () => {
+        setPreviewQuery(null);
+        setErrorModalOpen(false);
+    }
+
+    const errorModal = <Modal closeIcon
+                              open={errorModalOpen}
+                              onClose={handleErrorModalClose}
+    >
+        <ModalHeader>Unknown File</ModalHeader>
+        <ModalContent>Cannot display preview, no such file exists: {previewQuery}</ModalContent>
+        <ModalActions>
+            <Button onClick={handleErrorModalClose}>Close</Button>
+        </ModalActions>
+    </Modal>
+
+    React.useEffect(() => {
+        if (!_.isEmpty(previewFile)) {
+            // Change URL to match the file that is being previewed.
+            setPreviewQuery(previewFile['primary_path'] || previewFile['path']);
+        }
+    }, [previewFile]);
+
+    const initPreviewFile = async () => {
+        // Get simple information about the file, preview the file.
+        try {
+            const file = await getFile(previewQuery);
+            setPreviewFile(file);
+        } catch (e) {
+            console.error(e);
+            setPreviewModal(errorModal);
+            setErrorModalOpen(true);
+        }
+    }
+
+    React.useEffect(() => {
+        // Navigated to a page which has a file preview active, fetch the information about the file, then display it.
+        if (previewQuery && !previewFile) {
+            initPreviewFile();
+        } else if (!previewQuery && (previewFile || previewModal)) {
+            // User navigated back/forward and preview query is gone, close the preview.
+            // Only close if there's actually a preview open (previewFile or previewModal exists).
+            setPreviewFile(null);
+            setPreviewModal(null);
+        }
+    }, [previewQuery]);
 
     const localFetchFile = async () => {
         // Get the file again with its Tags.
         const {path, primary_path} = previewFile;
         try {
-            const file = await fetchFile(primary_path ?? path);
+            const file = await getFile(primary_path ?? path);
             setPreviewFile(file);
         } finally {
             await handleCallbacks();
@@ -164,6 +218,7 @@ export function FilePreviewProvider({children}) {
         }
         setPreviewModal(null);
         setPreviewFile(null);
+        setPreviewQuery(null);
     }
 
     const handleCallbacks = async () => {
@@ -220,7 +275,8 @@ export function FilePreviewProvider({children}) {
                             <Grid.Column width={5}>{closeButton}</Grid.Column>
                         </Grid.Row>
                         <Grid.Row>
-                            <Grid.Column width={16}>{tagsDisplay}</Grid.Column>
+                            <Grid.Column width={2} style={{paddingTop: '0.5em'}}><ShareButton/></Grid.Column>
+                            <Grid.Column width={14}>{tagsDisplay}</Grid.Column>
                         </Grid.Row>
                     </Grid>
                 </Media>
@@ -228,7 +284,8 @@ export function FilePreviewProvider({children}) {
                     <Grid>
                         <Grid.Row>
                             <Grid.Column width={2}>{downloadButton}</Grid.Column>
-                            <Grid.Column width={10}>{tagsDisplay}</Grid.Column>
+                            <Grid.Column width={1} style={{paddingTop: '0.5em'}}><ShareButton/></Grid.Column>
+                            <Grid.Column width={9}>{tagsDisplay}</Grid.Column>
                             <Grid.Column width={2}>{openButton}</Grid.Column>
                             <Grid.Column width={2}>{closeButton}</Grid.Column>
                         </Grid.Row>
@@ -258,6 +315,7 @@ export function FilePreviewProvider({children}) {
             const lowerPath = path.toLowerCase();
             const url = getMediaPathURL(previewFile);
             const downloadURL = getDownloadPathURL(previewFile);
+
             if (mimetype.startsWith('text/') && size > MAXIMUM_TEXT_SIZE) {
                 // Large text files should be downloaded.
                 window.open(downloadURL);
@@ -284,6 +342,14 @@ export function FilePreviewProvider({children}) {
                 // No special handler for this file type, just open it.
                 setModalContent(getGenericPreviewModal(previewFile), url, downloadURL, path, taggable);
             }
+
+            // Fetch the file so `FileGroup.viewed` is set.
+            try {
+                getFile(path);
+            } catch (e) {
+                console.error(e);
+                console.error('Failed to get file to set FileGroup.viewed');
+            }
         }
     }, [previewFile]);
 
@@ -292,5 +358,6 @@ export function FilePreviewProvider({children}) {
     return <FilePreviewContext.Provider value={value}>
         {children}
         {previewModal}
+        {errorModal}
     </FilePreviewContext.Provider>
 }

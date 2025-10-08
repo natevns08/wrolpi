@@ -2,7 +2,7 @@ import asyncio
 import enum
 import subprocess
 
-from wrolpi.cmd import NMCLI_BIN, CPUFREQ_INFO_BIN, SUDO_BIN, CPUFREQ_SET_BIN
+from wrolpi.cmd import NMCLI_BIN, CPUFREQ_INFO_BIN, SUDO_BIN, CPUFREQ_SET_BIN, run_command
 from wrolpi.common import logger, WROLPI_CONFIG, get_warn_once, background_task
 from wrolpi.errors import ShutdownFailed
 from wrolpi.events import Events
@@ -12,7 +12,8 @@ logger = logger.getChild(__name__)
 
 POWER_SAVE_FREQ = 'powersave'  # noqa
 
-warn_once = get_warn_once('Unable to use nmcli', logger)
+nmcli_warn_once = get_warn_once('Unable to use nmcli', logger)
+iwgetid_warn_once = get_warn_once('Unable to use iwgetid', logger)
 
 
 class HotspotStatus(enum.Enum):
@@ -20,20 +21,26 @@ class HotspotStatus(enum.Enum):
     unavailable = enum.auto()  # Radio is off.
     connected = enum.auto()  # Radio is on, Hotspot is on.
     unknown = enum.auto()  # Unknown status.  Hotspot may not be supported on this hardware.
+    in_use = enum.auto()  # WI-FI device is in use, and cannot be used for Hotspot.
 
 
 def hotspot_status() -> HotspotStatus:
     if NMCLI_BIN is None:
         return HotspotStatus.unknown
 
+    device = WROLPI_CONFIG.hotspot_device
+
+    if get_current_ssid(device):
+        # Hotspot device is currently connected to a WI-FI network.
+        return HotspotStatus.in_use
+
     cmd = (NMCLI_BIN,)
     try:
         output = subprocess.check_output(cmd, stderr=subprocess.PIPE).decode().strip()
     except Exception as e:
-        warn_once(e)
+        nmcli_warn_once(e)
         return HotspotStatus.unknown
 
-    device = WROLPI_CONFIG.hotspot_device
     for line in output.splitlines():
         if line.startswith(f'{device}: connected'):
             return HotspotStatus.connected
@@ -45,7 +52,33 @@ def hotspot_status() -> HotspotStatus:
     return HotspotStatus.unknown
 
 
-def enable_hotspot(depth: int = 10):
+def get_current_ssid(interface='wlan0') -> str | None:
+    """Returns the name of the SSID that is currently connected.  Returns None if Hotspot, or no WI-FI network is being
+    used."""
+    try:
+        # Run the iwgetid command and capture the output
+        cmd = ('iwgetid', interface, '--raw')
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        # Check if the command was successful
+        if result.returncode == 0:
+            ssid = result.stdout.strip()
+            return ssid
+        elif result.returncode == 255:
+            # Hotspot is in use.
+            return None
+        else:
+            logger.error(f'Failed to get current ssid: {result.stderr}')
+            return None
+    except FileNotFoundError as e:
+        iwgetid_warn_once(e)
+        return None
+    except Exception as e:
+        logger.error('Failed to get current ssid', exc_info=e)
+        return None
+
+
+def enable_hotspot(depth: int = 10, overwrite: bool = False):
     """Turn the Wi-Fi interface into a hotspot.
 
     If Wi-Fi is already running, replace that with a hotspot.
@@ -56,8 +89,15 @@ def enable_hotspot(depth: int = 10):
     status = hotspot_status()
     logger.info(f'Hotspot status: {status}')
 
+    if overwrite is False and (current_ssid := get_current_ssid(WROLPI_CONFIG.hotspot_device)):
+        raise RuntimeError(f'Refusing to start hotspot because Wi-Fi device is already being used for {current_ssid}.')
+
     if status == HotspotStatus.connected:
         logger.info('Hotspot already connected.  Rebooting hotspot.')
+        disable_hotspot()
+        return enable_hotspot(depth=depth - 1)
+    elif status == HotspotStatus.in_use:
+        logger.info('Wifi already in use.  Rebooting hotspot.')
         disable_hotspot()
         return enable_hotspot(depth=depth - 1)
     elif status == HotspotStatus.disconnected:
@@ -156,17 +196,14 @@ async def shutdown(reboot: bool = False, delay: int = 10):
     if DOCKERIZED:
         raise ShutdownFailed('Cannot Reboot because we are dockerized')
 
-    reboot = '--reboot' if reboot else ''
+    cmd = (SUDO_BIN, 'shutdown', '--reboot', '0') if reboot else (SUDO_BIN, 'shutdown', '0')
 
     async def _():
         await asyncio.sleep(delay)
 
         try:
             # Call shutdown (or reboot) with no delay now that we have slept.
-            cmd = f'{SUDO_BIN} shutdown {reboot} 0'
-            proc = await asyncio.create_subprocess_shell(cmd, stderr=asyncio.subprocess.PIPE,
-                                                         stdout=asyncio.subprocess.PIPE)
-            stdout, stderr = await proc.communicate()
+            result = await run_command(cmd)
         except subprocess.CalledProcessError as e:
             if reboot:
                 Events.send_shutdown_failed('Reboot failed')
@@ -174,12 +211,12 @@ async def shutdown(reboot: bool = False, delay: int = 10):
                 Events.send_shutdown_failed('Shutdown failed')
             raise ShutdownFailed() from e
 
-        if proc.returncode != 0:
+        if result.return_code != 0:
             if reboot:
                 Events.send_shutdown_failed('Reboot failed')
             else:
                 Events.send_shutdown_failed('Shutdown failed')
-            raise ShutdownFailed(f'Got return code {proc.returncode}')
+            raise ShutdownFailed(f'Got return code {result.return_code}')
 
     background_task(_())
     if reboot:

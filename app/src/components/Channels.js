@@ -1,39 +1,44 @@
 import React, {useState} from "react";
-import {
-    AccordionContent,
-    AccordionTitle,
-    Grid,
-    StatisticLabel,
-    StatisticValue,
-    TableCell,
-    TableRow,
-} from "semantic-ui-react";
-import {createChannel, deleteChannel, downloadChannel, refreshChannel, updateChannel, validateRegex} from "../api";
+import {Grid, Input, StatisticLabel, StatisticValue, TableCell, TableRow,} from "semantic-ui-react";
+import {createChannel, deleteChannel, refreshChannel, tagChannel, tagChannelInfo, updateChannel} from "../api";
 import {
     APIButton,
     BackButton,
-    DirectoryInput,
     ErrorMessage,
-    frequencyOptions,
     humanFileSize,
-    RequiredAsterisk,
+    humanNumber,
+    InfoPopup,
     SearchInput,
     secondsToFrequency,
     secondsToFullDuration,
+    SimpleAccordion,
     Toggle,
     useTitle,
     WROLModeMessage
 } from "./Common";
 import {Link, useNavigate, useParams} from "react-router-dom";
 import Message from "semantic-ui-react/dist/commonjs/collections/Message";
-import Icon from "semantic-ui-react/dist/commonjs/elements/Icon";
 import {useChannel, useChannels, useOneQuery} from "../hooks/customHooks";
 import _ from "lodash";
-import {Accordion, Button, Form, FormField, FormGroup, FormInput, Header, Loader, Segment, Statistic} from "./Theme";
-import Dropdown from "semantic-ui-react/dist/commonjs/modules/Dropdown";
+import {
+    Button,
+    Form,
+    Header,
+    Loader,
+    Modal,
+    ModalActions,
+    ModalContent,
+    ModalHeader,
+    Segment,
+    Statistic
+} from "./Theme";
 import {Media, ThemeContext} from "../contexts/contexts";
 import {SortableTable} from "./SortableTable";
 import {toast} from "react-semantic-toasts-2";
+import {RecurringDownloadsTable} from "./admin/Downloads";
+import {TagsContext, TagsSelector} from "../Tags";
+import {InputForm, ToggleForm} from "../hooks/useForm";
+import {ChannelDownloadForm, DestinationForm, DownloadTagsSelector} from "./Download";
 
 
 function ChannelStatistics({statistics}) {
@@ -59,52 +64,45 @@ function ChannelStatistics({statistics}) {
             <StatisticValue>{secondsToFullDuration(statistics.length)}</StatisticValue>
             <StatisticLabel>Total Duration</StatisticLabel>
         </Statistic>
+        <Statistic>
+            <StatisticValue>{humanNumber(statistics.video_tags)}</StatisticValue>
+            <StatisticLabel>Video Tags</StatisticLabel>
+        </Statistic>
     </Segment>
 }
 
 
-function ChannelPage({create, header}) {
-    const [disabled, setDisabled] = useState(false);
-    const [validRegex, setValidRegex] = useState(true);
-    const [activeIndex, setActiveIndex] = useState(-1);
-    const [errors, setErrors] = useState({});
+export function ChannelPage({create, header}) {
+    // Used to display messages to maintainer.
     const [error, setError] = useState(false);
     const [success, setSuccess] = useState(false);
     const [messageHeader, setMessageHeader] = useState();
     const [messageContent, setMessageContent] = useState();
 
+    const [downloadModalOpen, setDownloadModalOpen] = useState(false);
+
     const navigate = useNavigate();
     const {channelId} = useParams();
-    const {channel, changeValue, fetchChannel} = useChannel(channelId);
+    const {SingleTag} = React.useContext(TagsContext);
 
-    let title;
-    if (channel && channel.name) {
-        title = channel.name;
-    }
-    useTitle(title);
+    const [tagEditModalOpen, setTagEditModalOpen] = useState(false);
+    const [newTagName, setNewTagName] = useState(null);
+    const [moveToTagDirectory, setMoveToTagDirectory] = useState(true);
+    const [newTagDirectory, setNewTagDirectory] = useState('');
 
-    if (!channel) {
+    const {channel, form, fetchChannel} = useChannel(channelId);
+
+    useTitle(_.isEmpty(channel) ? null : `${channel.name} Channel`);
+
+    React.useEffect(() => {
+        if (channel && channel.tag_name !== newTagName) {
+            setNewTagName(channel.tag_name);
+        }
+    }, [channel]);
+
+    if (!create && !form.ready) {
+        // Waiting for editing Channel to be fetched.
         return <Loader active/>;
-    }
-
-    const checkRegex = async (e, {value}) => {
-        changeValue('match_regex', value);
-        const valid = await validateRegex(value);
-        setValidRegex(valid);
-    }
-
-    const handleCheckbox = (e, {name, checked}) => {
-        if (e) {
-            e.preventDefault();
-        }
-        changeValue(name, checked);
-    }
-
-    const handleInputChange = (e, {name, value}) => {
-        if (e) {
-            e.preventDefault();
-        }
-        changeValue(name, value);
     }
 
     const setErrorMessage = (header, message) => {
@@ -121,24 +119,19 @@ function ChannelPage({create, header}) {
         setMessageContent(message);
     }
 
-    const handleSubmit = async (e) => {
-        if (e) {
-            e.preventDefault();
-        }
+    const handleSubmit = async () => {
         const body = {
             name: channel.name,
             directory: channel.directory,
-            mkdir: channel.mkdir,
             url: channel.url,
-            download_frequency: channel.download_frequency,
-            match_regex: channel.match_regex,
+            download_missing_data: channel.download_missing_data,
         };
-
-        setDisabled(true);
 
         let response = null;
         try {
             if (create !== undefined) {
+                // Can create a Channel with a Tag.
+                body.tag_name = _.isEmpty(channel.tag_name) ? null : channel.tag_name[0];
                 response = await createChannel(body);
             } else {
                 response = await updateChannel(channelId, body);
@@ -152,11 +145,9 @@ function ChannelPage({create, header}) {
                 time: 5000,
             });
             return;
-        } finally {
-            setDisabled(false);
         }
 
-        if (response && response.status >= 200 && response.status < 300) {
+        if (response && response.ok) {
             let location = response.headers.get('Location');
             let channelResponse = await fetch(location);
             let data = await channelResponse.json();
@@ -182,13 +173,7 @@ function ChannelPage({create, header}) {
             // Some error occurred.
             let error = await response.json();
             let cause = error.cause;
-            if (error.code === 'UNKNOWN_DIRECTORY' || (cause && cause.code === 'UNKNOWN_DIRECTORY')) {
-                setErrorMessage(
-                    'Invalid directory',
-                    'This directory does not exist.',
-                    'directory',
-                );
-            } else if (cause && cause.code === 'CHANNEL_DIRECTORY_CONFLICT') {
+            if (cause && cause.code === 'CHANNEL_DIRECTORY_CONFLICT') {
                 setErrorMessage(
                     'Invalid directory',
                     'This directory is already used by another channel',
@@ -201,33 +186,10 @@ function ChannelPage({create, header}) {
                     'name',
                 );
             } else {
-                setErrorMessage('Invalid channel', 'Unable to save channel.  See logs.');
+                setErrorMessage('Invalid channel', error.message || error.error || 'Unable to save channel.  See logs.');
             }
         } else {
             console.error('Did not get a response for channel!');
-        }
-    }
-
-    const handleAdvancedClick = (e, {index}) => {
-        setActiveIndex(activeIndex === index ? -1 : index);
-    }
-
-    const handleDownloadChannel = async (e) => {
-        if (e) {
-            e.preventDefault();
-        }
-        try {
-            const response = await downloadChannel(channelId);
-            if (response.status === 204) {
-                toast({
-                    type: 'success',
-                    title: 'Download Created',
-                    description: 'Channel download has been started.',
-                    time: 5000,
-                });
-            }
-        } catch (e) {
-            console.error(e);
         }
     }
 
@@ -235,15 +197,7 @@ function ChannelPage({create, header}) {
         if (e) {
             e.preventDefault();
         }
-        const response = await refreshChannel(channelId);
-        if (response.status !== 204) {
-            toast({
-                type: 'error',
-                title: 'Failed to refresh',
-                description: "Failed to refresh this channel's directory",
-                time: 5000,
-            })
-        }
+        await refreshChannel(channelId);
     }
 
     const handleDelete = async () => {
@@ -255,6 +209,155 @@ function ChannelPage({create, header}) {
         } catch (e) {
             setErrorMessage('Failed to delete', 'Failed to delete this channel, check logs.');
         }
+    }
+
+    let downloads = channel && channel.downloads ? channel.downloads : null;
+
+    const afterNewDownloadSave = async () => {
+        setDownloadModalOpen(false);
+        await form.fetcher();
+    }
+
+    const onDelete = async () => {
+        await form.fetcher();
+        setDownloadModalOpen(false);
+    }
+
+    const handleTagEditChannel = async () => {
+        try {
+            await tagChannel(channelId, newTagName, moveToTagDirectory ? newTagDirectory : null);
+            setTagEditModalOpen(false);
+        } catch (e) {
+            console.error('Failed to tag channel', e);
+        } finally {
+            setTimeout(async () => {
+                // Delay fetch because config needs to be written.
+                await fetchChannel();
+            }, 500);
+        }
+    }
+
+    const handleTagSelectMoveSuggestion = async (newTagName_) => {
+        setNewTagName(newTagName_);
+        try {
+            // Get suggested Tag directory for this Tag and Channel.
+            const videosDestination = await tagChannelInfo(channelId, newTagName_);
+            setNewTagDirectory(videosDestination);
+        } catch (e) {
+            console.error('Failed to tag channel', e);
+        }
+    }
+
+    let tagEditModal;
+    if (!create) {
+        // User is editing the Tag of the Channel.
+        tagEditModal = <Modal
+            open={tagEditModalOpen}
+            onClose={() => setTagEditModalOpen(false)}
+            closeIcon
+        >
+            <ModalHeader>{channel.tag_name ? 'Modify Tag' : 'Add Tag'}</ModalHeader>
+            <ModalContent>
+                <Grid columns={1}>
+                    <Grid.Row>
+                        <Grid.Column>
+                            <TagsSelector
+                                limit={1}
+                                selectedTagNames={newTagName ? [newTagName] : []}
+                                onAdd={handleTagSelectMoveSuggestion}
+                                onRemove={() => handleTagSelectMoveSuggestion(null)}
+                            />
+                        </Grid.Column>
+                    </Grid.Row>
+                    <Grid.Row>
+                        <Grid.Column>
+                            <Toggle
+                                label='Move to directory: '
+                                checked={moveToTagDirectory}
+                                onChange={setMoveToTagDirectory}
+                            />
+                        </Grid.Column>
+                    </Grid.Row>
+                    <Grid.Row>
+                        <Grid.Column>
+                            <Input fluid
+                                   value={newTagDirectory}
+                                   onChange={(e, {value}) => setNewTagDirectory(value)}
+                                   disabled={!moveToTagDirectory}
+                            />
+                        </Grid.Column>
+                    </Grid.Row>
+                </Grid>
+            </ModalContent>
+            <ModalActions>
+                <Button onClick={() => setTagEditModalOpen(false)}>Cancel</Button>
+                <APIButton
+                    color='violet'
+                    onClick={handleTagEditChannel}
+                    obeyWROLMode={true}
+                >{moveToTagDirectory ? 'Move' : 'Save'}</APIButton>
+            </ModalActions>
+        </Modal>;
+    }
+
+    let channelUrlRow;
+    if (channel && channel.url) {
+        channelUrlRow = <Grid.Row columns={1}>
+            <Grid.Column>
+                <Header as='h4'>URL</Header>
+                <a href={channel.url}>{channel.url}</a>
+            </Grid.Column>
+        </Grid.Row>;
+    }
+
+    let channelRssUrlRow;
+    if (channel && channel.rss_url) {
+        channelRssUrlRow = <Grid.Row columns={1}>
+            <Grid.Column>
+                <Header as='h4'>RSS URL</Header>
+                <a href={channel.rss_url}>{channel.rss_url}</a>
+            </Grid.Column>
+        </Grid.Row>;
+    }
+
+    let channelTagRow;
+    if (channel && channel.tag_name) {
+        channelTagRow = <Grid.Row columns={1}>
+            <Grid.Column>
+                {channel.tag_name && !create && <SingleTag name={channel.tag_name}/>}
+            </Grid.Column>
+        </Grid.Row>;
+    }
+
+    const downloadMissingDataInfo = 'Automatically download missing comments, etc, in the background.';
+    const downloadMissingDataLabel = <>Download Missing Data<InfoPopup content={downloadMissingDataInfo}/></>;
+    const downloadMissingDataRow = <Grid.Row>
+        <Grid.Column>
+            <ToggleForm
+                form={form}
+                label={downloadMissingDataLabel}
+                path='download_missing_data'
+            />
+        </Grid.Column>
+    </Grid.Row>;
+
+    let messageRow;
+    if (error || success) {
+        messageRow = <Grid.Row columns={1}>
+            <Grid.Column>
+                {error &&
+                    <Message negative
+                             header={messageHeader}
+                             content={messageContent}
+                    />}
+                {success &&
+                    <Message positive
+                             header={messageHeader}
+                             content={messageContent}
+                    />}
+
+            </Grid.Column>
+        </Grid.Row>
     }
 
     return <>
@@ -272,149 +375,72 @@ function ChannelPage({create, header}) {
                 error={error}
                 success={success}
                 autoComplete="off"
-                onSubmit={handleSubmit}
             >
-                <FormGroup>
-                    <FormField width={8}>
-                        <FormInput required
-                                   label="Channel Name"
-                                   name="name"
-                                   type="text"
-                                   placeholder="Short Channel Name"
-                                   disabled={disabled}
-                                   error={errors.name}
-                                   value={channel.name}
-                                   onChange={(e, {value}) => changeValue('name', value)}
-                        />
-                    </FormField>
-                    <FormField width={8}>
-                        <label>
-                            Directory <RequiredAsterisk/>
-                        </label>
-                        <DirectoryInput required
-                                        disabled={create === undefined}
-                                        value={channel.directory}
-                                        setInput={value => changeValue('directory', value)}
-                                        placeholder='videos/channel directory'
-                        />
-                    </FormField>
-                </FormGroup>
-                {
-                    create !== undefined &&
-                    <FormGroup>
-                        <FormField width={8}/>{/* Empty field*/}
-                        <FormField width={8}>
-                            <FormField>
-                                <Toggle
-                                    toggle
-                                    label="Create this directory, if it doesn't exist."
-                                    name="mkdir"
-                                    disabled={disabled}
-                                    error={errors.mkdir}
-                                    checked={channel.mkdir}
-                                    onChange={i => {
-                                        handleCheckbox(null, {name: 'mkdir', checked: i})
-                                    }}
-                                />
-                            </FormField>
-                        </FormField>
-                    </FormGroup>
-                }
-                <FormGroup>
-                    <FormField width={16}>
-                        <FormInput
-                            label="URL"
-                            name="url"
-                            type="url"
-                            disabled={disabled}
-                            placeholder='https://example.com/channel/videos'
-                            error={errors.url}
-                            value={channel.url}
-                            onChange={handleInputChange}
-                        />
-                    </FormField>
-                </FormGroup>
-
-                <FormGroup>
-                    <FormField>
-                        <label>Download Frequency</label>
-                        <Dropdown selection clearable
-                                  name='download_frequency'
-                                  placeholder='Frequency'
-                                  error={errors.download_frequency}
-                                  value={channel.download_frequency}
-                                  disabled={disabled || !channel.url}
-                                  options={frequencyOptions}
-                                  onChange={handleInputChange}
-                        />
-                    </FormField>
-                </FormGroup>
-
-                <Accordion style={{marginBottom: '1em'}}>
-                    <AccordionTitle
-                        onClick={handleAdvancedClick}
-                        index={0}
-                        active={activeIndex === 0}
-                    >
-                        <Icon name='dropdown'/>
-                        Advanced Settings
-                    </AccordionTitle>
-                    <AccordionContent active={activeIndex === 0}>
-                        <Segment secondary>
-                            <Header as="h4">
-                                The following settings are encouraged by default, modify them at your own risk.
-                            </Header>
-                            <FormField>
-                                <FormInput
-                                    label="Title Match Regex"
-                                    name="match_regex"
-                                    type="text"
-                                    disabled={disabled}
-                                    error={!validRegex}
-                                    placeholder='.*([Nn]ame Matching).*'
-                                    value={channel.match_regex}
-                                    onChange={checkRegex}
-                                />
-                            </FormField>
-                        </Segment>
-                    </AccordionContent>
-                </Accordion>
-
-                <Message error
-                         header={messageHeader}
-                         content={messageContent}
-                />
-                <Message success
-                         header={messageHeader}
-                         content={messageContent}
-                />
-
                 <Grid stackable columns={2}>
                     <Grid.Row>
                         <Grid.Column>
-                            {!create &&
+                            <InputForm
+                                form={form}
+                                label="Channel Name"
+                                name="name"
+                                placeholder="Short Channel Name"
+                                required={true}
+                            />
+                        </Grid.Column>
+                        <Grid.Column>
+                            <DestinationForm
+                                form={form}
+                                label='Directory'
+                                name='directory'
+                                path='directory'
+                                required={true}
+                            />
+                        </Grid.Column>
+                    </Grid.Row>
+                    {channelTagRow}
+                    {downloadMissingDataRow}
+                    {!create && (channel.url || channel.rss_url) &&
+                        <SimpleAccordion title='Details'>
+                            <Grid>
+                                {channelUrlRow}
+                                {channelRssUrlRow}
+                            </Grid>
+                        </SimpleAccordion>}
+                    {messageRow}
+                    <Grid.Row>
+                        <Grid.Column width={8}>
+                            {!create ?
                                 <>
                                     <APIButton
                                         color='red'
                                         size='small'
                                         confirmContent='Are you sure you want to delete this channel?  No video files will be deleted.'
                                         confirmButton='Delete'
+                                        confirmHeader='Delete Channel?'
                                         onClick={handleDelete}
                                         obeyWROLMode={true}
+                                        style={{marginTop: '1em'}}
                                     >Delete</APIButton>
-                                    <APIButton
-                                        color='green'
-                                        size='small'
-                                        onClick={handleDownloadChannel}
-                                        obeyWROLMode={true}
-                                    >Download</APIButton>
                                     <APIButton
                                         color='blue'
                                         size='small'
                                         onClick={handleRefreshChannel}
                                         obeyWROLMode={true}
+                                        style={{marginTop: '1em'}}
                                     >Refresh</APIButton>
+                                    <Button
+                                        size='small'
+                                        onClick={() => setTagEditModalOpen(true)}
+                                        color='green'
+                                    >Tag</Button>
+                                    {tagEditModal}
                                 </>
+                                : <DownloadTagsSelector
+                                    form={form}
+                                    limit={1}
+                                    path='tag_name'
+                                    name='tag_name'
+                                />
                             }
                         </Grid.Column>
                         <Grid.Column>
@@ -423,7 +449,7 @@ function ChannelPage({create, header}) {
                                 size='big'
                                 floated='right'
                                 onClick={handleSubmit}
-                                disabled={disabled}
+                                disabled={form.disabled}
                                 obeyWROLMode={true}
                             >Save</APIButton>
                         </Grid.Column>
@@ -433,9 +459,37 @@ function ChannelPage({create, header}) {
             </Form>
         </Segment>
 
-        <div style={{marginTop: '2em'}}>
-            {channel.statistics && <ChannelStatistics statistics={channel.statistics}/>}
-        </div>
+        {!create && <Segment>
+            <Grid columns={2}>
+                <Grid.Row>
+                    <Grid.Column>
+                        <Header as='h1'>Downloads</Header>
+                    </Grid.Column>
+                    <Grid.Column>
+                        <Button floated='right'
+                                onClick={() => setDownloadModalOpen(!downloadModalOpen)}
+                        >
+                            New Download
+                        </Button>
+                    </Grid.Column>
+                </Grid.Row>
+            </Grid>
+            <Modal open={downloadModalOpen} closeIcon onClose={() => setDownloadModalOpen(false)}>
+                <ModalContent>
+                    <Header as='h2'>New Channel Download</Header>
+                    <ChannelDownloadForm
+                        channel_id={channelId}
+                        onSuccess={afterNewDownloadSave}
+                        onCancel={() => setDownloadModalOpen(false)}
+                        onDelete={onDelete}
+                    />
+                </ModalContent>
+            </Modal>
+
+            <RecurringDownloadsTable downloads={downloads} fetchDownloads={fetchChannel} onDelete={onDelete}/>
+        </Segment>}
+
+        {channel && channel.statistics && <ChannelStatistics statistics={channel.statistics}/>}
     </>
 }
 
@@ -449,6 +503,8 @@ export function ChannelNewPage(props) {
 }
 
 function ChannelRow({channel}) {
+    const {SingleTag} = React.useContext(TagsContext);
+
     const videosTo = `/videos/channel/${channel.id}/video`;
 
     const {inverted} = React.useContext(ThemeContext);
@@ -460,10 +516,13 @@ function ChannelRow({channel}) {
             <Link to={videosTo}>{channel.name}</Link>
         </TableCell>
         <TableCell>
+            {channel.tag_name ? <SingleTag name={channel.tag_name}/> : null}
+        </TableCell>
+        <TableCell>
             {channel.video_count}
         </TableCell>
         <TableCell>
-            {channel.url && channel.download_frequency ? secondsToFrequency(channel.download_frequency) : null}
+            {channel.url && channel.minimum_frequency ? secondsToFrequency(channel.minimum_frequency) : null}
         </TableCell>
         <TableCell>
             {channel.size ? humanFileSize(channel.size) : null}
@@ -475,6 +534,8 @@ function ChannelRow({channel}) {
 }
 
 function MobileChannelRow({channel}) {
+    const {SingleTag} = React.useContext(TagsContext);
+
     const editTo = `/videos/channel/${channel.id}/edit`;
     const videosTo = `/videos/channel/${channel.id}/video`;
     return <TableRow verticalAlign='top'>
@@ -483,6 +544,7 @@ function MobileChannelRow({channel}) {
                 <h3>
                     {channel.name}
                 </h3>
+                {channel.tag_name ? <SingleTag name={channel.tag_name}/> : null}
             </Link>
             <p>
                 Videos: {channel.video_count}
@@ -504,7 +566,7 @@ export function ChannelsPage() {
     const [searchStr, setSearchStr] = useOneQuery('name');
     // Hides Channels with few videos.
     const [hideSmall, setHideSmall] = React.useState(true);
-    const enoughChannelsToHideSmall = channels && channels.length > 10;
+    const enoughChannelsToHideSmall = channels && channels.length > 20;
 
     const header = <div style={{marginBottom: '1em'}}>
         <Grid stackable columns={2}>
@@ -530,15 +592,21 @@ export function ChannelsPage() {
     </div>;
 
     const headers = [
-        {key: 'name', text: 'Name', sortBy: 'name', width: 8},
-        {key: 'video_count', text: 'Videos', sortBy: 'video_count', width: 2},
-        {key: 'download_frequency', text: 'Download Frequency', sortBy: 'download_frequency', width: 2},
-        {key: 'size', text: 'Size', sortBy: 'size', width: 2},
+        {key: 'name', text: 'Name', sortBy: [i => i['name'].toLowerCase()], width: 8},
+        {key: 'tag', text: 'Tag', sortBy: [i => i['tag_name'], i => i['name'].toLowerCase()], width: 2},
+        {key: 'video_count', text: 'Videos', sortBy: [i => i['video_count'], i => i['name'].toLowerCase()], width: 2},
+        {
+            key: 'download_frequency',
+            text: 'Download Frequency',
+            sortBy: [i => i['minimum_frequency'], i => i['name'].toLowerCase()],
+            width: 2
+        },
+        {key: 'size', text: 'Size', sortBy: [i => i['size'], i => i['name'].toLowerCase()], width: 2},
         {key: 'manage', text: 'Manage', width: 2},
     ];
     const mobileHeaders = [
-        {key: 'name', text: 'Name', sortBy: 'name'},
-        {key: 'video_count', text: 'Videos', sortBy: 'video_count'},
+        {key: 'name', text: 'Name', sortBy: [i => i['name'].toLowerCase()]},
+        {key: 'video_count', text: 'Videos', sortBy: [i => i['video_count'], i => i['name'].toLowerCase()]},
         {key: 'manage', text: 'Manage'},
     ];
 
@@ -562,10 +630,17 @@ export function ChannelsPage() {
         const re = new RegExp(_.escapeRegExp(searchStr), 'i');
         filteredChannels = channels.filter(i => re.test(i['name']));
     } else if (channels && hideSmall && enoughChannelsToHideSmall) {
-        filteredChannels = channels.filter(i =>
-            i['video_count'] > 5 // Channels need to have at least 5 videos.
-            || i['name'].toLowerCase() === 'wrolpi'  // Always show the WROLPi channel so users can find tutorials.
-        );
+        // Get the top 80% of Channels.
+        let index80 = Math.floor(channels.length * 0.8);
+        const sortedChannels = channels.sort((a, b) => b.video_count - a.video_count);
+        let percentile = sortedChannels[index80].video_count;
+        filteredChannels = channels.filter(i => {
+            return i.video_count > percentile || i.name.toLowerCase() === 'wrolpi'
+        });
+        if (filteredChannels.length < 21) {
+            // Filtering hid too many Channels, show them all.
+            filteredChannels = channels;
+        }
     }
 
     return <>

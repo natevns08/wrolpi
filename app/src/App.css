@@ -237,3 +237,24 @@ textarea.otp {
 .search-clear {
     margin: 10px;
 }
+
+.icon.divider {
+    color: rgb(0, 0, 0, 0.4) !important;
+}
+
+.divider.inverted {
+    color: rgb(255, 255, 255, 0.6) !important;
+}
+
+.video-player {
+    display: block;
+    margin: 0 auto; /* Center the video horizontally */
+}
+
+table.ratio-table td.equal-width {
+    width: 48%;
+}
+
+table.ratio-table td.min-width {
+    width: auto;
+}

@@ -15,11 +15,12 @@ from modules.zim.errors import UnknownZim, UnknownZimSubscription
 from modules.zim.kiwix import KIWIX_CATALOG
 from modules.zim.models import Zim, Zims, TagZimEntry, ZimSubscription
 from wrolpi import flags
+from wrolpi.cmd import run_command
 from wrolpi.common import register_modeler, logger, extract_html_text, extract_headlines, get_media_directory, walk, \
-    register_refresh_cleanup, background_task
+    register_refresh_cleanup, background_task, get_wrolpi_config, unique_by_predicate
 from wrolpi.db import get_db_session, optional_session, get_db_curs
 from wrolpi.downloader import DownloadFrequency
-from wrolpi.files.lib import refresh_files
+from wrolpi.files.lib import refresh_files, split_file_name_words
 from wrolpi.files.models import FileGroup
 from wrolpi.vars import PYTEST, DOCKERIZED
 
@@ -34,9 +35,21 @@ __all__ = [
     'get_unique_paths',
     'get_zim',
     'get_zims',
-    'zim_modeler',
+    'model_zim',
     'zim_download_url_to_name',
+    'zim_modeler',
 ]
+
+
+def model_zim(file_group: FileGroup, session: Session) -> Zim:
+    """Create a Zim record for the provided FileGroup."""
+    zim = Zim(file_group=file_group, path=file_group.primary_path)
+    session.add(zim)
+    file_group.title = file_group.primary_path.name
+    file_group.a_text = split_file_name_words(file_group.primary_path.name)
+    file_group.indexed = True
+    file_group.model = 'zim'
+    return zim
 
 
 @register_modeler
@@ -58,11 +71,14 @@ async def zim_modeler():
                 zim_id = None
                 try:
                     if not zim:
-                        zim = Zim(file_group=file_group, path=file_group.primary_path)
-                        session.add(zim)
-                        session.flush([zim])
-                    zim_id = zim.id
-                    file_group.indexed = True
+                        zim = model_zim(file_group, session)
+                        zim.flush()
+                    else:
+                        zim_id = zim.id
+                        file_group.title = file_group.primary_path.name
+                        file_group.a_text = split_file_name_words(file_group.primary_path.name)
+                        file_group.indexed = True
+                        file_group.model = 'zim'
                 except Exception as e:
                     if PYTEST:
                         raise
@@ -122,14 +138,11 @@ def get_entries_tags(paths: List[str], zim_id: int):
 
 def get_unique_paths(*paths: str) -> List[str]:
     """Return a new list which contains unique Zim paths."""
-    new_paths = list()
-    simple_paths = list()
-    for path in paths:
-        simple_path = path.replace('-', '').replace('_', '').replace('/', '').lower()
-        if simple_path not in simple_paths:
-            new_paths.append(path)
-            simple_paths.append(simple_path)
-    return new_paths
+    unique_paths = unique_by_predicate(
+        paths,
+        lambda i: i.replace('-', '').replace('_', '').replace('/', '').lower()
+    )
+    return list(unique_paths)
 
 
 @optional_session
@@ -149,7 +162,7 @@ def headline_zim(search_str: str, zim_id: int, tag_names: List[str] = None, offs
         # Remove duplicate entries (disambiguation or redirect).
         results = get_unique_paths(*results, *search_results)
         results = results[:limit]
-        entries = [zim.get_entry(i) for i in results]
+        entries = [zim.find_entry(i) for i in results]
         estimate = zim.estimate(search_str)
     else:
         raise RuntimeError('Must provide search_str or tag_names.')
@@ -236,7 +249,7 @@ def get_zim(zim_id: int, session: Session = None) -> Zim:
 def get_entry(path: str, zim_id: int) -> Entry:
     with get_db_session() as session:
         zim = get_zim(zim_id, session=session)
-        entry = zim.get_entry(path, throw=True)
+        entry = zim.find_entry(path)
     return entry
 
 
@@ -314,7 +327,10 @@ async def subscribe(name: str, language: str, session: Session = None,
     elif name == 'Vikidia':
         url = f'https://download.kiwix.org/zim/vikidia/vikidia_{language}_all_maxi_'
     elif name == 'Stackoverflow (Stack Exchange)':
-        url = f'https://download.kiwix.org/zim/stack_exchange/{language}.stackoverflow.com_{language}_all_'
+        if language == 'en':
+            url = f'https://download.kiwix.org/zim/stack_exchange/stackoverflow.com_{language}_all_'
+        else:
+            url = f'https://download.kiwix.org/zim/stack_exchange/{language}.stackoverflow.com_{language}_all_'
     elif name == 'Superuser (Stack Exchange)':
         url = f'https://download.kiwix.org/zim/stack_exchange/superuser.com_{language}_all_'
     elif name == 'iFixit':
@@ -323,6 +339,36 @@ async def subscribe(name: str, language: str, session: Session = None,
         url = f'https://download.kiwix.org/zim/gutenberg/gutenberg_{language}_all_'
     elif name == 'Amateur Radio (Stack Exchange)':
         url = f'https://download.kiwix.org/zim/stack_exchange/ham.stackexchange.com_{language}_all_'
+    elif name == 'DIY (Stack Exchange)':
+        url = f'https://download.kiwix.org/zim/stack_exchange/diy.stackexchange.com_{language}_all_'
+    elif name == 'Electronics (Stack Exchange)':
+        url = f'https://download.kiwix.org/zim/stack_exchange/electronics.stackexchange.com_{language}_all_'
+    elif name == 'Unix (Stack Exchange)':
+        url = f'https://download.kiwix.org/zim/stack_exchange/unix.stackexchange.com_{language}_all_'
+    elif name == 'Ask Ubuntu (Stack Exchange)':
+        url = f'https://download.kiwix.org/zim/stack_exchange/askubuntu.com_{language}_all_'
+    elif name == 'Bicycles (Stack Exchange)':
+        url = f'https://download.kiwix.org/zim/stack_exchange/bicycles.stackexchange.com_{language}_all_'
+    elif name == 'Biology (Stack Exchange)':
+        url = f'https://download.kiwix.org/zim/stack_exchange/biology.stackexchange.com_{language}_all_'
+    elif name == 'Arduino (Stack Exchange)':
+        url = f'https://download.kiwix.org/zim/stack_exchange/arduino.stackexchange.com_{language}_all_'
+    elif name == '3D Printing (Stack Exchange)':
+        url = f'https://download.kiwix.org/zim/stack_exchange/3dprinting.stackexchange.com_{language}_all_'
+    elif name == 'MD Wiki (Wiki Project Med Foundation)':
+        url = f'https://download.kiwix.org/zim/other/mdwiki_{language}_all_'
+    elif name == 'WikiMed Medical Encyclopedia':
+        url = f'https://download.kiwix.org/zim/wikipedia/wikipedia_{language}_medicine_'
+    elif name == 'Post Disaster Resource Library':
+        url = f'https://download.kiwix.org/zim/other/zimgit-post-disaster_{language}_'
+    elif name == 'Military Medicine':
+        url = f'https://download.kiwix.org/zim/zimit/fas-military-medicine_{language}_'
+    elif name == 'WikEm (Global Emergency Medicine Wiki)':
+        url = f'https://download.kiwix.org/zim/other/wikem_{language}_all_maxi_'
+    elif name == 'Health (Stack Exchange)':
+        url = f'https://download.kiwix.org/zim/stack_exchange/health.stackexchange.com_{language}_all_'
+    elif name == 'Khan Academy':
+        url = f'https://download.kiwix.org/zim/other/khanacademy_{language}_all_'
     else:
         raise ValueError(f'{name} not a valid Kiwix subscription name!')
 
@@ -348,11 +394,17 @@ async def unsubscribe(subscription_id: int, session: Session = None):
         raise UnknownZimSubscription(f'{subscription_id=}')
 
 
-KIWIX_URL_PARSER = re.compile(r'https:\/\/download\.kiwix\.org\/zim\/(.+?)\/(.+?)_(\w{2,3})(_.+)')
+KIWIX_URL_PARSER = re.compile(r'https:\/\/download\.kiwix\.org\/zim\/(.+?)\/(.+?)[_-](\w{2,3})([_-].+)')
+KIWIX_URL_NO_FLAVOR_PARSER = re.compile(r'https:\/\/download\.kiwix\.org\/zim\/(.+?)\/(.+)[_-]([a-zA-Z]{2,3})')
 
 
 def zim_download_url_to_name(url: str) -> Tuple[str, str]:
-    _, project, language, flavor = KIWIX_URL_PARSER.match(url).groups()
+    try:
+        _, project, language, flavor = KIWIX_URL_PARSER.match(url).groups()
+    except AttributeError:
+        # May not have a "flavor".
+        _, project, language = KIWIX_URL_NO_FLAVOR_PARSER.match(url).groups()
+        flavor = None
     if project == 'wikipedia' and flavor == '_all_maxi_':
         name = 'Wikipedia (with images)'
     elif project == 'wikipedia' and flavor == '_all_nopic_':
@@ -387,6 +439,36 @@ def zim_download_url_to_name(url: str) -> Tuple[str, str]:
         name = 'Gutenberg'
     elif project == 'ham.stackexchange.com' and flavor == '_all_':
         name = 'Amateur Radio (Stack Exchange)'
+    elif project == 'diy.stackexchange.com' and flavor == '_all_':
+        name = 'DIY (Stack Exchange)'
+    elif project == 'electronics.stackexchange.com' and flavor == '_all_':
+        name = 'Electronics (Stack Exchange)'
+    elif project == 'unix.stackexchange.com' and flavor == '_all_':
+        name = 'Unix (Stack Exchange)'
+    elif project == 'askubuntu.com' and flavor == '_all_':
+        name = 'Ask Ubuntu (Stack Exchange)'
+    elif project == 'bicycles.stackexchange.com' and flavor == '_all_':
+        name = 'Bicycles (Stack Exchange)'
+    elif project == 'biology.stackexchange.com' and flavor == '_all_':
+        name = 'Biology (Stack Exchange)'
+    elif project == 'arduino.stackexchange.com' and flavor == '_all_':
+        name = 'Arduino (Stack Exchange)'
+    elif project == '3dprinting.stackexchange.com' and flavor == '_all_':
+        name = '3D Printing (Stack Exchange)'
+    elif project == 'mdwiki' and flavor == '_all_':
+        name = 'MD Wiki (Wiki Project Med Foundation)'
+    elif project == 'wikipedia' and flavor == '_medicine_':
+        name = 'WikiMed Medical Encyclopedia'
+    elif project == 'zimgit-post-disaster' and flavor is None:
+        name = 'Post Disaster Resource Library'
+    elif project == 'fas-military-medicine' and flavor is None:
+        name = 'Military Medicine'
+    elif project == 'wikem' and flavor == '_all_maxi_':
+        name = 'WikEm (Global Emergency Medicine Wiki)'
+    elif project == 'health.stackexchange.com' and flavor == '_all_':
+        name = 'Health (Stack Exchange)'
+    elif project == 'khanacademy' and flavor == '_all_':
+        name = 'Khan Academy'
     else:
         raise RuntimeError(f'Could not find name for Zim URL: {url} {project=} {flavor=}')
 
@@ -397,8 +479,7 @@ def zim_download_url_to_name(url: str) -> Tuple[str, str]:
 
 
 def get_zim_directory() -> pathlib.Path:
-    media_directory = get_media_directory()
-    zim_directory = media_directory / 'zims'
+    zim_directory = get_media_directory() / get_wrolpi_config().zims_destination
     return zim_directory
 
 
@@ -408,13 +489,14 @@ async def check_zim(path: pathlib.Path) -> int:
 
     @warning: Only performs the checksum check!
     """
-    cmd = f'zimcheck -C {path.absolute()}'
-    proc = await asyncio.create_subprocess_shell(cmd)
-    stdout, stderr = await proc.communicate()
-    logger.debug(f'zimcheck returned {proc.returncode}')
-    if proc.returncode != 0 and stderr:
-        logger.debug(stderr)
-    return proc.returncode
+    cmd = ('zimcheck', '-C', path.absolute())
+    cmd_str = " ".join(str(i) for i in cmd)
+    logger.debug(f'check_zim: {cmd_str}')
+    result = await run_command(cmd)
+    logger.debug(f'zimcheck returned {result.return_code}')
+    if result.return_code != 0 and result.stderr:
+        logger.debug(result.stderr)
+    return result.return_code
 
 
 ZIM_NAME_PARSER = re.compile(r'(.+?)_(\d{4}-\d{2}).zim')
@@ -434,7 +516,7 @@ def find_outdated_zim_files(path: pathlib.Path = None) -> Tuple[List[pathlib.Pat
         return list(), list()
 
     # Find all non-empty Zim files.
-    files = [i for i in walk(path) if i.is_file() and i.stat().st_size and i.suffix == '.zim']
+    files = [i for i in walk(path) if i.is_file() and i.suffix == '.zim' and i.stat().st_size]
     zims = list()
     for file in files:
         try:
@@ -503,10 +585,16 @@ async def restart_kiwix():
 
     logger.info('Restarting Kiwix serve')
 
-    cmd = f'sudo /usr/bin/systemctl restart wrolpi-kiwix.service'
-    proc = await asyncio.create_subprocess_shell(cmd)
-    stdout, stderr = await proc.communicate()
-    logger.debug(f'systemctl returned {proc.returncode}')
-    if proc.returncode != 0 and stderr:
-        logger.debug(stderr)
-    return proc.returncode
+    cmd = ('sudo', '/usr/bin/systemctl', 'restart' 'wrolpi-kiwix.service')
+    result = await run_command(cmd)
+    logger.debug(f'systemctl returned {result.return_code}')
+    if result.return_code != 0 and result.stderr:
+        logger.debug(result.stderr)
+    return result.return_code
+
+
+@optional_session
+def set_zim_auto_search(zim_id: int, auto_search: bool, session: Session = None):
+    zim = Zim.find_by_id(zim_id, session)
+    zim.auto_search = auto_search
+    session.commit()

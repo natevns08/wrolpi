@@ -1,9 +1,7 @@
-import asyncio
 import json
 import os
 import pathlib
 import re
-import shlex
 import subprocess
 import tempfile
 from datetime import timedelta
@@ -16,7 +14,7 @@ from PIL import Image
 from sqlalchemy.orm import Session
 
 from wrolpi.captions import FFMPEG_BIN
-from wrolpi.cmd import FFPROBE_BIN
+from wrolpi.cmd import FFPROBE_BIN, run_command
 from wrolpi.common import logger, get_media_directory
 from wrolpi.dates import seconds_to_timestamp
 from wrolpi.db import get_db_session, get_db_curs
@@ -26,8 +24,6 @@ from .models import Channel
 
 logger = logger.getChild(__name__)
 
-REQUIRED_OPTIONS = ['name', 'directory']
-
 
 class ConfigError(Exception):
     pass
@@ -35,7 +31,9 @@ class ConfigError(Exception):
 
 def get_videos_directory() -> pathlib.Path:
     """Get the "videos" directory in the media directory.  Make it if it does not exist."""
-    directory = get_media_directory() / 'videos'
+    from modules.videos.lib import format_videos_destination
+    videos_destination = format_videos_destination()
+    directory = get_media_directory() / videos_destination
     if not directory.is_dir():
         directory.mkdir(parents=True)
     return directory
@@ -142,12 +140,14 @@ def ffmpeg_video_complete(video_path: Path, seconds: int = None) -> bool:
     """
     if not video_path.is_file():
         raise FileNotFoundError(f'Video file not found: {video_path}')
+    if not video_path.stat().st_size:
+        raise RuntimeError(f'Video file is empty: {video_path}')
 
     with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as fh:
         path = Path(fh.name)
         path.unlink()
         try:
-            seconds = seconds or get_video_duration(video_path) - 5
+            seconds = seconds or extract_video_duration(video_path) - 5
             ffmpeg_poster(video_path, path, seconds)
             return True
         except subprocess.CalledProcessError:
@@ -202,7 +202,7 @@ def is_valid_poster(poster_path: Path) -> bool:
 async def ffprobe_json(video_path: Union[Path, str]) -> dict:
     """Extract video file metadata using ffprobe.
 
-    >>> ffprobe_json('video')
+    >>> ffprobe_json('video.mp4')
     {
         'chapters': [],
         'format': {},
@@ -211,28 +211,26 @@ async def ffprobe_json(video_path: Union[Path, str]) -> dict:
         ],
     }
     """
-    cmd = f'{FFPROBE_BIN}' \
-          f' -print_format json' \
-          f' -loglevel quiet' \
-          f' -show_streams' \
-          f' -show_format' \
-          f' -show_chapters' \
-          f' {shlex.quote(str(video_path.absolute()))}'
+    if not FFPROBE_BIN:
+        raise RuntimeError('ffprobe was not found')
+
+    cmd = (FFPROBE_BIN,
+           '-print_format', 'json',
+           '-loglevel', 'quiet',
+           '-show_streams',
+           '-show_format',
+           '-show_chapters',
+           video_path.absolute())
+
+    result = await run_command(cmd, timeout=60)
+
+    if result.return_code != 0:
+        raise RuntimeError(f'Got non-zero exit code: {result.return_code}')
 
     try:
-        proc = await asyncio.create_subprocess_shell(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = await proc.communicate()
+        content = json.loads(result.stdout.decode().strip())
     except Exception as e:
-        logger.error(f'Failed to run ffprobe json', exc_info=e)
-        raise
-
-    if proc.returncode != 0:
-        raise RuntimeError(f'Got non-zero exit code: {proc.returncode}')
-
-    try:
-        content = json.loads(stdout.decode().strip())
-    except Exception as e:
-        logger.debug(stdout.decode())
+        logger.debug(result.stdout.decode())
         logger.error(f'Failed to load ffprobe json', exc_info=e)
         raise
 
@@ -243,7 +241,7 @@ async def ffprobe_json(video_path: Union[Path, str]) -> dict:
     return content
 
 
-def get_video_duration(video_path: Path) -> Optional[int]:
+def extract_video_duration(video_path: Path) -> Optional[int]:
     """Get the duration of a video in seconds.  Do this using ffprobe."""
     if not isinstance(video_path, Path):
         video_path = Path(video_path)
@@ -268,41 +266,9 @@ def get_video_duration(video_path: Path) -> Optional[int]:
     return duration
 
 
-def check_for_video_corruption(video_path: Path) -> bool:
-    """Uses ffprobe to check for specific ways a video file can be corrupt.
-
-    Also attempts to screenshot the video near the end of it's duration, this check if the video is corrupted somewhere
-    in the middle."""
-    video_path = Path(video_path) if not isinstance(video_path, Path) else video_path
-
-    if not video_path.is_file():
-        raise FileNotFoundError(f'{video_path} does not exist!')
-    if not FFPROBE_BIN:
-        raise SystemError('ffprobe is not installed!')
-
-    # Just read the video using FFMPEG, this prints out useful information about the video.
-    cmd = (FFPROBE_BIN, str(video_path))
-    try:
-        proc = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError as e:
-        logger.warning(f'FFPROBE failed to check for corruption with stderr: {e.stderr.decode()}')
-        return True  # video is corrupt.
-
-    messages = (
-        b'Invalid NAL unit size',
-        b'Error splitting the input into NAL units',
-        b'Invalid data found when processing input',
-    )
-    corrupt = False
-    for error in messages:
-        if error in proc.stderr:
-            logger.warning(f'Possible video corruption ({error.decode()}): {video_path}')
-            corrupt = True
-    return corrupt
-
-
-async def update_view_counts(channel_id: int):
-    """Update view_count for all Videos in a channel using its info_json file."""
+async def update_view_counts_and_censored(channel_id: int):
+    """Update view_count for all Videos in a channel using its info_json file.  Also sets FileGroup.censored
+    if Video is no longer available on the Channel."""
     with get_db_session() as session:
         channel: Channel = session.query(Channel).filter_by(id=channel_id).one()
         channel_name = channel.name
@@ -327,4 +293,19 @@ async def update_view_counts(channel_id: int):
         '''
         curs.execute(stmt, (view_counts_str, channel_id))
         count = len(curs.fetchall())
-        logger.debug(f'Updated {count} view counts in DB for {channel_name}.')
+        logger.info(f'Updated {count} view counts in DB for {channel_name}.')
+
+    source_ids = [i['id'] for i in info['entries']]
+    with get_db_curs(commit=True) as curs:
+        # Set FileGroup.censored if the video is no longer on the Channel.
+        stmt = '''
+            UPDATE file_group fg
+            SET censored = NOT (v.source_id = ANY(%(source_ids)s))
+            FROM video v
+            WHERE v.file_group_id = fg.id
+                AND v.channel_id = %(channel_id)s
+            RETURNING fg.id, fg.censored
+        '''
+        curs.execute(stmt, {'channel_id': channel_id, 'source_ids': source_ids})
+        censored = len([i for i in curs.fetchall() if i['censored']])
+        logger.info(f'Set {censored} censored videos for {channel_name}.')

@@ -1,7 +1,14 @@
 import React, {useEffect} from "react";
-import {deleteTag, getTags, saveTag} from "./api";
+import {ApiDownError, deleteTag, getTags, saveTag} from "./api";
 import {Dimmer, Divider, Form, Grid, GridColumn, GridRow, Label, TableCell, TableRow,} from "semantic-ui-react";
-import {APIButton, contrastingColor, ErrorMessage, fuzzyMatch, scrollToTopOfElement} from "./components/Common";
+import {
+    APIButton,
+    contrastingColor,
+    ErrorMessage,
+    fuzzyMatch,
+    getDistinctColor,
+    scrollToTopOfElement
+} from "./components/Common";
 import {
     Button,
     FormInput,
@@ -16,7 +23,7 @@ import {
 import _ from "lodash";
 import {HexColorPicker} from "react-colorful";
 import {useRecurringTimeout} from "./hooks/customHooks";
-import {Media, ThemeContext} from "./contexts/contexts";
+import {Media, QueryContext, ThemeContext} from "./contexts/contexts";
 import {Link, useNavigate} from "react-router-dom";
 import {TagPlaceholder} from "./components/Placeholder";
 import {SortableTable} from "./components/SortableTable";
@@ -38,8 +45,12 @@ const DEFAULT_TAG_COLOR = '#000000';
 export function useTags() {
     const [tags, setTags] = React.useState(null);
     const [tagNames, setTagNames] = React.useState(null);
+    const {getLocationStr} = React.useContext(QueryContext);
 
     const fetchTags = async () => {
+        if (window.apiDown) { // apiDown is set in useStatus
+            return;
+        }
         try {
             const t = await getTags();
             setTags(t);
@@ -47,9 +58,23 @@ export function useTags() {
         } catch (e) {
             setTags(undefined);
             setTagNames(undefined);
-            console.error(e);
+            if (e instanceof ApiDownError) {
+                // API is down, do not log this error.
+                return;
+            }
+            // Ignore SyntaxError because they happen when the API is down.
+            if (!(e instanceof SyntaxError)) {
+                console.error(e);
+            }
         }
     }
+
+    React.useEffect(() => {
+        if (!window.apiDown) {
+            // Fetch tags when the API comes back up.
+            fetchTags();
+        }
+    }, [window.apiDown]);
 
     const findTagByName = (name) => {
         if (!tags || tags.length === 0) {
@@ -74,7 +99,6 @@ export function useTags() {
     }
 
     const NameToTagLabel = ({name, to, ...props}) => {
-        const defaultTag = <Label size='large'>{name}</Label>;
         const tag = findTagByName(name);
         if (tag !== null && tag !== undefined) {
             const tagColor = tag['color'] || DEFAULT_TAG_COLOR;
@@ -91,7 +115,7 @@ export function useTags() {
         }
 
         // No tags have been fetched.
-        return defaultTag;
+        return <Label size='large'>{name}</Label>;
     }
 
     const TagsGroup = ({tagNames, onClick}) => {
@@ -104,7 +128,7 @@ export function useTags() {
     }
 
     const TagLabelLink = ({name, props}) => {
-        const to = `/search?tag=${encodeURIComponent(name)}`;
+        const to = getLocationStr({tag: name}, '/search');
         const style = {marginLeft: '0.3em', marginRight: '0.3em'};
         try {
             // We prefer to use Link to avoid reloading the page, check if React Router is available, so we can use it.
@@ -130,8 +154,8 @@ export function useTags() {
         </Label.Group>
     }
 
-    const SingleTag = ({name}) => {
-        return <Label.Group tag><NameToTagLabel name={name}/></Label.Group>
+    const SingleTag = ({name, ...props}) => {
+        return <Label.Group tag {...props}><NameToTagLabel name={name}/></Label.Group>
     }
 
     useEffect(() => {
@@ -197,11 +221,23 @@ function EditTagsModal() {
     const {fetchTags, tags} = React.useContext(TagsContext);
     const {inverted} = React.useContext(ThemeContext);
 
+    // Return a random, but distinct Hex color.
+    const getRandomColor = () => getDistinctColor((tags || []).map(i => i.color));
+
     const [open, setOpen] = React.useState(false);
     const [tagId, setTagId] = React.useState(null);
     const [tagName, setTagName] = React.useState('');
     const [tagColor, setTagColor] = React.useState(DEFAULT_TAG_COLOR);
     const textColor = contrastingColor(tagColor);
+    const [tagNameError, setTagNameError] = React.useState(null);
+    const disabled = !!!tagName || !!tagNameError;
+
+    const setRandomColor = () => setTagColor(getRandomColor());
+
+    // Open modal with random color.
+    React.useEffect(() => {
+        setRandomColor();
+    }, [open]);
 
     const localOnClose = () => {
         setOpen(false);
@@ -233,7 +269,15 @@ function EditTagsModal() {
         }
         setTagName('');
         setTagId(null);
-        setTagColor(DEFAULT_TAG_COLOR);
+        // Change suggested color after save.
+        setRandomColor();
+    }
+
+    const handleTagNameChange = (e, {value}) => {
+        setTagName(value);
+        // Tag names cannot contain these characters.
+        const tagNameRegex = /[,<>:|"\\?*%!\n\r]/;
+        setTagNameError(tagNameRegex.test(value) ? {content: 'Invalid Tag Name'} : null);
     }
 
     const tableHeaders = [
@@ -263,19 +307,34 @@ function EditTagsModal() {
                                label={<b>Tag Name</b>}
                                placeholder='Unique name'
                                value={tagName}
-                               onChange={(e, {value}) => setTagName(value)}
+                               error={tagNameError}
+                               onChange={handleTagNameChange}
                     />
                 </Form>
 
                 <HexColorPicker color={tagColor} onChange={setTagColor} style={{marginTop: '1em'}}/>
 
-                <APIButton
-                    color='violet'
-                    size='big'
-                    onClick={localSaveTag}
-                    style={{marginTop: '2em'}}
-                    disabled={!!!tagName}
-                >Save</APIButton>
+                <Grid>
+                    <Grid.Row columns={2}>
+                        <Grid.Column>
+                            <Button
+                                color='orange'
+                                onClick={setRandomColor}
+                                style={{marginTop: '2em'}}
+                                type='button'
+                            >Random</Button>
+                        </Grid.Column>
+                        <Grid.Column textAlign='right'>
+                            <APIButton
+                                color='violet'
+                                size='big'
+                                onClick={localSaveTag}
+                                style={{marginTop: '2em'}}
+                                disabled={disabled}
+                            >Save</APIButton>
+                        </Grid.Column>
+                    </Grid.Row>
+                </Grid>
 
                 <Divider/>
 
@@ -309,11 +368,15 @@ function EditTagsModal() {
 
 export function AddTagsButton({
                                   hideEdit,
-                                  active,
+                                  showAny = false,
                                   selectedTagNames = [],
-                                  onToggle = _.noop,
+                                  anyTag = false,
                                   onAdd = _.noop,
-                                  onRemove = _.noop
+                                  onRemove = _.noop,
+                                  onChange = _.noop,  // Expects to send: (tagNames, anyTag)
+                                  closeAfterLimit = true,
+                                  limit = null,
+                                  disabled = false,
                               }) {
     // A button which displays a modal in which the user can add or remove tags.
 
@@ -321,6 +384,8 @@ export function AddTagsButton({
     const [open, setOpen] = React.useState(false);
     const [loading, setLoading] = React.useState(false);
     const [localTags, setLocalTags] = React.useState(selectedTagNames);
+
+    const active = anyTag || (selectedTagNames && selectedTagNames.length > 0);
 
     const handleOpen = (e) => {
         if (e) {
@@ -332,10 +397,16 @@ export function AddTagsButton({
     const addTag = (name) => {
         setLoading(true);
         try {
-            const newTags = [...localTags, name];
+            const newTags = [...(localTags || []), name];
+            if (limit !== null && newTags.length > limit) {
+                return;
+            }
             setLocalTags(newTags);
-            onToggle(newTags);
             onAdd(name);
+            onChange(newTags, null);
+            if (closeAfterLimit && newTags && limit && newTags.length >= limit) {
+                setOpen(false);
+            }
         } finally {
             setLoading(false);
         }
@@ -345,38 +416,45 @@ export function AddTagsButton({
         setLoading(true);
         try {
             const newTags = localTags.filter(i => i !== name);
-            setLocalTags(newTags);
-            onToggle(newTags);
+            setLocalTags(newTags)
             onRemove(name);
+            onChange(newTags, null);
         } finally {
             setLoading(false);
         }
     }
 
     const clearLocalTags = () => {
-        if (!localTags || (localTags && localTags.length === 0)) {
+        if (!anyTag && (!localTags || (localTags && localTags.length === 0))) {
             console.debug('No tags to clear');
             return
         }
 
-        setLoading(true);
-        try {
-            for (let i = 0; i < localTags.length; i++) {
-                onRemove(localTags[i]);
-            }
-            setLocalTags([]);
-            onToggle([]);
-        } finally {
-            setLoading(false);
-        }
+        console.debug('Clearing selected tags');
+        onChange([], null);
+        setLocalTags([]);
+        setOpen(false);
+    }
+
+    const localOnAnyTag = () => {
+        console.debug('Setting any tag');
+        onChange([], true);
+        setOpen(false);
     }
 
     const selectedTagsGroup = <TagsGroup tagNames={localTags} onClick={removeTag}/>;
     const unusedTags = _.difference(tagNames, localTags);
     const unusedTagsGroup = <TagsGroup tagNames={unusedTags} onClick={addTag}/>;
+    const emptySelectedTags = limit === 1 ? 'Add only one tag below' : 'Add one or more tags below';
 
     return <>
-        <Button icon={active ? 'tags' : 'tag'} onClick={handleOpen} primary={!!active}/>
+        <Button
+            icon={active ? 'tags' : 'tag'}
+            color={active ? 'violet' : undefined}
+            onClick={handleOpen}
+            type="button"
+            disabled={disabled}
+        />
         <Modal closeIcon
                open={open}
                onOpen={(e) => handleOpen(e)}
@@ -385,7 +463,7 @@ export function AddTagsButton({
                 {loading && <Dimmer active><Loader/></Dimmer>}
                 <Header as='h4'>Applied Tags</Header>
 
-                {localTags && localTags.length > 0 ? selectedTagsGroup : 'Add one or more tags below'}
+                {localTags && localTags.length > 0 ? selectedTagsGroup : emptySelectedTags}
 
                 <Divider/>
 
@@ -399,6 +477,7 @@ export function AddTagsButton({
                         </Grid.Column>
                         <Grid.Column width={8}>
                             <Button onClick={() => setOpen(false)} floated='right'>Close</Button>
+                            {showAny && <Button color='violet' onClick={localOnAnyTag} floated='right'>Any</Button>}
                             <Button floated='right' secondary onClick={() => clearLocalTags()}>Clear</Button>
                         </Grid.Column>
                     </Grid.Row>
@@ -412,12 +491,16 @@ export const taggedImageLabel = {corner: 'left', icon: 'tag', color: 'green'};
 
 export const TagsSelector = ({
                                  hideEdit = false,
-                                 active,
+                                 showAny = false,
                                  hideGroup = false,
                                  selectedTagNames = [],
-                                 onToggle = _.noop,
+                                 anyTag = false,
                                  onAdd = _.noop,
-                                 onRemove = _.noop
+                                 onRemove = _.noop,
+                                 onChange = _.noop,
+                                 closeAfterLimit = true,
+                                 limit = null,
+                                 disabled = false,
                              }) => {
     // Provides a button to add tags to a list.  Displays the tags of that list.
     const {TagsLinkGroup} = React.useContext(TagsContext);
@@ -429,18 +512,22 @@ export const TagsSelector = ({
 
     const button = <AddTagsButton
         hideEdit={hideEdit}
-        active={active}
+        showAny={showAny}
         selectedTagNames={selectedTagNames}
-        onToggle={onToggle}
         onAdd={onAdd}
         onRemove={onRemove}
+        onChange={onChange}
+        closeAfterLimit={closeAfterLimit}
+        anyTag={anyTag}
+        limit={limit}
+        disabled={disabled}
     />;
 
     if (hideGroup) {
         return button;
     }
 
-    return <Grid>
+    return <Grid columns={2}>
         <Grid.Row>
             <Grid.Column mobile={2} computer={1}>
                 {button}

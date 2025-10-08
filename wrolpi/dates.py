@@ -1,9 +1,8 @@
 import logging
 from datetime import datetime, timezone, timedelta
 from enum import Enum
-from typing import Union
+from typing import Union, List
 
-import dateutil.parser
 import pytz
 from sqlalchemy import types
 
@@ -46,22 +45,28 @@ def strftime(dt: datetime) -> str:
 def strpdate(dt: str) -> datetime:
     """
     Attempt to parse a datetime string.  Tries to find a Timezone, if possible.  DB requires timezone.
-
-    TODO replace this in Python 3.11 https://docs.python.org/3/library/datetime.html#datetime.datetime.fromisoformat
     """
+    if not dt or dt in ('undefined', 'null'):
+        InvalidDatetime(f'Unable to parse empty datetime string: {dt}')
+
     try:
         if dt.count('/') == 2:
             # No timezone info.
-            try:
-                a, b, c = dt.split('/')
-                if len(c) == 4:
-                    # Assume m/d/Y
-                    return datetime.strptime(dt, '%m/%d/%Y')
-                if len(a) == 4:
-                    # Y/m/d
-                    return datetime.strptime(dt, '%Y/%m/%d')
-            except ValueError:
-                pass
+            a, b, c = dt.split('/')
+            if len(c) == 4:
+                # Assume m/d/Y
+                return datetime.strptime(dt, '%m/%d/%Y')
+            if len(a) == 4:
+                # Y/m/d
+                return datetime.strptime(dt, '%Y/%m/%d')
+            if len(a) in (1, 2) and len(b) in (1, 2):
+                # Day/Month may or may not have 0 prefix.
+                if len(c) == 13:
+                    # d/m/Y HH:MM:SS
+                    return datetime.strptime(dt, '%m/%d/%Y %H:%M:%S')
+                elif len(c) in (15, 16):
+                    # d/m/Y HH:MM:SS PM
+                    return datetime.strptime(dt, '%m/%d/%Y %H:%M:%S %p')
         elif dt.count('-') == 2 and len(dt) <= 10:
             # No timezone info.
             a, b, c = dt.split('-')
@@ -79,20 +84,13 @@ def strpdate(dt: str) -> datetime:
 
             return datetime.strptime(dt2, "D:%Y%m%d%H%M%S")
 
-        if dt.count('-') == 0 and dt.count('/') == 0 and dt.isdigit() and len(dt) == 8:
-            # Assume %Y%m%d date
-            return datetime.strptime(dt, '%Y%m%d')
-
         if dt.count('.') == 2 and len(dt) <= 9:
             # yyyy.mm.dd or dd.mm.yyyy
-            try:
-                a, b, c = dt.split('.')
-                if len(a) == 4:
-                    return datetime.strptime(dt, '%Y.%m.%d')
-                if len(c) == 4:
-                    return datetime.strptime(dt, '%d.%m.%Y')
-            except ValueError:
-                pass
+            a, b, c = dt.split('.')
+            if len(a) == 4:
+                return datetime.strptime(dt, '%Y.%m.%d')
+            if len(c) == 4:
+                return datetime.strptime(dt, '%d.%m.%Y')
 
         try:
             # Fri Jun 17 2022 19:24:52  (from Singlefile)
@@ -118,7 +116,7 @@ def strpdate(dt: str) -> datetime:
                 pass
 
         # Last, try third-party module to parse ISO 8601 datetime.
-        return dateutil.parser.isoparse(dt)
+        return datetime.fromisoformat(dt)
     except Exception as e:
         raise InvalidDatetime(f'Unable to parse datetime string: {dt}') from e
 
@@ -192,3 +190,44 @@ class TZDateTime(types.TypeDecorator):
             # Assume the DB timestamp is UTC.
             value = value.replace(tzinfo=pytz.utc) if not value.tzinfo else value
         return value
+
+
+def months_selector_to_where(wheres: list, params: dict, months: List[int]):
+    """Filter FileGroup results by the month that the file was published.  Returns wheres/params unchanged if months
+    is empty.
+
+    @param months: List of integers representing the index of the month of the year (January is 1).
+    @param wheres: A list of strings which are SQL where filters.
+    @param params: Dict which contains the parameters passed to SQLAlchemy query.
+    """
+    if not months:
+        return wheres, params
+
+    if not set(months).issubset(set(range(1, 13))):
+        raise ValueError('Months must be between 1 and 12')
+
+    wheres.append('EXTRACT (MONTH FROM published_datetime) IN %(months_list)s')
+    params['months_list'] = tuple(months)
+    return wheres, params
+
+
+def date_range_to_where(wheres: list, params: dict, from_year: int, to_year: int):
+    """Filter FileGroup results by the year that the file was published.
+
+    @param from_year: The earliest year the file was published
+    @param to_year: The latest year the file was published
+    @param wheres: A list of strings which are SQL where filters.
+    @param params: Dict which contains the parameters passed to SQLAlchemy query.
+    """
+    if from_year and to_year:
+        wheres.append('EXTRACT (YEAR FROM published_datetime) BETWEEN %(from_year)s AND %(to_year)s')
+        params['from_year'] = from_year
+        params['to_year'] = to_year
+    elif from_year:
+        wheres.append('EXTRACT (YEAR FROM published_datetime) >= %(from_year)s')
+        params['from_year'] = from_year
+    elif to_year:
+        wheres.append('EXTRACT (YEAR FROM published_datetime) <= %(to_year)s')
+        params['to_year'] = to_year
+
+    return wheres, params

@@ -1,33 +1,31 @@
 import asyncio
 import json
 import pathlib
-import tempfile
 from abc import ABC
-from typing import List, Tuple
+from typing import List, Tuple, Iterable
 
-from selenium import webdriver
 from sqlalchemy import not_
 from sqlalchemy.orm import Session
 
-from wrolpi.cmd import SINGLE_FILE_BIN, CHROMIUM, READABILITY_BIN
+from wrolpi.cmd import SINGLE_FILE_BIN, CHROMIUM
 from wrolpi.common import logger, register_modeler, register_refresh_cleanup, limit_concurrent, split_lines_by_length, \
-    slow_logger, html_screenshot
+    slow_logger, get_title_from_html
 from wrolpi.db import optional_session, get_db_session
 from wrolpi.downloader import Downloader, Download, DownloadResult
 from wrolpi.errors import UnrecoverableDownloadError
 from wrolpi.files.models import FileGroup
-from wrolpi.vars import PYTEST, DOCKERIZED
+from wrolpi.vars import PYTEST, DOCKERIZED, DOWNLOAD_USER_AGENT
 from . import lib
-from .api import bp  # noqa
+from .api import archive_bp  # noqa
 from .errors import InvalidArchive
-from .lib import is_singlefile_file, get_title_from_html, request_archive, SINGLEFILE_HEADER
+from .lib import is_singlefile_file, request_archive, SINGLEFILE_HEADER
 from .models import Archive, Domain
 
 PRETTY_NAME = 'Archive'
 
 logger = logger.getChild(__name__)
 
-__all__ = ['ArchiveDownloader', 'archive_downloader']
+__all__ = ['ArchiveDownloader', 'archive_downloader', 'model_archive']
 
 
 class ArchiveDownloader(Downloader, ABC):
@@ -37,6 +35,11 @@ class ArchiveDownloader(Downloader, ABC):
     def __repr__(self):
         return f'<ArchiveDownloader>'
 
+    @optional_session
+    def already_downloaded(self, *urls: List[str], session: Session = None) -> List:
+        file_groups = list(session.query(FileGroup).filter(FileGroup.url.in_(urls), FileGroup.model == 'archive'))
+        return file_groups
+
     async def do_download(self, download: Download) -> DownloadResult:
         if download.attempts > 3:
             raise UnrecoverableDownloadError(f'Max download attempts reached for {download.url}')
@@ -44,133 +47,92 @@ class ArchiveDownloader(Downloader, ABC):
         if DOCKERIZED or PYTEST:
             # Perform the archive in the Archive docker container.  (Typically in the development environment).
             singlefile, readability, screenshot = await request_archive(download.url)
+            archive: Archive = await lib.model_archive_result(download.url, singlefile, readability, screenshot)
+            archive_id = archive.id
         else:
             # Perform the archive using locally installed executables.
-            singlefile, readability, screenshot = await self.do_archive(download)
+            singlefile = await self.do_singlefile(download)
+            archive = await lib.singlefile_to_archive(singlefile)
+            archive_id = archive.id
 
-        archive: Archive = await lib.model_archive_result(download.url, singlefile, readability, screenshot)
+        with get_db_session() as session:
+            archive = Archive.find_by_id(archive_id, session)
+            need_commit = False
+            if tag_names := download.tag_names:
+                for name in tag_names:
+                    archive.add_tag(name, session)
+                    need_commit = True
 
-        if download.settings and (tag_names := download.settings.get('tag_names')):
-            for name in tag_names:
-                archive.add_tag(name)
+                if need_commit:
+                    session.commit()
 
-            if session := Session.object_session(archive):
-                session.commit()
+            logger.info(f'Successfully downloaded Archive {download.url} {archive}')
 
-        logger.info(f'Successfully downloaded Archive {download.url} {archive}')
-
-        return DownloadResult(success=True, location=f'/archive/{archive.id}')
-
-    @optional_session
-    def already_downloaded(self, *urls: List[str], session: Session = None) -> List:
-        file_groups = list(session.query(FileGroup).filter(FileGroup.url.in_(urls), FileGroup.model == 'archive'))
-        return file_groups
+            return DownloadResult(success=True, location=f'/archive/{archive.id}')
 
     async def do_singlefile(self, download: Download) -> bytes:
         """Create a Singlefile from the archive's URL."""
-        cmd = (str(SINGLE_FILE_BIN),
-               download.url,
+        cmd = ('/usr/bin/nice', '-n15',  # Nice above map importing, but very low priority.
+               str(SINGLE_FILE_BIN),
                '--browser-executable-path', CHROMIUM,
                '--browser-args', '["--no-sandbox"]',
-               '--dump-content')
-        return_code, _, stdout = await self.process_runner(
-            download.url,
-            cmd,
-            pathlib.Path('/home/wrolpi'),
-        )
-        if return_code != 0:
-            raise RuntimeError(f'Archive singlefile exited with {return_code}')
+               '--user-agent', DOWNLOAD_USER_AGENT,
+               '--dump-content',
+               '--load-deferred-images-dispatch-scroll-event',
+               download.url,
+               )
+        cwd = pathlib.Path('/home/wrolpi')
+        cwd = cwd if cwd.is_dir() else None
+        result = await self.process_runner(download, cmd, cwd)
 
-        return stdout
+        stderr = result.stderr.decode()
+        log_output = stderr or result.stdout.decode() or 'No stderr or stdout!'
 
-    async def do_readability(self, download: Download, html: bytes) -> dict:
-        """Extract the readability dict from the provided HTML."""
-        with tempfile.NamedTemporaryFile('wb', suffix='.html') as fh:
-            fh.write(html)
+        if result.return_code != 0:
+            e = ChildProcessError(log_output[:1000])
+            raise RuntimeError(f'singlefile exited with {result.return_code}') from e
 
-            cmd = (READABILITY_BIN, fh.name, download.url)
-            logger.debug(f'readability cmd: {cmd}')
-            return_code, logs, stdout = await self.process_runner(
-                download.url,
-                cmd,
-                pathlib.Path('/home/wrolpi'),
-            )
-            if return_code == 0:
-                readability = json.loads(stdout)
-                logger.debug(f'done readability for {download.url}')
-                return readability
-            else:
-                logger.error(f'Failed to extract readability for {download.url}')
-                raise RuntimeError(f'Failed to extract readability for {download.url}')
+        if not result.stdout:
+            e = ChildProcessError(log_output[:1000])
+            raise RuntimeError(f'Singlefile created was empty: {download.url}') from e
 
-    @staticmethod
-    async def do_screenshot_url(download: Download) -> bytes:
-        """Use Chromium to get a screenshot of the Download's URL."""
-        # Set Chromium to headless.  Use a wide window size so that screenshot will be the "desktop" version of
-        # the page.
-        options = webdriver.ChromeOptions()
-        options.add_argument('headless')
-        options.add_argument('disable-gpu')
-        options.add_argument('window-size=1280x720')
+        if SINGLEFILE_HEADER.encode() not in result.stdout:
+            e = ChildProcessError(log_output[:1000])
+            raise RuntimeError(f'Singlefile created was invalid: {download.url}') from e
 
-        driver = webdriver.Chrome(chrome_options=options)
-        driver.get(download.url)
-        screenshot = driver.get_screenshot_as_png()
-        return screenshot
-
-    async def do_archive(self, download: Download) -> Tuple[bytes, dict, bytes]:
-        """Use locally installed executables to create an Archive.
-
-        Creates a Singlefile, readability file, and screenshot file.
-
-        @warning: Will not raise errors if readability or screenshot cannot be extracted.
-        """
-        singlefile = await self.do_singlefile(download)
-
-        if SINGLEFILE_HEADER.encode() not in singlefile[:1000]:
-            raise RuntimeError(f'Singlefile created was invalid: {download.url}')
-
-        # Extract Readability from the Singlefile.
-        try:
-            readability = await self.do_readability(download, singlefile)
-        except RuntimeError:
-            # Readability is not required.
-            readability = None
-
-        screenshot = b''
-        try:
-            # Screenshot the Singlefile first.
-            screenshot = html_screenshot(singlefile)
-        except Exception as e:
-            logger.error(f'Failed to screenshot file for {download.url}', exc_info=e)
-
-        if not screenshot:
-            # Screenshot of singlefile failed.  Download the URL again.
-            try:
-                screenshot = await self.do_screenshot_url(download)
-            except Exception as e:
-                # Screenshot failed.
-                logger.error(f'Failed to screenshot {download.url}', exc_info=e)
-
-        singlefile_len = len(singlefile) if singlefile else None
-        readability_len = len(readability) if readability else None
-        screenshot_len = len(screenshot) if screenshot else None
-        logger.debug(f'do_archive of {download.url} finished: {singlefile_len=} {readability_len=} {screenshot_len=}')
-
-        return singlefile, readability, screenshot
+        return result.stdout
 
 
 archive_downloader = ArchiveDownloader()
 
 
 def model_archive(file_group: FileGroup, session: Session = None) -> Archive:
+    """
+    Models an Archive from a given FileGroup.
+
+    This function takes in a FileGroup and attempts to create an Archive object.
+    It does this by checking for the presence of HTML files within the FileGroup,
+    determining if any of these are SingleFiles, and then extracting relevant data
+    (title, contents) from either the JSON or text readability files.
+
+    Args:
+        file_group: The FileGroup to model as an Archive.
+        session: An optional database session for committing changes.
+
+    Returns:
+        An Archive object representing the modeled archive.
+
+    Raises:
+        InvalidArchive: If no HTML SingleFile is found in the FileGroup, or if
+            any other error occurs during modeling.
+    """
     file_group_id = file_group.id
     if not file_group_id:
         session.flush([file_group])
         file_group_id = file_group.id
 
-    # All Archives have an HTML Singlefile.
-    html_paths = file_group.my_paths('text/html')
+    # All Archives have an HTML Singlefile.  Singlefile may be text HTML, or bytes HTML.
+    html_paths = file_group.my_html_paths()
     if not html_paths:
         logger.error('Query returned a group without an HTML file!')
         raise InvalidArchive('FileGroup does not contain any html files')
@@ -222,9 +184,9 @@ def model_archive(file_group: FileGroup, session: Session = None) -> Archive:
         archive = Archive(file_group_id=file_group_id, file_group=file_group)
         session.add(archive)
         archive.validate()
-        session.flush([archive])
+        archive.flush()
 
-        file_group.title = file_group.a_text = title
+        file_group.title = file_group.a_text = title or archive.file_group.title
         file_group.d_text = contents
         file_group.data = {
             'id': archive.id,
@@ -258,15 +220,17 @@ async def archive_modeler():
             ).filter(not_(FileGroup.id.in_(list(invalid_archives)))) \
                 .outerjoin(Archive, Archive.file_group_id == FileGroup.id) \
                 .limit(20)
+            results: Iterable[Tuple[FileGroup, Archive]]
 
             processed = 0
-            for file_group, archive in results:
-                processed += 1
+            for processed, (file_group, archive) in enumerate(results):
+
+                # Even if indexing fails, we mark it as indexed.  We won't retry indexing this.
+                file_group.indexed = True
 
                 with slow_logger(1, f'Modeling archive took %(elapsed)s seconds: {file_group}',
                                  logger__=logger):
                     if archive:
-                        archive: Archive
                         try:
                             archive_id = archive.id
                             archive.validate()
@@ -279,10 +243,8 @@ async def archive_modeler():
                             model_archive(file_group, session=session)
                         except InvalidArchive:
                             # It was not a real Archive.  Many HTML files will not be an Archive.
-                            pass
-
-                # Even if indexing fails, we mark it as indexed.  We won't retry indexing this.
-                file_group.indexed = True
+                            file_group.indexed = False
+                            invalid_archives.add(file_group.id)
 
             session.commit()
 

@@ -3,40 +3,34 @@
 set -e
 set -x
 
+# Create postgres cluster for map.
+pg_createcluster 15 map --port=5433 -e utf8
+
 # Create mapnik config.
 git clone https://github.com/lrnselfreliance/openstreetmap-carto.git /opt/openstreetmap-carto
 git config --global --add safe.directory /opt/openstreetmap-carto
 (cd /opt/openstreetmap-carto && git fetch && git checkout master && git reset --hard origin/master && git pull --ff)
 chown -R wrolpi:wrolpi /opt/openstreetmap-carto
-(cd /opt/openstreetmap-carto && carto project.mml >/opt/openstreetmap-carto/mapnik.xml)
+# Append port line after dbname configuration line.
+sed -i '/dbname: "gis"/a \    port: 5433' /opt/openstreetmap-carto/project.mml
+(cd /opt/openstreetmap-carto/ && carto project.mml >mapnik.xml)
 
-# WROLPi user can access WROLPi and Map database.
-mkdir -p /home/pi/Desktop
-cat >/home/pi/.pgpass <<'EOF'
-127.0.0.1:5432:gis:_renderd:wrolpi
+# All users can access wrolpi and map database.
+cat >/etc/skel/.pgpass <<'EOF'
+127.0.0.1:5433:gis:_renderd:wrolpi
 127.0.0.1:5432:wrolpi:wrolpi:wrolpi
 EOF
-cat >/home/pi/Desktop/wrolpi.desktop <<'EOF'
-[Desktop Entry]
-Encoding=UTF-8
-Name=WROLPi App
-Type=Link
-URL=http://127.0.0.1
-Icon=/opt/wrolpi/icon.png
+chmod 0600 /etc/skel/.pgpass
+cat >/etc/skel/.gitconfig  <<'EOF'
+[safe]
+	directory = /opt/wrolpi
+	directory = /opt/wrolpi-help
 EOF
-cat >/home/pi/Desktop/wrolpi-help.desktop <<'EOF'
-[Desktop Entry]
-Encoding=UTF-8
-Name=WROLPi Help
-Type=Link
-URL=http://127.0.0.1:8086
-Icon=/opt/wrolpi-help/venv/lib/python3.11/site-packages/mkdocs/themes/mkdocs/img/favicon.ico
-EOF
-chown -R pi:pi /home/pi
-chmod 0600 /home/pi/.pgpass
-usermod -aG wrolpi pi
+# Copy desktop shortcuts.
+mkdir /etc/skel/Desktop
+cp /opt/wrolpi/etc/raspberrypios/*desktop /etc/skel/Desktop
 
-# Configure renderd.
+# Configure renderd (map).
 cp /opt/wrolpi/etc/raspberrypios/renderd.conf /etc/renderd.conf
 # Configure Apache2 to listen on 8084.  Import renderd into apache.
 cp /opt/wrolpi/etc/raspberrypios/ports.conf /etc/apache2/ports.conf
@@ -60,11 +54,6 @@ chown -R _renderd:_renderd /var/cache/renderd/tiles
 # Create the media directory for the wrolpi user.
 echo '/dev/sda1 /media/wrolpi auto defaults,nofail 0 0' | tee -a /etc/fstab
 mkdir -p /media/wrolpi
-cat >/home/wrolpi/.pgpass <<'EOF'
-127.0.0.1:5432:gis:_renderd:wrolpi
-127.0.0.1:5432:wrolpi:wrolpi:wrolpi
-EOF
-chmod 0600 /home/wrolpi/.pgpass
 chown -R wrolpi:wrolpi /media/wrolpi /home/wrolpi /opt/wrolpi*
 
 set +x

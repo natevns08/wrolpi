@@ -1,5 +1,3 @@
-import multiprocessing
-
 __all__ = ['Events', 'get_events']
 
 from datetime import datetime
@@ -10,9 +8,6 @@ from wrolpi.dates import now
 logger = logger.getChild(__name__)
 
 HISTORY_SIZE = 100
-EVENTS_LOCK = multiprocessing.Lock()
-
-EVENTS_HISTORY = multiprocessing.Manager().list()
 
 
 class Events:
@@ -81,6 +76,30 @@ class Events:
     def send_shutdown_failed(message: str = None):
         send_event('shutdown_failed', message, subject='shutdown')
 
+    @staticmethod
+    def send_file_move_completed(message: str = None):
+        send_event('file_move_completed', message, subject='refresh')
+
+    @staticmethod
+    def send_file_move_failed(message: str = None):
+        send_event('file_move_failed', message, subject='refresh')
+
+    @staticmethod
+    def send_config_import_failed(message: str = None):
+        send_event('config_import_failed', message, subject='configs')
+
+    @staticmethod
+    def send_config_save_failed(message: str = None):
+        send_event('config_save_failed', message, subject='configs')
+
+    @classmethod
+    def send_archive_uploaded(cls, message: str = None, url: str = None):
+        send_event('upload_archive', message, subject='upload', url=url)
+
+    @classmethod
+    def send_upload_archive_failed(cls, message: str = None):
+        send_event('upload_archive_failed', message, subject='upload')
+
 
 def log_event(event: str, message: str = None, action: str = None, subject: str = None):
     log = f'{event=}'
@@ -94,7 +113,8 @@ def log_event(event: str, message: str = None, action: str = None, subject: str 
 
 
 def send_event(event: str, message: str = None, action: str = None, subject: str = None, url: str = None):
-    EVENTS_LOCK.acquire()
+    from wrolpi.api_utils import api_app
+    api_app.shared_ctx.events_lock.acquire()
     try:
         # All events will be in time order, they should never be at the exact same time.
         dt = now()
@@ -107,23 +127,25 @@ def send_event(event: str, message: str = None, action: str = None, subject: str
             subject=subject,
             url=url,
         )
-        EVENTS_HISTORY.append(e)
+        api_app.shared_ctx.events_history.append(e)
 
         # Keep events below limit.
-        while len(EVENTS_HISTORY) > HISTORY_SIZE:
-            EVENTS_HISTORY.pop(0)
+        while len(api_app.shared_ctx.events_history) > HISTORY_SIZE:
+            api_app.shared_ctx.events_history.pop(0)
     finally:
-        EVENTS_LOCK.release()
+        api_app.shared_ctx.events_lock.release()
 
     log_event(event, message, action, subject)
 
 
 @iterify(list)
 def get_events(after: datetime = None):
+    from wrolpi.api_utils import api_app
+    events_history = api_app.shared_ctx.events_history
     if not after:
-        events = [i for i in EVENTS_HISTORY]
+        events = [i for i in events_history]
     else:
-        events = [i for i in EVENTS_HISTORY if i['dt'] > after]
+        events = [i for i in events_history if i['dt'] > after]
 
     # Most recent first.
     return events[::-1]

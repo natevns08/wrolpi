@@ -6,13 +6,13 @@ from datetime import datetime
 from typing import List, Tuple, OrderedDict as OrderedDictType, Dict, Optional, Set
 
 from libzim import Archive, Searcher, Query, Entry, SuggestionSearcher
-from sqlalchemy import Column, Integer, BigInteger, ForeignKey, Text, tuple_
+from sqlalchemy import Column, Integer, BigInteger, ForeignKey, Text, tuple_, Boolean
 from sqlalchemy.orm import relationship, Session
 from sqlalchemy.orm.exc import NoResultFound  # noqa
 
-from modules.zim.errors import UnknownZimEntry, UnknownZimTagEntry
+from modules.zim.errors import UnknownZimEntry, UnknownZimTagEntry, UnknownZim
 from wrolpi import dates, tags
-from wrolpi.common import Base, extract_html_text, logger, get_relative_to_media_directory
+from wrolpi.common import Base, logger, get_relative_to_media_directory, ModelHelper
 from wrolpi.dates import TZDateTime
 from wrolpi.db import optional_session, get_db_curs
 from wrolpi.downloader import Download, download_manager
@@ -60,7 +60,7 @@ class EntrySummary:
         return d
 
 
-class Zim(Base):
+class Zim(Base, ModelHelper):
     """Records of Zim files.
 
     Zim files stores wiki content (and much more) for offline usage. Zim files are compressed data that can be searched.
@@ -72,6 +72,7 @@ class Zim(Base):
 
     file_group_id = Column(BigInteger, ForeignKey('file_group.id', ondelete='CASCADE'), unique=True, nullable=False)
     file_group: FileGroup = relationship('FileGroup')
+    auto_search = Column(Boolean, nullable=False, default=True)
 
     def __repr__(self):
         return f'<Zim id={self.id} file_group_id={self.file_group_id} path={self.path}>'
@@ -83,6 +84,7 @@ class Zim(Base):
             file_group_id=self.file_group_id,
             metadata=self.zim_metadata,
             size=self.file_group.size,
+            auto_search=self.auto_search,
         )
         return d
 
@@ -92,6 +94,34 @@ class Zim(Base):
         zim = Zim(path=file_group.primary_path, file_group=file_group)
         session.add(zim)
         session.flush([file_group, zim])
+        return zim
+
+    @staticmethod
+    @optional_session
+    def get_by_path(path: pathlib.Path, session: Session = None) -> Optional['Zim']:
+        zim = session.query(Zim).filter_by(path=path).one_or_none()
+        return zim
+
+    @staticmethod
+    @optional_session
+    def find_by_path(path: pathlib.Path, session: Session = None) -> 'Zim':
+        zim = Zim.get_by_path(path, session=session)
+        if not zim:
+            raise UnknownZim(f'Cannot find zim at path')
+        return zim
+
+    @staticmethod
+    @optional_session
+    def get_by_id(zim_id: int, session: Session = None) -> Optional['Zim']:
+        zim = session.query(Zim).filter_by(id=zim_id).one_or_none()
+        return zim
+
+    @staticmethod
+    @optional_session
+    def find_by_id(zim_id: int, session: Session = None) -> 'Zim':
+        zim = Zim.get_by_id(zim_id, session=session)
+        if not zim:
+            raise UnknownZim(f'Cannot find zim with ID {zim_id}')
         return zim
 
     def get_zim(self) -> Archive:
@@ -108,6 +138,18 @@ class Zim(Base):
         session: Session = Session.object_session(self)
         self.path.unlink(missing_ok=True)
         session.delete(self)
+
+    @staticmethod
+    def can_model(file_group: FileGroup) -> bool:
+        if file_group.primary_path.suffix.lower() == '.zim':
+            return True
+        return False
+
+    @staticmethod
+    def do_model(file_group: FileGroup, session: Session) -> 'Zim':
+        from modules.zim.lib import model_zim
+        zim = model_zim(file_group, session)
+        return zim
 
     @functools.cached_property
     def zim_metadata(self) -> ZimMetadata:
@@ -163,61 +205,54 @@ class Zim(Base):
         results = list(suggestions.getResults(offset, limit))
         return results
 
-    def get_entry(self, path: str, throw: bool = True) -> Optional[Entry]:
+    def get_entry(self, path: str) -> Optional[Entry]:
         """Search this Zim file for the provided Entry at the `path`."""
         zim = self.get_zim()
         try:
             entry = zim.get_entry_by_path(path)
         except KeyError:
-            if throw:
-                raise UnknownZimEntry(f'Cannot find entry at {path=}')
-            else:
-                return None
+            return None
         return entry
 
-    def get_entry_html(self, path: str) -> Optional[str]:
-        """Search this Zim file for the provided Entry at `path`, read its contents and return the HTML."""
-        content = bytes(self.get_entry(path).get_item().content).decode('UTF-8')
-        return content
+    def find_entry(self, path: str) -> Entry:
+        """Search this Zim file for the provided Entry at the `path`.
 
-    def get_entry_text(self, path: str) -> Optional[str]:
-        """Search this Zim file for the provided Entry at `path`, read its contents and return the text in the HTML."""
-        html = self.get_entry_html(path)
-        content = extract_html_text(html)
-        return content
+        @raise UnknownZimEntry: if an entry at path does not exist."""
+        if entry := self.get_entry(path):
+            return entry
 
-    def tag_entry(self, tag_name: str, zim_entry: str) -> 'TagZimEntry':
+        raise UnknownZimEntry(f'Cannot find entry at {path=}')
+
+    def tag_entry(self, tag_id_or_name: int | str, zim_entry: str) -> 'TagZimEntry':
         """Create a TagZimEntry for this Zim at the provided entry (path) for the provided Tag."""
         session = Session.object_session(self)
-        tag = Tag.find_by_name(tag_name, session=session)
+
+        # Ensure the entry exists.
+        self.find_entry(zim_entry)
+
+        tag = Tag.get_by_name(tag_id_or_name, session) if isinstance(tag_id_or_name, str) \
+            else Tag.get_by_id(tag_id_or_name, session)
         tag_zim_entry = TagZimEntry(tag=tag, zim=self, zim_entry=zim_entry)
         session.add(tag_zim_entry)
-        tags.schedule_save()
+        tags.save_tags_config.activate_switch()
         return tag_zim_entry
 
-    def untag_entry(self, tag_name: str, zim_entry: str):
+    def untag_entry(self, tag_id_or_name: int | str, zim_entry: str):
         """Removes any TagZimEntry of the Zim entry at the provided path for the provided Tag.
 
         @raise UnknownZimTagEntry: No entry exists to remove."""
         session = Session.object_session(self)
-        tag = Tag.find_by_name(tag_name, session=session)
-        tag_zim_entry = session.query(TagZimEntry).filter_by(
-            tag_id=tag.id,
-            zim_id=self.id,
-            zim_entry=zim_entry,
-        ).one_or_none()
+        tag = Tag.get_by_name(tag_id_or_name, session) if isinstance(tag_id_or_name, str) \
+            else Tag.get_by_id(tag_id_or_name, session)
+        tag_zim_entry = TagZimEntry.get_by_primary_keys(tag.id, self.id, zim_entry, session)
         if tag_zim_entry:
             session.delete(tag_zim_entry)
         else:
             raise UnknownZimTagEntry(f'Could not find at {repr(str(zim_entry))}')
-        tags.schedule_save()
+        tags.save_tags_config.activate_switch()
 
-    @optional_session
-    def entries_with_tags(self, tag_names: List[str], offset: int = 0, limit: int = 10, session: Session = None) \
-            -> List[Entry]:
-        """Return Zim Entries tagged with the provided names."""
-        tags_sub_select, params = tag_names_to_zim_sub_select(tag_names, zim_id=self.id)
-
+    @staticmethod
+    def _entries_with_tags_process(limit: int, offset: int, params: dict, session: Session, tags_sub_select: str):
         with get_db_curs() as curs:
             curs.execute(tags_sub_select, params)
             zim_ids_entries: List[Tuple[int, int]] = list(curs.fetchall())
@@ -231,9 +266,29 @@ class Zim(Base):
 
         entries = list()
         for tag_zim_entry, zim in tag_zim_entries:
-            entry = zim.get_entry(tag_zim_entry.zim_entry)
+            entry = zim.find_entry(tag_zim_entry.zim_entry)
             entries.append(entry)
 
+        return entries
+
+    @optional_session
+    def entries_with_tags(*args, session: Session = None, **kwargs) -> List[Entry]:
+        """Return Zim Entries tagged with the provided names."""
+        limit = int(kwargs.pop('limit', 10))
+        offset = int(kwargs.pop('offset', 0))
+        args = list(args)
+
+        zim: Zim | None = args.pop(0) if isinstance(args[0], Zim) else None
+        zim_id = zim.id if zim else None
+        tag_names: List[str] = args.pop(0)
+
+        if limit < 1:
+            raise RuntimeError('Limit must be greater than zero')
+        if args:
+            raise RuntimeError('Extra unknown arguments')
+
+        tags_sub_select, params = tag_names_to_zim_sub_select(tag_names, zim_id=zim_id)
+        entries = Zim._entries_with_tags_process(limit, offset, params, session, tags_sub_select)
         return entries
 
     @functools.cached_property
@@ -257,11 +312,6 @@ class Zim(Base):
             summary.title = title
             entries.add(summary)
         return entries
-
-    def parse_name(self):
-        from modules.zim import lib
-        name, date = lib.parse_name(self.path)
-        return name, date
 
 
 class Zims:
@@ -287,7 +337,8 @@ class Zims:
         zims = cls.get_all(session=session)
         results = OrderedDict()
         for zim in zims:
-            results[zim] = zim.estimate(search_str)
+            if zim.auto_search:
+                results[zim] = zim.estimate(search_str)
         return results
 
     @classmethod
@@ -317,7 +368,13 @@ class TagZimEntry(Base):
         zim = self.zim_id
         if self.zim:
             zim = get_relative_to_media_directory(self.zim.path)
-        return f'<TagZimEntry {tag=} {zim=} zim_entry={self.zim_entry}>'
+        return f'<TagZimEntry {tag=} zim={str(zim)} zim_entry={self.zim_entry}>'
+
+    @staticmethod
+    def get_by_primary_keys(tag_id: int, zim_id: int, zim_entry: str, session: Session):
+        return session.query(TagZimEntry) \
+            .filter_by(tag_id=tag_id, zim_id=zim_id, zim_entry=zim_entry) \
+            .one_or_none()
 
 
 class ZimSubscription(Base):
@@ -335,7 +392,7 @@ class ZimSubscription(Base):
         download_id = self.download_id
         return f'<ZimSubscription id={self.id} {name=} {language=} {download_id=}>'
 
-    def __json__(self):
+    def __json__(self) -> dict:
         d = dict(
             id=self.id,
             name=self.name,

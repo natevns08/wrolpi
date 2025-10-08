@@ -4,8 +4,8 @@ import logging
 import pathlib
 from typing import List, Optional, Tuple
 
-from sqlalchemy import Column, Integer, String, BigInteger, ForeignKey, or_, and_
-from sqlalchemy.orm import relationship
+from sqlalchemy import Column, Integer, BigInteger, ForeignKey, or_, and_
+from sqlalchemy.orm import relationship, Session
 
 from wrolpi.common import ModelHelper, Base, register_modeler, get_html_soup
 from wrolpi.db import get_db_session
@@ -23,13 +23,16 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'EBOOK_MIMETYPES',
     'EBook',
     'EBookData',
+    'EPUB_MIMETYPE',
+    'MOBI_MIMETYPE',
+    'ebook_modeler',
     'extract_ebook_cover',
     'extract_ebook_data',
-    'ebook_modeler',
-    'MOBI_MIMETYPE',
-    'EPUB_MIMETYPE'
+    'mimetype_is_ebook',
+    'model_ebook',
 ]
 
 EBOOK_SUFFIXES = ('.epub', '.mobi')
@@ -53,7 +56,7 @@ class EBookData:
     def __bool__(self):
         return bool(self.cover) or bool(self.author) or bool(self.text) or bool(self.title)
 
-    def __json__(self):
+    def __json__(self) -> dict:
         d = {}
         if self.author:
             d['author'] = self.author
@@ -70,8 +73,8 @@ def extract_text(html: str) -> str:
     return text
 
 
-def mimetype_is_ebook(mimetype: str) -> List[str]:
-    return [i for i in EBOOK_MIMETYPES if mimetype.startswith(i)]
+def mimetype_is_ebook(mimetype: str) -> bool:
+    return any(i for i in EBOOK_MIMETYPES if mimetype.startswith(i))
 
 
 def extract_ebook_data(path: pathlib.Path, mimetype: str) -> Optional[EBookData]:
@@ -164,6 +167,18 @@ class EBook(ModelHelper, Base):
         d['data']['cover_path'] = pathlib.Path(d['data']['cover_path']) if 'cover_path' in d['data'] else None
         return d
 
+    @staticmethod
+    def can_model(file_group: FileGroup) -> bool:
+        if mimetype_is_ebook(file_group.mimetype):
+            return True
+        return False
+
+    @staticmethod
+    def do_model(file_group: FileGroup, session: Session) -> 'EBook':
+        ebook = model_ebook(file_group, session)
+        file_group.indexed = True
+        return ebook
+
     def generate_cover(self) -> Optional[pathlib.Path]:
         """Discover this ebook's cover, if found, store it next to the ebook file."""
         path = self.file_group.primary_path
@@ -211,11 +226,14 @@ class EBook(ModelHelper, Base):
                 session.delete(file_group)
 
 
-def _model_ebook(ebook: EBook) -> EBook:
-    """Creates an EBook model based off a File.  Searches for it's cover in the provided `files`."""
-    # Multiple formats may share this cover.
-    epub_file = next(iter(ebook.file_group.my_files('application/epub')), None)
-    mobi_file = next(iter(ebook.file_group.my_files('application/x-mobipocket-ebook')), None)
+def model_ebook(file_group: FileGroup, session: Session) -> EBook:
+    """Creates an EBook model based off a File.  Searches for its cover in the provided `files`."""
+    ebook = EBook(file_group=file_group)
+    session.add(ebook)
+
+    # Multiple formats may be available.
+    epub_file = next(iter(ebook.file_group.my_epub_files()), None)
+    mobi_file = next(iter(ebook.file_group.my_mobi_files()), None)
     # epub is preferred because it can be indexed.
     if epub_file:
         ebook_file = epub_file['path']
@@ -262,6 +280,7 @@ def _model_ebook(ebook: EBook) -> EBook:
         ebook.file_group.title = stem
 
     ebook.size = size
+    ebook.flush()
 
     return ebook
 
@@ -290,11 +309,10 @@ async def ebook_modeler():
             for file_group, ebook in file_groups:
                 processed += 1
                 try:
-                    ebook = ebook or EBook(file_group=file_group)
                     if PYTEST:
                         # Handle caching issue during testing.
                         session.expire(file_group)
-                    _model_ebook(ebook)
+                    ebook = ebook or model_ebook(file_group, session)
                     session.add(ebook)
                     file_group.model = EBook.__tablename__
                     file_group.indexed = True

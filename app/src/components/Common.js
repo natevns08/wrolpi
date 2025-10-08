@@ -1,10 +1,17 @@
 import React, {useContext, useEffect, useState} from "react";
 import {
+    AccordionContent,
+    AccordionTitle,
+    BreadcrumbSection,
     Button as SButton,
     ButtonGroup,
     Card,
     Confirm,
     Container,
+    Dimmer,
+    DimmerDimmable,
+    GridColumn,
+    GridRow,
     Icon as SIcon,
     IconGroup,
     Input,
@@ -15,19 +22,12 @@ import {
 } from 'semantic-ui-react';
 import {Link, NavLink, useNavigate, useSearchParams} from "react-router-dom";
 import Message from "semantic-ui-react/dist/commonjs/collections/Message";
+import {useHotspot, useSearchDirectories, useSearchOrder, useThrottle, useWROLMode} from "../hooks/customHooks";
+import {Media, SettingsContext, StatusContext, ThemeContext} from "../contexts/contexts";
 import {
-    useCPUTemperature,
-    useDirectories,
-    useHotspot,
-    useLoad,
-    useSearchDirectories,
-    useSearchOrder,
-    useSettings,
-    useThrottle,
-    useWROLMode
-} from "../hooks/customHooks";
-import {Media, StatusContext, ThemeContext} from "../contexts/contexts";
-import {
+    Accordion,
+    Breadcrumb,
+    BreadcrumbDivider,
     Button,
     CardIcon,
     darkTheme,
@@ -35,6 +35,7 @@ import {
     Header,
     Icon,
     lightTheme,
+    Loader,
     Menu,
     Modal,
     ModalActions,
@@ -42,20 +43,14 @@ import {
     ModalDescription,
     ModalHeader,
     Popup,
+    Segment,
     Statistic
 } from "./Theme";
 import {FilePreviewContext} from "./FilePreview";
 import _ from "lodash";
 import {killDownloads, startDownloads} from "../api";
+import {allFrequencyOptions, NAME, semanticUIColorMap, validUrlRegex} from "./Vars";
 import Grid from "semantic-ui-react/dist/commonjs/collections/Grid";
-
-export const API_URI = process.env && process.env.REACT_APP_API_URI ? process.env.REACT_APP_API_URI : `${window.location.protocol}//${window.location.host}/api`;
-export const VIDEOS_API = `${API_URI}/videos`;
-export const ARCHIVES_API = `${API_URI}/archive`;
-export const OTP_API = `${API_URI}/otp`;
-export const ZIM_API = `${API_URI}/zim`;
-export const DEFAULT_LIMIT = 20;
-export const NAME = process.env && process.env.REACT_APP_NAME ? process.env.REACT_APP_NAME : null;
 
 export function Paginator({activePage, onPageChange, totalPages, showFirstAndLast, size = 'mini'}) {
     const handlePageChange = (e, {activePage}) => {
@@ -94,7 +89,7 @@ export function divmod(x, y) {
     return [Math.floor(x / y), x % y];
 }
 
-export function secondsElapsed(seconds) {
+export function secondsToHumanElapsed(seconds, short = true) {
     // Convert the provided seconds into a human-readable string of the time elapsed between the provided timestamp
     // and now.
     if (!seconds || seconds < 0) {
@@ -102,37 +97,52 @@ export function secondsElapsed(seconds) {
     }
 
     // Get seconds elapsed between now and `seconds` which is a UTC epoch.
-    const localNow = (new Date()).getTime();
+    const localNow = (new Date()).getTime() / 1000;
 
     let years;
     let days;
     let hours;
     let minutes;
 
-    seconds = Math.abs((localNow / 1000) - seconds);
+    seconds = Math.abs(localNow - seconds);
     [years, seconds] = divmod(seconds, secondsToYears);
     [days, seconds] = divmod(seconds, secondsToDays);
     [hours, seconds] = divmod(seconds, secondsToHours);
     [minutes, seconds] = divmod(seconds, secondsToMinutes);
     seconds = Math.floor(seconds);
 
-    if (years > 0 && days > 30) {
-        return `${years}y${days}d`;
-    } else if (years > 0) {
-        return `${years}y`;
-    } else if (days > 0) {
-        return `${days}d`;
-    } else if (hours > 0) {
-        return `${hours}h`;
-    } else if (minutes > 0) {
-        return `${minutes}m`;
+    if (short) {
+        if (years > 0 && days > 30) {
+            return `${years}y${days}d`;
+        } else if (years > 0) {
+            return `${years}y`;
+        } else if (days > 0) {
+            return `${days}d`;
+        } else if (hours > 0) {
+            return `${hours}h`;
+        } else if (minutes > 0) {
+            return `${minutes}m`;
+        }
+        return `${seconds}s`
+    } else {
+        if (years > 0 && days > 30) {
+            return `${years} years ${days} days`;
+        } else if (years > 0) {
+            return `${years} years`;
+        } else if (days > 0) {
+            return `${days} days`;
+        } else if (hours > 0) {
+            return `${hours} hours`;
+        } else if (minutes > 0) {
+            return `${minutes} minutes`;
+        }
+        return `${seconds} seconds`
     }
-    return `${seconds}s`
 }
 
 export function secondsToElapsedPopup(seconds) {
     // Return a Popup which allows the user see a more detailed timestamp when hovering.
-    const elapsed = secondsElapsed(seconds);
+    const elapsed = secondsToHumanElapsed(seconds);
     if (!elapsed) {
         return <></>;
     }
@@ -146,6 +156,21 @@ export function secondsToElapsedPopup(seconds) {
 export function isoDatetimeToElapsedPopup(dt) {
     let d = new Date(dt);
     return secondsToElapsedPopup(d.getTime() / 1000);
+}
+
+export function isoDatetimeToAgoPopup(dt, short = true) {
+    const seconds = (new Date(dt)).getTime() / 1000;
+    // Return a Popup which allows the user see a more detailed timestamp when hovering.
+    const elapsed = secondsToHumanElapsed(seconds, short);
+    if (seconds === 0 || !elapsed) {
+        return <></>;
+    }
+    const trigger = <span>{isoDatetimeToString(dt)}</span>;
+    return <Popup
+        content={<span>{elapsed} ago</span>}
+        on='hover'
+        trigger={trigger}
+    />
 }
 
 export function secondsToHMS(totalSeconds) {
@@ -230,31 +255,9 @@ export function RequiredAsterisk() {
     return <span style={{color: '#db2828'}}> *</span>
 }
 
-export let defaultVideoOrder = '-published_datetime';
-export let defaultSearchOrder = 'rank';
-
-export const frequencyOptions = [{key: null, text: '', value: null}, {
-    key: 'daily', text: 'Daily', value: 86400
-}, {key: 'weekly', text: 'Weekly', value: 604800}, {key: 'biweekly', text: 'Biweekly', value: 1209600}, {
-    key: '30days', text: '30 Days', value: 2592000
-}, {key: '90days', text: '90 Days', value: 7776000},];
-
-export const rssFrequencyOptions = [{key: 'once', text: 'Once', value: 0}, {
-    key: 'hourly', text: 'Hourly', value: 3600
-}, {key: '3hours', text: '3 hours', value: 10800}, {key: '12hours', text: '12 hours', value: 43200}, {
-    key: 'daily', text: 'Daily', value: 86400
-}, {key: 'weekly', text: 'Weekly', value: 604800}, {key: 'biweekly', text: 'Biweekly', value: 1209600}, {
-    key: '30days', text: '30 Days', value: 2592000
-}, {key: '90days', text: '90 Days', value: 7776000}, {key: '180days', text: '180 Days', value: 15552000}];
-
 export function secondsToFrequency(seconds) {
-    for (let i = 0; i < Object.keys(rssFrequencyOptions).length; i++) {
-        let d = rssFrequencyOptions[i];
-        if (d.value === seconds) {
-            return d.text;
-        }
-    }
-    return null;
+    const option = allFrequencyOptions[seconds];
+    return option ? option.text : null;
 }
 
 const secondsToYears = 31536000;
@@ -401,9 +404,19 @@ export function scrollToTopOfElement(element, smooth = true) {
     });
 }
 
-const useClearableInput = (searchStr, onChange, onClear, onSubmit, size = 'small', placeholder = 'Search...', icon = 'search') => {
+const useClearableInput = (searchStr, onChange, onClear, onSubmit, size = 'small', placeholder = 'Search...', icon = 'search', clearDisabled = null) => {
     const [value, setValue] = useState(searchStr || '');
     const [submitted, setSubmitted] = useState(false);
+
+    React.useEffect(() => {
+        // Search was changed above.
+        if (searchStr !== value) {
+            setValue(searchStr);
+        }
+        if (!searchStr) {
+            setValue('');
+        }
+    }, [searchStr, value]);
 
     const handleChange = (e) => {
         if (e) {
@@ -450,7 +463,9 @@ const useClearableInput = (searchStr, onChange, onClear, onSubmit, size = 'small
         size={size}
         onClick={handleClearSearch}
         type='button'
-        disabled={!!!value}
+        // If `clearDisabled` is provided, use it to disable the clear button.  Fallback to disabling if there is no
+        // search value.
+        disabled={clearDisabled !== null ? clearDisabled : !!!value}
         className='search-clear'
     />;
 
@@ -499,11 +514,12 @@ export function SearchResultsInput({
                                        action,
                                        actionIcon,
                                        clearable = false,
-                                       autoFocus = false,
+                                       clearDisabled = null,
                                        results = undefined,
                                        handleResultSelect = null,
                                        resultRenderer = undefined,
                                        loading = false,
+                                       inputRef = null,
                                        ...props
                                    }) {
     // A Semantic <Search> input with a Clear button.
@@ -512,7 +528,7 @@ export function SearchResultsInput({
         clearButton,
         localOnSubmit,
         handleChange,
-    } = useClearableInput(searchStr, onChange, onClear, onSubmit, size, placeholder);
+    } = useClearableInput(searchStr, onChange, onClear, onSubmit, size, placeholder, icon, clearDisabled);
 
     // Show a "Loading" message rather than "No results" while results are pending.
     const loadingResults = {'loading': {name: 'Loading', results: [{title: 'Results are pending...'}]}};
@@ -531,7 +547,7 @@ export function SearchResultsInput({
 
     return <Form onSubmit={localOnSubmit} {...props} className='search-container'>
         <Search category
-                input={{fluid: true, icon: icon}}
+                input={{fluid: true, icon: icon, ref: inputRef}}
                 placeholder={placeholder}
                 type='text'
                 onSearchChange={handleChange}
@@ -571,7 +587,7 @@ export function textEllipsis(str, maxLength = 100, {side = "end", ellipsis = "..
 }
 
 export function TabLinks({links}) {
-    const [searchParams, setSearchParams] = useSearchParams();
+    const [searchParams] = useSearchParams();
 
     const getTo = (to) => {
         return `${to}?${searchParams.toString()}`;
@@ -673,7 +689,7 @@ export function CardPoster({to, file}) {
         const image = <>
             {/* Replicate <Image label/> but with maxHeight applied to image */}
             {imageLabel}
-            <img alt='poster' src={posterPath} style={{maxHeight: '163px', width: 'auto'}}/>
+            <img alt='poster' src={posterPath} style={{maxHeight: '163px', maxWidth: '290px', width: 'auto'}}/>
         </>;
 
         if (to) {
@@ -711,23 +727,44 @@ export function CardPoster({to, file}) {
     }
 }
 
-export function HelpPopup({icon, size, content, position, iconSize = 'small'}) {
+export function InfoPopup({
+                              icon = 'info circle',
+                              size = null,
+                              content,
+                              position = 'left center',
+                              iconSize = null,
+                              header = '',
+                              iconStyle = {marginLeft: '0.25em', marginRight: '0.25em', marginTop: '-0.5em'},
+                          }) {
+    const trigger = <Icon link name={icon} size={iconSize} style={iconStyle}/>;
     return <Popup
         content={content}
-        size={size || null}
-        position={position || 'left center'}
-        trigger={<Icon circular link name={icon || 'question'} size={iconSize}
-                       style={{marginLeft: '0.25em', marginRight: '0.25em'}}
-        />}
+        size={size}
+        position={position}
+        header={header || null}
+        trigger={trigger}
+        hoverable={true}
     />
 }
 
-export function HelpHeader({icon, headerSize, iconSize, headerContent, popupContent}) {
-    return <div className='inline-header'>
-        <Header as={headerSize || 'h2'}>{headerContent}</Header>
+export function InfoHeader({
+                               icon,
+                               headerSize = 'h2',
+                               iconSize,
+                               headerContent,
+                               popupContent,
+                               popupPosition = null,
+                               for_ = null,
+                               required = false,
+                               ...props
+                           }) {
+    return <div className='inline-header' {...props}>
+        <label htmlFor={for_}>
+            <Header as={headerSize}>{headerContent} {required && <RequiredAsterisk/>}</Header>
+        </label>
         <span>
-                <HelpPopup content={popupContent} size={iconSize} icon={icon}/>
-            </span>
+            <InfoPopup content={popupContent} iconSize={iconSize} icon={icon} position={popupPosition}/>
+        </span>
     </div>
 }
 
@@ -741,7 +778,7 @@ export function HotspotToggle() {
             checked={on === true}
             onChange={checked => setHotspot(checked)}
         />
-        {disabled && <HelpPopup content='Hotspot is not supported on this server'/>}
+        {disabled && <InfoPopup content='Hotspot is not supported on this server'/>}
     </div>;
 }
 
@@ -755,11 +792,11 @@ export function ThrottleToggle() {
             checked={on === true}
             onChange={checked => setThrottle(checked)}
         />
-        {disabled && <HelpPopup content='CPU Power-save is not supported on this server'/>}
+        {disabled && <InfoPopup content='CPU Power-save is not supported on this server'/>}
     </div>;
 }
 
-export function Toggle({label, checked, disabled, onChange, icon}) {
+export function Toggle({label, checked, disabled, onChange, icon, popupContent = null}) {
     // Custom toggle because Semantic UI does not handle inverted labels correctly.
     const {t, inverted} = useContext(ThemeContext);
 
@@ -797,7 +834,7 @@ export function Toggle({label, checked, disabled, onChange, icon}) {
         icon = <Icon name={icon}/>
     }
 
-    return <>
+    const body = <span>
         <div className='toggle' onMouseUp={onMouseUp}>
             <input type="checkbox" className={inputClassName} checked={checked} onChange={onMouseUp}
                    data-testid='toggle'/>
@@ -807,7 +844,12 @@ export function Toggle({label, checked, disabled, onChange, icon}) {
             {icon}
             {label}
         </span>
-    </>
+    </span>
+
+    if (popupContent) {
+        return <Popup on='hover' trigger={body} content={popupContent}/>
+    }
+    return body
 }
 
 export function DisableDownloadsToggle() {
@@ -913,6 +955,8 @@ export function mimetypeIconName(mimetype, lowerPath = '') {
             return 'file word';
         } else if (mimetype.startsWith('application/x-x509-ca-cert')) {
             return 'certificate';
+        } else if (mimetype.startsWith('application/x-pie-executable')) {
+            return 'linux';
         } else if (mimetype.startsWith('application/octet-stream')) {
             if (lowerPath.endsWith('.mp3')) {
                 return 'file audio';
@@ -978,7 +1022,7 @@ export function DarkModeToggle() {
     return <Icon
         name={iconName}
         onClick={cycleSavedTheme}
-        style={{cursor: 'pointer'}}
+        style={{cursor: 'pointer', marginRight: '0.8em'}}
     />
 }
 
@@ -1011,30 +1055,59 @@ export function UnsupportedModal(header, message, icon) {
 }
 
 export function HotspotStatusIcon() {
-    const {on, setHotspot, dockerized} = useHotspot();
-    const {modal, doOpen} = UnsupportedModal('Unsupported', 'You cannot toggle the hotspot on this machine.');
-    const [confirmOpen, setConfirmOpen] = React.useState(false);
+    const {on, inUse, setHotspot, dockerized, hotspotSsid} = useHotspot();
+    const {modal: unsupportedModal, doOpen: openUnsupportedModal} =
+        UnsupportedModal('Unsupported', 'You cannot toggle the hotspot on this machine.');
+    const [disableHotspotOpen, setDisableHotspotOpen] = React.useState(false);
+    const [inUseOpen, setInUseOpen] = React.useState(false);
 
-    const handleConfirm = (e) => {
+    const handleConfirmDisable = (e) => {
         if (e) {
             e.preventDefault()
         }
-        setConfirmOpen(false);
+        setDisableHotspotOpen(false);
         setHotspot(false);
     }
 
-    if (dockerized === false && on === true) {
+    const handleConfirmInUse = (e) => {
+        if (e) {
+            e.preventDefault()
+        }
+        setInUseOpen(false);
+        setHotspot(true);
+    }
+
+    if (inUse === true) {
+        const content = hotspotSsid ? `Wifi device is in use for ${hotspotSsid}.  Disconnect and enable hotspot?`
+            : 'Wifi device is in use.  Disconnect and enable hotspot?'
+        return <>
+            <Confirm open={inUseOpen}
+                     onCancel={() => setInUseOpen(false)}
+                     onClose={() => setInUseOpen(false)}
+                     onConfirm={handleConfirmInUse}
+                     header='Wifi is in-use'
+                     content={content}
+                     confirmButton='Enable Hotspot'
+            />
+            <a href='#' onClick={() => setInUseOpen(true)}>
+                <IconGroup size='large'>
+                    <Icon name='wifi' disabled/>
+                    <Icon corner name='exclamation'/>
+                </IconGroup>
+            </a>
+        </>
+    } else if (dockerized === false && on === true) {
         return <>
             <Confirm
-                open={confirmOpen}
-                onCancel={() => setConfirmOpen(false)}
-                onClose={() => setConfirmOpen(false)}
-                onConfirm={handleConfirm}
+                open={disableHotspotOpen}
+                onCancel={() => setDisableHotspotOpen(false)}
+                onClose={() => setDisableHotspotOpen(false)}
+                onConfirm={handleConfirmDisable}
                 header='Disable the hotspot'
                 content='You will be disconnected when using the hotspot. Are you sure?'
                 confirmButton='Disable'
             />
-            <a href='#' onClick={() => setConfirmOpen(true)}>
+            <a href='#' onClick={() => setDisableHotspotOpen(true)}>
                 <IconGroup size='large'>
                     <Icon name='wifi' disabled={on !== true}/>
                     {on === false && <Icon corner name='x'/>}
@@ -1053,46 +1126,14 @@ export function HotspotStatusIcon() {
 
     // Hotspot is not available, or, status has not yet been fetched.
     return <>
-        <a href='#' onClick={doOpen}>
+        <a href='#' onClick={openUnsupportedModal}>
             <IconGroup size='large'>
                 <Icon name='wifi' disabled/>
                 <Icon corner name='question'/>
             </IconGroup>
         </a>
-        {modal}
+        {unsupportedModal}
     </>
-}
-
-export function CPUTemperatureIcon({size = 'large', fallback = null}) {
-    // Returns an Icon only if temperature is too high.
-    const {temperature, highTemperature, criticalTemperature} = useCPUTemperature();
-
-    if (temperature === null || temperature < highTemperature) {
-        // Temperature is not a problem.
-        return fallback;
-    }
-
-    let icon = temperature >= criticalTemperature ?
-        <Icon data-testid='cpuTemperatureIcon' name='thermometer' size={size} color='red'/>
-        : <Icon data-testid='cpuTemperatureIcon' name='thermometer half' size={size} color='yellow'/>;
-    icon = <Link to='/admin/status'>{icon}</Link>;
-
-    return <Popup content={`CPU: ${temperature}°C`} trigger={icon}/>
-}
-
-export function SystemLoadIcon({size = 'large', fallback = null}) {
-    const {minute_1, mediumLoad, highLoad} = useLoad();
-
-    if (!mediumLoad && !highLoad) {
-        return fallback;
-    }
-
-    // Only return the icon if the load is not low.
-    const color = highLoad ? 'red' : 'yellow';
-    let icon = <Link to='/admin/status'>
-        <Icon name='tachometer alternate' size={size} color={color}/>
-    </Link>;
-    return <Popup content={`Load: ${minute_1}`} trigger={icon}/>
 }
 
 export function useTitle(title) {
@@ -1115,23 +1156,28 @@ export function useTitle(title) {
     }, [title]);
 }
 
-export function DirectorySearch({onSelect, value, ...props}) {
+export function DirectorySearch({onSelect, value, disabled, required, ...props}) {
     const {
         directoryName,
         setDirectoryName,
         directories,
         channelDirectories,
         domainDirectories,
+        isDir,
         loading,
     } = useSearchDirectories(value);
     const [results, setResults] = useState();
 
     useEffect(() => {
-        if (
-            (directories && directories.length >= 0)
-            || (channelDirectories && channelDirectories.length >= 0)
-            || (domainDirectories && domainDirectories.length >= 0)) {
-            setResults({
+        if (directories && directories.length >= 0) {
+            const newDirectory = isDir ? {} : {
+                newDirectory: {
+                    name: 'New Directory',
+                    results: [{title: directoryName}],
+                }
+            };
+            const newResults = {
+                ...newDirectory,
                 directories: {
                     name: 'Directories',
                     results: directories.map(i => {
@@ -1149,8 +1195,9 @@ export function DirectorySearch({onSelect, value, ...props}) {
                     results: domainDirectories.map(i => {
                         return {title: i['path'], description: i['domain']};
                     }),
-                }
-            });
+                },
+            };
+            setResults(newResults);
         }
     }, [
         JSON.stringify(directories),
@@ -1163,9 +1210,6 @@ export function DirectorySearch({onSelect, value, ...props}) {
         if (e) {
             e.preventDefault();
         }
-        if (onSelect) {
-            onSelect('');
-        }
         setDirectoryName(data.value);
     }
 
@@ -1173,97 +1217,32 @@ export function DirectorySearch({onSelect, value, ...props}) {
         if (e) {
             e.preventDefault();
         }
+        setDirectoryName(data.result.title);
         // title is the relative path.
         if (onSelect) {
             onSelect(data.result.title);
         }
-        setDirectoryName(data.result.title);
     }
 
-    const handleClear = (e) => {
-        if (e) {
-            e.preventDefault();
-        }
-        onSelect('');
-        setDirectoryName('');
-    }
-
-    return <Grid>
-        <Grid.Row>
-            <Grid.Column mobile={13} tablet={14} computer={15}>
-                <Search category
-                        placeholder='Search directory names...'
-                        onSearchChange={handleSearchChange}
-                        onResultSelect={handleResultSelect}
-                        loading={loading}
-                        value={directoryName}
-                        results={results}
-                        {...props}
-                />
-            </Grid.Column>
-            <Grid.Column mobile={3} tablet={2} computer={1}>
-                <Button secondary icon='close' onClick={handleClear}/>
-            </Grid.Column>
-        </Grid.Row>
-    </Grid>
+    return <Search category
+                   placeholder='Search directory names...'
+                   onSearchChange={handleSearchChange}
+                   onResultSelect={handleResultSelect}
+                   loading={loading}
+                   value={directoryName}
+                   results={results}
+                   disabled={disabled}
+                   {...props}
+    />
 }
 
-export function DirectoryInput({disabled, error, placeholder, setInput, value, required, isDirectory}) {
-    const {directory, directories, setDirectory, isDir} = useDirectories(value);
-    const {settings} = useSettings();
-
-    if (!directories || !settings) {
-        return <></>;
-    }
-
-    const localSetInput = (e, {value}) => {
-        setInput(value);
-        setDirectory(value);
-    }
-
-    const {media_directory} = settings;
-    error = error || isDirectory && !isDir;
-
-    return <div>
-        <Input
-            action={{
-                color: error ? 'red' : 'green', labelPosition: 'left', icon: 'folder', content: media_directory,
-            }}
-            required={required}
-            disabled={disabled}
-            actionPosition='left'
-            value={directory}
-            onChange={localSetInput}
-            placeholder={placeholder}
-            list='directories'
-        />
-        <datalist id='directories'>
-            {directories.map(i => <option key={i} value={i}>{i}</option>)}
-        </datalist>
-    </div>;
-}
-
-export const BackButton = () => {
+export const BackButton = ({...props}) => {
     const navigate = useNavigate();
-    return <Button icon='arrow left' content='Back' onClick={() => navigate(-1)}/>;
+    return <Button icon='arrow left' content='Back' onClick={() => navigate(-1)} {...props}/>;
 }
 
 export const ColorToSemanticHexColor = (color) => {
-    const colorMap = {
-        red: '#db2828',
-        orange: '#f2711c',
-        yellow: '#fbbd08',
-        olive: '#b5cc18',
-        green: '#21ba45',
-        teal: '#00b5ad',
-        blue: '#2185d0',
-        violet: '#6435c9',
-        purple: '#a333c8',
-        pink: '#e03997',
-        brown: '#a5673f',
-        grey: '#767676',
-    }
-    return colorMap[color] || null;
+    return semanticUIColorMap[color] || null;
 }
 
 export const filterToMimetypes = (filter) => {
@@ -1396,7 +1375,10 @@ export function TagIcon() {
 }
 
 export function normalizeEstimate(estimate) {
-    return estimate > 999 ? '>999' : estimate;
+    if (Number.isInteger(estimate)) {
+        return estimate > 999 ? '>999' : estimate.toString();
+    }
+    return '?';
 }
 
 export function useAPIButton(
@@ -1407,16 +1389,19 @@ export function useAPIButton(
     disabled,
     confirmContent,
     confirmButton,
+    confirmHeader,
     themed = true,
     obeyWROLMode = false,
     icon = null,
+    type = 'button',
+    id = null,
     props
 ) {
     props = props || {};
     const ref = React.useRef();
 
     const [confirmOpen, setConfirmOpen] = React.useState(false);
-    const [pending, setPending] = React.useState(false);
+    const [loading, setLoading] = React.useState(false);
     const [animation, setAnimation] = React.useState('jiggle');
     const [animationVisible, setAnimationVisible] = React.useState(true);
     const [showSuccess, setShowSuccess] = React.useState(false);
@@ -1425,7 +1410,7 @@ export function useAPIButton(
     const wrolModeEnabled = useWROLMode();
 
     // Disable when API call is pending, or button is disabled.
-    disabled = pending || disabled;
+    disabled = loading || disabled;
     // Disable when WROL Mode is enabled, otherwise normal disabled.
     disabled = obeyWROLMode ? wrolModeEnabled || disabled : disabled;
 
@@ -1450,15 +1435,16 @@ export function useAPIButton(
 
     const handleAPICall = async () => {
         // Handle when user clicks button, or clicks confirm.
-        setPending(true);
+        setLoading(true);
         try {
             await onClick();
             setSuccess();
         } catch (e) {
             console.error(e);
             setFailure();
+        } finally {
+            setLoading(false);
         }
-        setPending(false);
     }
 
     const localOnClick = async (e) => {
@@ -1487,7 +1473,14 @@ export function useAPIButton(
     }
 
     // Create button with or without theme.  Pass all props to the <Button/> (except props.children).
-    const buttonArgs = {color, onClick: localOnClick, disabled, loading: pending, size, floated, ...props};
+    const buttonArgs = {
+        color, onClick: localOnClick, disabled, loading, size, floated, type,
+        ...props
+    };
+
+    if (id) {
+        buttonArgs['id'] = id;
+    }
 
     let buttonContent = props.children || null;
     if (icon) {
@@ -1521,13 +1514,10 @@ export function useAPIButton(
                      onCancel={() => setConfirmOpen(false)}
                      onConfirm={localOnConfirm}
                      confirmButton={confirmButton}
+                     header={confirmHeader}
             />
         </>
     }
-
-    button = <>
-        {button}
-    </>
 
     return {button, ref}
 }
@@ -1540,9 +1530,12 @@ export function APIButton({
                               disabled,
                               confirmContent,
                               confirmButton,
+                              confirmHeader,
                               themed,
                               obeyWROLMode,
                               icon,
+                              type = 'button',
+                              id = null,
                               ...props
                           }) {
     const {button} = useAPIButton(
@@ -1553,26 +1546,51 @@ export function APIButton({
         disabled,
         confirmContent,
         confirmButton,
+        confirmHeader,
         themed,
         obeyWROLMode,
         icon,
+        type,
+        id,
         props
     );
 
     return button;
 }
 
-export function InfoMessage({children, size = null}) {
-    return <Message info icon size={size}>
-        <SIcon name='question'/>
+export const useMessageDismissal = (messageName) => {
+    const [dismissed, setDismissed] = useLocalStorage('dismissed_hints', {});
+
+    return {
+        dismissed: dismissed[messageName] || false, // true or false
+        setDismissed: (value) => setDismissed({...dismissed, [messageName]: !!value}), // force true/false
+        clearAll: () => setDismissed({}),
+    }
+}
+
+export function InfoMessage({children, size = null, storageName = null, icon = 'info circle'}) {
+    const {dismissed, setDismissed} = useMessageDismissal(storageName);
+
+    if (dismissed) {
+        return <React.Fragment/>
+    }
+
+    return <Message info icon size={size} onDismiss={storageName ? () => setDismissed(true) : undefined}>
+        <SIcon name={icon}/>
         <Message.Content>
             {children}
         </Message.Content>
     </Message>
 }
 
-export function WarningMessage({children, size = null}) {
-    return <Message warning icon size={size}>
+export function HandPointMessage({children, size = null, storageName = null}) {
+    const {dismissed, setDismissed} = useMessageDismissal(storageName);
+
+    if (dismissed) {
+        return <React.Fragment/>
+    }
+
+    return <Message info icon size={size} onDismiss={storageName ? () => setDismissed(true) : undefined}>
         <SIcon name='hand point right'/>
         <Message.Content>
             {children}
@@ -1580,10 +1598,34 @@ export function WarningMessage({children, size = null}) {
     </Message>
 }
 
-export function ErrorMessage({children, size = null}) {
-    return <Message error icon size={size}>
-        <SIcon name='exclamation'/>
-        <Message.Content>{children}</Message.Content>
+export function WarningMessage({children, size = null, icon = 'exclamation', storageName = null}) {
+    const {dismissed, setDismissed} = useMessageDismissal(storageName);
+
+    if (dismissed) {
+        return <React.Fragment/>
+    }
+
+    // Use color='yellow' because "warning" does not work.
+    return <Message color='yellow' icon size={size} onDismiss={storageName ? () => setDismissed(true) : undefined}>
+        <SIcon name={icon}/>
+        <Message.Content>
+            {children}
+        </Message.Content>
+    </Message>
+}
+
+export function ErrorMessage({children, size = null, icon = 'exclamation', storageName = null}) {
+    const {dismissed, setDismissed} = useMessageDismissal(storageName);
+
+    if (dismissed) {
+        return <React.Fragment/>
+    }
+
+    return <Message negative icon size={size} onDismiss={storageName ? () => setDismissed(true) : undefined}>
+        <SIcon name={icon}/>
+        <Message.Content>
+            {children}
+        </Message.Content>
     </Message>
 }
 
@@ -1614,4 +1656,340 @@ function levenshteinDistance(a, b) {
 
 export function fuzzyMatch(a, b, threshold = 3) {
     return levenshteinDistance(a, b) <= threshold;
+}
+
+export function useIsIgnoredDirectory(directory) {
+    const {settings} = React.useContext(SettingsContext);
+
+    if (!settings || _.isEmpty(settings)) {
+        // Settings have not yet been fetched.
+        return false;
+    }
+
+    let ignoredDirectories = settings['ignored_directories'];
+    if (directory.endsWith('/')) {
+        ignoredDirectories = ignoredDirectories.map(i => `${i}/`);
+    }
+
+    return ignoredDirectories.indexOf(directory) >= 0;
+}
+
+export function getParentDirectory(filePath) {
+    // Remove trailing slashes for consistency
+    const normalizedPath = filePath.endsWith('/') ? filePath.slice(0, -1) : filePath;
+
+    // Find the last occurrence of "/" and extract the substring up to it
+    const parentDirectory = normalizedPath.substring(0, normalizedPath.lastIndexOf('/'));
+
+    return parentDirectory;
+}
+
+export function MultilineText({text, ...props}) {
+    return <div {...props}>
+        {text.split('\n').map((line, index, array) =>
+            index === array.length - 1 ? line : <p key={index}>{line}</p>
+        )}
+    </div>
+}
+
+export const monthNames = [
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December',
+];
+
+export function IframeViewer({title, src, fallback, style, timeout = 5000}) {
+    // This function checks that an iframe can be fetched before displaying it.  Otherwise, it will display the fallback
+    // element which should help the maintainer to fix the issue.
+    const [contentAvailable, setContentAvailable] = useState(false);
+    const [loading, setLoading] = useState(true);
+
+    const {s} = React.useContext(ThemeContext);
+    fallback = fallback || <pre {...s}>Frame could not load.</pre>;
+
+    useEffect(() => {
+        const controller = new AbortController();  // To manage fetch timeout
+        const timeoutId = setTimeout(() => {
+            controller.abort();  // Abort the fetch after 5 seconds
+        }, timeout);
+
+        fetch(src, {signal: controller.signal})
+            .then(response => {
+                // Only display content if it can be fetched.
+                setContentAvailable(response.ok);
+            })
+            .catch(() => {
+                setContentAvailable(false);  // Handle fetch errors (including aborts)
+            })
+            .finally(() => {
+                setLoading(false);  // Update loading state regardless of result
+                clearTimeout(timeoutId);  // Clear the timeout
+            });
+
+        return () => clearTimeout(timeoutId);  // Cleanup timeout on unmount
+    }, [src]);
+
+    // Mobile needs less height, otherwise it hides the content below the screen.
+    let mobileStyle = {
+        position: 'fixed',
+        height: '80%',
+        width: '100%',
+        border: 'none',
+        padding: 0,
+        backgroundColor: '#FFFFFF',
+    };
+    // Allow provided `style` to overwrite.
+    mobileStyle = style ? {...mobileStyle, ...style} : mobileStyle;
+    let tabletStyle = {...mobileStyle, height: '93%'};
+    tabletStyle = style ? {...tabletStyle, ...style} : tabletStyle;
+
+    const iframeMedia = <>
+        <Media at='mobile'>
+            <iframe title={title} src={src} style={mobileStyle}/>
+        </Media>
+        <Media greaterThan='mobile'>
+            <iframe title={title} src={src} style={tabletStyle}/>
+        </Media>
+    </>;
+
+    const dimmer = <DimmerDimmable as={Segment} dimmed={true}><Dimmer active><Loader/></Dimmer></DimmerDimmable>;
+    return <>
+        {loading ? dimmer
+            : contentAvailable ? iframeMedia
+                : fallback
+        }
+    </>
+}
+
+export function roundDigits(value, decimals = 2) {
+    return Number(Math.round(value + 'e' + decimals) + 'e-' + decimals);
+}
+
+
+export function Breadcrumbs({crumbs, size = undefined}) {
+    function getSection(crumb) {
+        const {text, link, icon} = crumb;
+        let contents = text;
+        if (link) {
+            contents = <Link to={link}>
+                {icon && <Icon name={icon}/>}
+                {text}
+            </Link>;
+        }
+        return <BreadcrumbSection>{contents}</BreadcrumbSection>
+    }
+
+    return <Breadcrumb size={size}>
+        {crumbs.map((crumb, index) => (
+            <React.Fragment key={index}>
+                {getSection(crumb)}
+                {index < crumbs.length - 1 && <BreadcrumbDivider icon='right chevron'/>}
+            </React.Fragment>
+        ))}
+    </Breadcrumb>
+}
+
+export function validURL(url) {
+    return !(url && !validUrlRegex.test(url));
+}
+
+export function validURLs(urls) {
+    if (!!!urls) {
+        // Invalid while empty.
+        return false;
+    }
+    urls = urls.split(/\r?\n/);
+    for (let i = 0; i < urls.length; i++) {
+        if (!validURL(urls[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+export function useLocalStorage(key, initialValue, decode = JSON.parse, encode = JSON.stringify) {
+    // Use localstorage to store some JSON encode-able.
+
+    // Initialize state with the value from localStorage or initial value
+    const [value, setValue] = useState(() => {
+        let item;
+        try {
+            const item = window.localStorage.getItem(key);
+            // Parse the stored item (integer, bool, etc.).  Use the initial value if empty.
+            return item ? decode(item) : initialValue;
+        } catch (error) {
+            console.error('useLocalStorage', key, item, initialValue);
+            console.error('Error reading localStorage:', error);
+            return initialValue;
+        }
+    });
+
+    // Save to localStorage when the value changes
+    useEffect(() => {
+        if (key === null || key === undefined) {
+            // key was not defined, do not add this to storage.
+            return
+        }
+        try {
+            decode(value);
+            window.localStorage.setItem(key, value);
+        } catch (error) {
+            window.localStorage.setItem(key, encode(value));
+        }
+    }, [key, value, encode]);
+
+    // Return the stored value and a function to update it
+    return [value, setValue];
+}
+
+export function useLocalStorageInt(key, initialValue) {
+    // Use localStorage to store an integer.
+    const [storedValue, setStoredValue] = useLocalStorage(key, initialValue, parseInt, (num) => num.toString());
+    return [storedValue, setStoredValue];
+}
+
+export function SimpleAccordion({title = 'Advanced', ...props}) {
+    const [active, setActive] = React.useState(false);
+
+    return <Accordion>
+        <AccordionTitle
+            active={active}
+            onClick={() => setActive(!active)}
+        >
+            <Icon name='dropdown'/>
+            {title}
+        </AccordionTitle>
+        <AccordionContent active={active}>
+            {props.children}
+        </AccordionContent>
+    </Accordion>
+}
+
+export function mergeDeep(target, source) {
+    if (_.isEmpty(source)) {
+        return target;
+    }
+
+    // Initialize the result as target
+    let result = Object.assign({}, target);
+
+    for (let key of Object.keys(source)) {
+        if (Array.isArray(source[key])) {
+            // source overwrites target if it is a list with values.
+            result[key] = source[key] || target[key];
+        } else if (typeof source[key] === 'object' && typeof target[key] === 'object' && source[key] !== null) {
+            result[key] = mergeDeep(target[key] || {}, source[key]);
+        } else {
+            result[key] = source[key] !== undefined ? source[key] : target[key];
+        }
+    }
+
+    return result;
+}
+
+export function getDistinctColor(hexColors) {
+    function hexToHSL(hex) {
+        if (!hex) {
+            return {h: 0, s: 0, l: 0};
+        }
+        let r = parseInt(hex.slice(1, 3), 16) / 255;
+        let g = parseInt(hex.slice(3, 5), 16) / 255;
+        let b = parseInt(hex.slice(5, 7), 16) / 255;
+
+        let cmax = Math.max(r, g, b), cmin = Math.min(r, g, b);
+        let delta = cmax - cmin;
+        let h, s, l = (cmax + cmin) / 2;
+
+        if (delta === 0) h = 0;
+        else if (cmax === r) h = ((g - b) / delta) % 6;
+        else if (cmax === g) h = (b - r) / delta + 2;
+        else h = (r - g) / delta + 4;
+
+        h = Math.round(h * 60);
+        if (h < 0) h += 360;
+
+        s = delta === 0 ? 0 : delta / (1 - Math.abs(2 * l - 1));
+
+        return {h: h, s: s, l: l};
+    }
+
+    function hslToHex(h, s, l) {
+        l /= 100;
+        const a = s * Math.min(l, 1 - l) / 100;
+        const f = n => {
+            const k = (n + h / 30) % 12;
+            const color = l - a * Math.max(Math.min(k - 3, 9 - k, 1), -1);
+            return Math.round(255 * color).toString(16).padStart(2, '0');
+        };
+        return `#${f(0)}${f(8)}${f(4)}`;
+    }
+
+    function generateRandomHSL() {
+        return {
+            h: Math.random() * 360,
+            s: Math.random() * 100,
+            l: Math.random() * 100
+        };
+    }
+
+    function isDistinct(newColor, existingColors, threshold) {
+        const hslNew = newColor;
+        for (const color of existingColors) {
+            const hslColor = hexToHSL(color);
+            const h = Math.abs(hslNew.h - hslColor.h);
+            const s = Math.abs(hslNew.s * 100 - hslColor.s * 100);
+            const l = Math.abs(hslNew.l - hslColor.l * 100);
+            if (h < threshold && s < threshold && l < threshold) {
+                console.debug(`trying distinct color h=${h} s=${s} l=${l} with threshold=${threshold}`);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    let newColor, attempt = 0;
+    const maxAttempts = 1000; // Max attempts before returning any color
+    const baseThreshold = 30; // Starting threshold
+
+    do {
+        newColor = generateRandomHSL();
+        // Decreasing threshold as attempts increase, but never below 10 for distinctiveness
+        let threshold = Math.max(baseThreshold - (attempt / 10), 10);
+        if (isDistinct(newColor, hexColors, threshold)) {
+            return hslToHex(newColor.h, newColor.s, newColor.l);
+        }
+        attempt++;
+    } while (attempt < maxAttempts);
+
+    // If we've tried maxAttempts times, return the last generated color regardless
+    return hslToHex(newColor.h, newColor.s, newColor.l);
+}
+
+export const RefreshHeader = ({header, headerSize = 'h2', onRefresh, popupContents}) => {
+    const refreshButton = <APIButton icon='refresh' onClick={onRefresh}/>;
+    let popup;
+    if (popupContents) {
+        popup = <Popup
+            content={popupContents}
+            on='hover'
+            trigger={refreshButton}
+        />;
+    }
+    return <Grid columns={2}>
+        <GridRow>
+            <GridColumn>
+                <Header as={headerSize}>{header}</Header>
+            </GridColumn>
+            <GridColumn textAlign='right'>{popup || refreshButton}</GridColumn>
+        </GridRow>
+    </Grid>
 }

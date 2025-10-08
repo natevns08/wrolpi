@@ -2,8 +2,10 @@ import React, {useContext} from "react";
 import {
     APIButton,
     ErrorMessage,
-    HelpPopup,
+    HandPointMessage,
+    InfoPopup,
     humanFileSize,
+    IframeViewer,
     InfoMessage,
     PageContainer,
     TabLinks,
@@ -26,53 +28,49 @@ import {
     TableRow
 } from "semantic-ui-react";
 import Message from "semantic-ui-react/dist/commonjs/collections/Message";
-import {Loader, Placeholder, Table} from "./Theme";
+import {Header, Loader, Placeholder, Segment, Table} from "./Theme";
 import {StatusContext} from "../contexts/contexts";
 import _ from "lodash";
+import {MAP_VIEWER_URI} from "./Vars";
 
 function DockerMapImportWarning() {
     const {status} = useContext(StatusContext);
     if (status['dockerized']) {
-        return <Message negative icon>
-            <SIcon name='hand point right'/>
-            <Message.Content>
-                <Message.Header>
-                    Maps are not fully supported in a Docker container!
-                </Message.Header>
+        return <ErrorMessage storageName='hint_map_docker_warning'>
+            <Message.Header>
+                Maps are not fully supported in a Docker container!
+            </Message.Header>
 
-                <p><b>Only one PBF can be imported and displayed in the docker container.</b></p>
+            <p><b>Only one PBF can be imported and displayed in the docker container.</b></p>
 
-                <p>To import a map file, run the following docker-compose commands:</p>
-                <pre>  docker-compose stop map</pre>
-                <pre>  docker-compose rm map</pre>
-                <pre>  docker-compose run --rm -v /absolute/path/to/map.osm.pbf:/data.osm.pbf
-                        -v openstreetmap-data:/var/lib/postgresql/12/main map import
-                    </pre>
+            <p>To import a map file, run the following docker-compose commands:</p>
+            <pre>  docker-compose stop map</pre>
+            <pre>  docker-compose rm map</pre>
+            <pre>  docker-compose run --rm -v /absolute/path/to/map.osm.pbf:/data.osm.pbf
+                    -v openstreetmap-data:/var/lib/postgresql/12/main map import
+                </pre>
 
-                <p>Be sure to change <b>/absolute/path/to/map.osm.pbf</b>!</p>
+            <p>Be sure to change <b>/absolute/path/to/map.osm.pbf</b>!</p>
 
-                <p>After you have imported a new PBF file, you need to clear the rendered tile cache:</p>
-                <pre>  docker volume rm openstreetmap-rendered-tiles</pre>
-                <pre>  docker volume create openstreetmap-rendered-tiles</pre>
+            <p>After you have imported a new PBF file, you need to clear the rendered tile cache:</p>
+            <pre>  docker volume rm openstreetmap-rendered-tiles</pre>
+            <pre>  docker volume create openstreetmap-rendered-tiles</pre>
 
-                <p>Start your map container:</p>
-                <pre>  docker-compose up -d map</pre>
+            <p>Start your map container:</p>
+            <pre>  docker-compose up -d map</pre>
 
-                <Divider/>
+            <Divider/>
 
-                <p>You can merge multiple PBF files using osmium (the merged file can then be imported):</p>
-                <pre>  osmium merge file1.osm.pbf file2.osm.pbf -o merged.osm.pbf</pre>
-            </Message.Content>
-        </Message>;
+            <p>You can merge multiple PBF files using osmium (the merged file can then be imported):</p>
+            <pre>  osmium merge file1.osm.pbf file2.osm.pbf -o merged.osm.pbf</pre>
+        </ErrorMessage>;
     }
     return <></>;
 }
 
 function DownloadMessage() {
-    return <InfoMessage>
-        <Message.Header>
-            Where do I get map files?
-        </Message.Header>
+    return <InfoMessage storageName='hint_map_download'>
+        <Message.Header>Where do I get map files?</Message.Header>
 
         <p>You can download map files from&nbsp;
             <a href='https://download.geofabrik.de/'>https://download.geofabrik.de/</a>
@@ -88,9 +86,15 @@ function DownloadMessage() {
     </InfoMessage>
 }
 
+const ViewerMessage = () => {
+    return <HandPointMessage>
+        <p>You can view your Map at <a href={MAP_VIEWER_URI}>{MAP_VIEWER_URI}</a></p>
+    </HandPointMessage>
+}
+
 function SlowImportMessage() {
     const {status} = useContext(StatusContext);
-    if (status && status['cpu_info'] && status['cpu_info']['temperature'] >= 80) {
+    if (status && status['cpu_stats'] && status['cpu_stats']['temperature'] >= 80) {
         return <Message warning icon>
             <SIcon name='exclamation'/>
             <Message.Content>
@@ -241,9 +245,9 @@ class ManageMap extends React.Component {
             </TableRow>
         }
 
-        let spaceHelpPopup = <HelpPopup
+        let spaceInfoPopup = <InfoPopup
             content='Upon importing, a PBF file will consume more disk space than the original file.'/>;
-        let timeHelpPopup = <HelpPopup content='Estimated for a Raspberry Pi 4'/>;
+        let timeInfoPopup = <InfoPopup content='Estimated for a Raspberry Pi 4'/>;
 
         return <PageContainer>
             <WROLModeMessage content='Cannot modify Map'/>
@@ -259,8 +263,8 @@ class ManageMap extends React.Component {
                         <TableHeaderCell>PBF File</TableHeaderCell>
                         <TableHeaderCell>Imported</TableHeaderCell>
                         <TableHeaderCell>Size</TableHeaderCell>
-                        <TableHeaderCell>Space Required {spaceHelpPopup}</TableHeaderCell>
-                        <TableHeaderCell>Time to Import {timeHelpPopup}</TableHeaderCell>
+                        <TableHeaderCell>Space Required {spaceInfoPopup}</TableHeaderCell>
+                        <TableHeaderCell>Time to Import {timeInfoPopup}</TableHeaderCell>
                     </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -276,20 +280,28 @@ class ManageMap extends React.Component {
                 </TableFooter>
             </Table>
             <DownloadMessage/>
+            <ViewerMessage/>
         </PageContainer>
     }
 }
 
 function MapPage() {
-    return <iframe
-        title='map'
-        src={`http://${window.location.hostname}:8084/`}
-        style={{
-            position: 'fixed',
-            height: '100%',
-            width: '100%',
-            border: 'none',
-        }}/>
+    const fallback = <Segment>
+        <Header as='h3'>Failed to fetch Map service.</Header>
+        <p>You may need to give permission to access the page: <a href={MAP_VIEWER_URI}>{MAP_VIEWER_URI}</a></p>
+
+        <p>Map startup is delayed on boot, if you have just started your WROLPi try again in a few minutes.</p>
+
+        <p>If the above does not work, try starting the service:</p>
+        <pre>sudo systemctl start renderd</pre>
+        <pre>sudo systemctl start apache2</pre>
+
+        <p>Check the logs</p>
+        <pre>journalctl -u renderd</pre>
+        <pre>sudo tail -f /var/log/apache2/*log</pre>
+    </Segment>;
+
+    return <IframeViewer title='map' src={MAP_VIEWER_URI} fallback={fallback}/>
 }
 
 export function MapRoute() {

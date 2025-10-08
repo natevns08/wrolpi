@@ -9,8 +9,8 @@ from wrolpi.files.models import FileGroup
 
 
 @pytest.mark.asyncio
-async def test_pdf_title(test_session, example_pdf):
-    """PDF modeler extracts a PDF's title and contents."""
+async def test_pdf_title(async_client, test_session, example_pdf):
+    """PDF modeler extracts a PDFs title and contents."""
     await files_lib.refresh_files()
 
     with mock.patch('wrolpi.files.pdfs.get_pdf_metadata') as mock_get_pdf_metadata:

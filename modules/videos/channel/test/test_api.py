@@ -1,19 +1,23 @@
-import asyncio
 import json
 import pathlib
+import shutil
 import tempfile
-import time
 from datetime import timedelta
 from http import HTTPStatus
 
 import mock
 import pytest
 
-from modules.videos.channel.lib import delete_channel
-from modules.videos.models import Channel
+from modules.videos.common import get_videos_directory
+from modules.videos.conftest import simple_channel
+from modules.videos.downloader import ChannelDownloader
+from modules.videos.lib import save_channels_config, get_channels_config
+from modules.videos.models import Channel, Video
+from wrolpi.common import get_relative_to_media_directory, walk
 from wrolpi.dates import now
 from wrolpi.db import get_db_session
-from wrolpi.downloader import download_manager, Download, DownloadResult
+from wrolpi.downloader import Download, DownloadResult
+from wrolpi.files.models import Directory
 from wrolpi.test.common import assert_dict_contains
 
 
@@ -40,7 +44,7 @@ def test_get_video(test_client, test_session, simple_channel, video_factory):
     assert response.status_code == HTTPStatus.NOT_FOUND, response.json
     assert response.json == {'code': 'UNKNOWN_VIDEO',
                              'error': 'Cannot find Video with id 10',
-                             'summary': 'The video could not be found.'}
+                             'message': 'The video could not be found.'}
 
     # Get the video info we inserted
     _, response = test_client.get('/api/videos/video/1')
@@ -52,124 +56,40 @@ def test_get_video(test_client, test_session, simple_channel, video_factory):
     assert_dict_contains(response.json['next'], {'title': 'vid2'})
 
 
-def test_channel_no_download_frequency(test_client, test_session, test_directory, simple_channel):
+@pytest.mark.asyncio
+async def test_channel_no_download_frequency(async_client, test_session, test_directory, simple_channel,
+                                             test_download_manager):
     """A channel does not require a download frequency."""
     # No downloads are scheduled.
-    assert len(download_manager.get_downloads(test_session)) == 0
+    assert len(test_download_manager.get_downloads(test_session)) == 0
 
     # Get the Channel
-    request, response = test_client.get('/api/videos/channels/1')
+    request, response = await async_client.get('/api/videos/channels/1')
+    assert response.status_code == HTTPStatus.OK
     channel = response.json['channel']
-    assert channel['download_frequency'] is None
+    assert not channel['downloads']
 
     # Update the Channel with a frequency.
-    new_channel = dict(
-        directory=channel['directory'],
-        name=channel['name'],
-        url=channel['url'],
-        download_frequency=10,
-    )
-    request, response = test_client.put(f'/api/videos/channels/{simple_channel.id}',
-                                        content=json.dumps(new_channel))
+    new_download = {'urls': [simple_channel.url], 'frequency': 10, 'downloader': ChannelDownloader.name}
+    request, response = await async_client.post('/api/download', json=new_download)
+    assert response.status_code == HTTPStatus.CREATED, response.json
+
+    # Download is scheduled.  Download is related to Channel.
+    assert len(test_download_manager.get_downloads(test_session)) == 1
+    request, response = await async_client.get('/api/videos/channels/1')
+    channel = response.json['channel']
+    assert channel['downloads']
+    downloads = channel['downloads']
+    assert len(downloads) == 1 and downloads[0]['url'] == simple_channel.url
+    assert test_session.query(Download).one()
+    download_id = channel['downloads'][0]['id']
+
+    # Deleting Download does not delete Channel.
+    request, response = await async_client.delete(f'/api/download/{download_id}')
     assert response.status_code == HTTPStatus.NO_CONTENT, response.json
-
-    # Download is scheduled.
-    assert len(download_manager.get_downloads(test_session)) == 1
-
-    # Remove the frequency.
-    new_channel = dict(
-        directory=channel['directory'],
-        name=channel['name'],
-        url=channel['url'],
-        download_frequency=None,
-    )
-    request, response = test_client.put(f'/api/videos/channels/{simple_channel.id}',
-                                        content=json.dumps(new_channel))
-    assert response.status_code == HTTPStatus.NO_CONTENT, response.json
-
-
-@pytest.mark.asyncio
-async def test_channel_frequency_update(download_channel, test_async_client, test_session, test_download_manager):
-    """
-    A Channel's Download record is updated when the Channel's frequency is updated.
-    """
-    old_frequency = download_channel.get_download().frequency
-    assert old_frequency
-
-    data = dict(
-        directory=str(download_channel.directory),
-        name=download_channel.name,
-        url=download_channel.url,
-        download_frequency=100,
-    )
-    request, response = await test_async_client.put(f'/api/videos/channels/{download_channel.id}', json=data)
-    assert response.status_code == HTTPStatus.NO_CONTENT, response.json
-
-    download = download_channel.get_download()
-    assert download.frequency == 100
-
-    # Only one download
-    downloads = test_session.query(Download).all()
-    assert len(list(downloads)) == 1
-
-
-@pytest.mark.asyncio
-async def test_channel_download_crud(test_session, simple_channel, test_downloader_config):
-    """Modifying a Channel modifies its Download."""
-    assert simple_channel.url
-    assert simple_channel.download_frequency is None
-
-    simple_channel.update({'download_frequency': 1000})
-    test_session.commit()
-
-    download: Download = test_session.query(Download).one()
-    assert simple_channel.get_download() == download
-    assert simple_channel.url == download.url
-    assert simple_channel.download_frequency == download.frequency
-
-    # Increase the frequency to 1 second.
-    simple_channel.update({'download_frequency': 1})
-    test_session.commit()
-    assert simple_channel.url == download.url
-    assert simple_channel.download_frequency == download.frequency == 1
-    assert test_session.query(Download).count() == 1
-
-    # Changing the Channel's URL changes the download's URL.
-    simple_channel.update({'url': 'https://example.com/new url'})
-    test_session.commit()
-    assert simple_channel.url == 'https://example.com/new url'
-    assert simple_channel.download_frequency == download.frequency == 1
-    assert test_session.query(Download).count() == 1
-
-    # Removing the Channel's frequency removes the download.
-    simple_channel.update({'download_frequency': None})
-    test_session.commit()
-    assert test_session.query(Download).count() == 0
-
-    # Removing the URL is supported.
-    simple_channel.update({'url': None})
-    test_session.commit()
-
-    # Adding a URL is supported.
-    simple_channel.update({'url': 'https://example.com'})
-    test_session.commit()
-
-    # Adding a frequency adds a Download.
-    simple_channel.update({'download_frequency': 1})
-    test_session.commit()
-    assert test_session.query(Download).count() == 1
-    next_download = simple_channel.get_download().next_download
-    assert next_download
-
-    # Next download isn't overwritten.
-    time.sleep(1)
-    simple_channel.update({'name': 'new name'})
-    test_session.commit()
-    assert simple_channel.get_download().next_download == next_download
-
-    # Deleting a Channel deletes it's Download.
-    delete_channel(channel_id=simple_channel.id)
-    assert test_session.query(Download).count() == 0
+    assert not test_download_manager.get_downloads(test_session)
+    assert not test_session.query(Download).all()
+    assert test_session.query(Channel).count() == 1
 
 
 def test_video_file_name(test_session, simple_video, test_client):
@@ -180,21 +100,21 @@ def test_video_file_name(test_session, simple_video, test_client):
     assert resp.json['file_group']['video'].get('stem') == 'simple_video'
 
 
-def test_channel_conflicts(test_client, test_session, test_directory):
+@pytest.mark.asyncio
+async def test_channel_conflicts(async_client, test_session, test_directory):
     channel_directory = tempfile.TemporaryDirectory(dir=test_directory).name
     pathlib.Path(channel_directory).mkdir()
     new_channel = dict(
         directory=channel_directory,
-        match_regex='asdf',
         name='Example Channel 1',
         url='https://example.com/channel1',
     )
 
-    def _post_channel(channel):
-        return test_client.post('/api/videos/channels', content=json.dumps(channel))
+    async def _post_channel(channel):
+        return await async_client.post('/api/videos/channels', content=json.dumps(channel))
 
     # Create it
-    request, response = _post_channel(new_channel)
+    request, response = await _post_channel(new_channel)
     assert response.status_code == HTTPStatus.CREATED
 
     # Name is an exact match
@@ -204,28 +124,28 @@ def test_channel_conflicts(test_client, test_session, test_directory):
         directory=channel_directory2,
         name='Example Channel 1',
     )
-    request, response = _post_channel(new_channel)
+    request, response = await _post_channel(new_channel)
     assert response.status_code == HTTPStatus.BAD_REQUEST
     assert response.json == {'cause': {'code': 'CHANNEL_NAME_CONFLICT',
-                                       'error': '',
-                                       'summary': 'The channel name is already taken.'},
+                                       'error': 'Bad Request',
+                                       'message': 'The channel name is already taken.'},
                              'code': 'VALIDATION_ERROR',
-                             'error': '',
-                             'summary': 'Could not validate the contents of the request'}
+                             'error': 'Bad Request',
+                             'message': 'Could not validate the contents of the request'}
 
     # Directory was already used
     new_channel = dict(
         directory=channel_directory,
         name='name is fine',
     )
-    request, response = _post_channel(new_channel)
+    request, response = await _post_channel(new_channel)
     assert response.status_code == HTTPStatus.BAD_REQUEST
     assert response.json == {'cause': {'code': 'CHANNEL_DIRECTORY_CONFLICT',
-                                       'error': '',
-                                       'summary': 'The directory is already used by another channel.'},
+                                       'error': 'Bad Request',
+                                       'message': 'The directory is already used by another channel.'},
                              'code': 'VALIDATION_ERROR',
-                             'error': '',
-                             'summary': 'Could not validate the contents of the request'}
+                             'error': 'Bad Request',
+                             'message': 'Could not validate the contents of the request'}
 
     # URL is already used
     channel_directory3 = tempfile.TemporaryDirectory(dir=test_directory).name
@@ -235,14 +155,14 @@ def test_channel_conflicts(test_client, test_session, test_directory):
         name='name is fine',
         url='https://example.com/channel1',
     )
-    request, response = _post_channel(new_channel)
+    request, response = await _post_channel(new_channel)
     assert response.status_code == HTTPStatus.BAD_REQUEST
     assert response.json == {'cause': {'code': 'CHANNEL_URL_CONFLICT',
-                                       'error': '',
-                                       'summary': 'The URL is already used by another channel.'},
+                                       'error': 'Bad Request',
+                                       'message': 'The URL is already used by another channel.'},
                              'code': 'VALIDATION_ERROR',
-                             'error': '',
-                             'summary': 'Could not validate the contents of the request'}
+                             'error': 'Bad Request',
+                             'message': 'Could not validate the contents of the request'}
 
 
 def test_channel_empty_url_doesnt_conflict(test_client, test_session, test_directory):
@@ -250,34 +170,29 @@ def test_channel_empty_url_doesnt_conflict(test_client, test_session, test_direc
     channel_directory = tempfile.TemporaryDirectory(dir=test_directory).name
     pathlib.Path(channel_directory).mkdir()
 
-    new_channel = {
-        'name': 'Fooz',
-        'directory': channel_directory,
-    }
-    request, response = test_client.post('/api/videos/channels', content=json.dumps(new_channel))
+    new_channel = dict(name='Fooz', directory=channel_directory)
+    request, response = test_client.post('/api/videos/channels', json=new_channel)
     assert response.status_code == HTTPStatus.CREATED, response.json
     location = response.headers['Location']
 
     channel_directory2 = tempfile.TemporaryDirectory(dir=test_directory).name
     pathlib.Path(channel_directory2).mkdir()
-    new_channel = {
-        'name': 'Barz',
-        'directory': channel_directory2,
-    }
-    request, response = test_client.post('/api/videos/channels', content=json.dumps(new_channel))
+    new_channel = dict(name='Barz', directory=channel_directory2)
+    request, response = test_client.post('/api/videos/channels', json=new_channel)
     assert response.status_code == HTTPStatus.CREATED, response.json
     assert location != response.headers['Location']
 
 
 @pytest.mark.asyncio
-async def test_channel_download_requires_refresh(test_session, download_channel, video_download_manager, video_factory,
-                                                 events_history):
+async def test_channel_download_requires_refresh(
+        async_client, test_session, mock_video_extract_info, download_channel, video_download_manager,
+        video_factory, events_history, await_switches):
     """A Channel cannot be downloaded until it has been refreshed.
 
     Videos already downloaded are not downloaded again."""
     vid = video_factory(channel_id=download_channel.id, with_video_file=True, with_poster_ext='jpg')
     vid.file_group.url = 'https://example.com/1'
-    d = download_channel.get_download()
+    d = download_channel.downloads[0]
     d.next_download = None
     test_session.commit()
     assert not d.next_download
@@ -286,6 +201,8 @@ async def test_channel_download_requires_refresh(test_session, download_channel,
         channel: Channel = test_session.query(Channel).one()
         assert channel.refreshed == expected
         assert bool(channel.info_json) == expected
+
+    await async_client.sanic_app.dispatch('wrolpi.download.download')
 
     assert_refreshed(False)
     test_session.commit()
@@ -297,19 +214,16 @@ async def test_channel_download_requires_refresh(test_session, download_channel,
         downloaded_urls.append(download.url)
         return DownloadResult(success=True)
 
-    with mock.patch('modules.videos.downloader.YDL.extract_info') as mock_extract_info, \
-            mock.patch('modules.videos.downloader.VideoDownloader.do_download', do_download), \
-            mock.patch('wrolpi.files.lib.apply_indexers'):  # TODO why does apply_indexers break this test?
+    with mock.patch('modules.videos.downloader.VideoDownloader.do_download', do_download):
         entries = [
             dict(id=vid.source_id, view_count=0, webpage_url='https://example.com/1'),  # Already downloaded.
             dict(id='not downloaded', view_count=0, webpage_url='https://example.com/2'),
         ]
-        mock_extract_info.return_value = {'entries': entries, 'url': 'foo', 'uploader': 'some uploader',
-                                          'channel_id': 'the id', 'id': 'the id'}
+        mock_video_extract_info.return_value = dict(entries=entries, url=download_channel.url, uploader='some uploader',
+                                                    channel_id='the id', id='the id')
         await video_download_manager.do_downloads()
         await video_download_manager.wait_for_all_downloads()
-        # Give time for background tasks to finish.  :(
-        await asyncio.sleep(1)
+        await await_switches()
 
     # Channel was refreshed before downloading videos.
     assert_refreshed(True)
@@ -318,7 +232,7 @@ async def test_channel_download_requires_refresh(test_session, download_channel,
     assert downloaded_urls == ['https://example.com/2']
 
     # Should not send refresh events because downloads are automated.
-    assert events_history == []
+    assert list(events_history) == []
 
 
 def test_channel_post_directory(test_session, test_client, test_directory):
@@ -329,15 +243,6 @@ def test_channel_post_directory(test_session, test_client, test_directory):
     assert response.status_code == HTTPStatus.CREATED
     directory = test_session.query(Channel).filter_by(id=1).one().directory
     assert (test_directory / 'foo') == directory
-    assert not directory.is_dir()
-    assert directory.is_absolute()
-
-    # Channel can be created and have its directory be created.
-    data = dict(name='bar', directory='bar', mkdir=True)
-    request, response = test_client.post('/api/videos/channels', content=json.dumps(data))
-    assert response.status_code == HTTPStatus.CREATED
-    directory = test_session.query(Channel).filter_by(id=2).one().directory
-    assert (test_directory / 'bar') == directory
     assert directory.is_dir()
     assert directory.is_absolute()
 
@@ -348,33 +253,31 @@ def test_channel_by_id(test_session, test_client, simple_channel, simple_video):
 
 
 @pytest.mark.asyncio
-async def test_channel_crud(test_session, test_async_client, test_directory, test_download_manager):
+async def test_channel_crud(test_session, async_client, test_directory, test_download_manager):
     channel_directory = test_directory / 'channel directory'
     channel_directory.mkdir()
 
     new_channel = dict(
         directory=str(channel_directory),
-        match_regex='asdf',
         name='   Example Channel 1  ',
         url='https://example.com/channel1',
     )
 
     # Channel doesn't exist
-    request, response = await test_async_client.get('/api/videos/channels/examplechannel1')
+    request, response = await async_client.get('/api/videos/channels/examplechannel1')
     assert response.status_code == HTTPStatus.NOT_FOUND, f'Channel exists: {response.json}'
 
     # Create it
-    request, response = await test_async_client.post('/api/videos/channels', content=json.dumps(new_channel))
-    assert response.status_code == HTTPStatus.CREATED, response.json
+    request, response = await async_client.post('/api/videos/channels', content=json.dumps(new_channel))
+    assert response.status_code == HTTPStatus.CREATED, response.content
     location = response.headers['Location']
 
-    request, response = await test_async_client.get(location)
+    request, response = await async_client.get(location)
     assert response.status_code == HTTPStatus.OK, response.json
     created = response.json['channel']
     assert created
     assert created['id']
     # No frequency was provided.  No download exists.
-    assert not created['download_frequency']
     assert test_session.query(Download).count() == 0
 
     # Channel name leading/trailing whitespace should be stripped
@@ -385,13 +288,13 @@ async def test_channel_crud(test_session, test_async_client, test_directory, tes
         f'Channel directory is absolute: {created["directory"]}'
 
     # Can't create it again
-    request, response = await test_async_client.post('/api/videos/channels', content=json.dumps(new_channel))
+    request, response = await async_client.post('/api/videos/channels', content=json.dumps(new_channel))
     assert response.status_code == HTTPStatus.BAD_REQUEST
 
     async def put_and_fetch(new_channel_):
-        request, response = await test_async_client.put(location, content=json.dumps(new_channel))
+        request, response = await async_client.put(location, content=json.dumps(new_channel_))
         assert response.status_code == HTTPStatus.NO_CONTENT, response.status_code
-        request, response = await test_async_client.get(location)
+        request, response = await async_client.get(location)
         assert response.status_code == HTTPStatus.OK
         channel = response.json['channel']
         return channel
@@ -399,69 +302,36 @@ async def test_channel_crud(test_session, test_async_client, test_directory, tes
     # Update it
     new_channel['name'] = 'Example Channel 2'
     new_channel['directory'] = str(new_channel['directory'])  # noqa
-    new_channel['download_frequency'] = 60
     channel = await put_and_fetch(new_channel)
     assert channel['id'] == 1
     assert channel['name'] == 'Example Channel 2'
     assert channel['directory'] == channel_directory.name
-    assert channel['match_regex'] == 'asdf'
     assert channel['url'] == 'https://example.com/channel1'
-    # Download was created.
-    assert channel['download_frequency']
-    assert (downloads := test_download_manager.get_downloads(test_session)) and len(downloads) == 1 and downloads[
-        0].url == new_channel['url']
-
-    # Update with no download frequency.
-    new_channel['download_frequency'] = None
-    channel = await put_and_fetch(new_channel)
-    assert channel['download_frequency'] is None
-    # Download was deleted.
-    assert len(test_download_manager.get_downloads(test_session)) == 0
 
     # Can't update channel that doesn't exist
-    request, response = await test_async_client.put('/api/videos/channels/doesnt_exist',
-                                                    content=json.dumps(new_channel))
+    request, response = await async_client.put('/api/videos/channels/doesnt_exist',
+                                               content=json.dumps(new_channel))
     assert response.status_code == HTTPStatus.NOT_FOUND
 
     # Delete the new channel
-    request, response = await test_async_client.delete(location)
+    request, response = await async_client.delete(location)
     assert response.status_code == HTTPStatus.NO_CONTENT
+    assert test_session.query(Download).count() == 0
 
     # Cant delete it again
-    request, response = await test_async_client.delete(location)
+    request, response = await async_client.delete(location)
     assert response.status_code == HTTPStatus.NOT_FOUND
 
 
-def test_channel_creation_with_download(test_client, test_session, test_directory):
-    """A Download is created when a Channel is created."""
-    new_channel = dict(
-        directory=str(test_directory),
-        name='Download this one',
-        url='https://example.com/channel1',
-        download_frequency=60,
-    )
-    request, response = test_client.post('/api/videos/channels', content=json.dumps(new_channel))
-    assert response.status_code == HTTPStatus.CREATED
-
-    download = test_session.query(Download).one()
-    assert download.url == 'https://example.com/channel1'
-    assert download.downloader == 'video_channel'
-    assert download.sub_downloader == 'video'
-
-
 @pytest.mark.asyncio
-async def test_change_channel_url(test_async_client, test_session, test_download_manager, download_channel,
+async def test_change_channel_url(async_client, test_session, test_download_manager, download_channel,
                                   test_download_manager_config):
     # Change the Channel's URL.
     download_channel.update({'url': 'https://example.com/new-url'})
     test_session.commit()
 
-    download = test_session.query(Download).one()
-    assert download.url == download_channel.url == 'https://example.com/new-url', \
-        "Channel's download URL was not changed."
-
-    download_channel.update({'download_frequency': None})
-    assert not list(test_session.query(Download).all())
+    channel = test_session.query(Channel).one()
+    assert channel.url == 'https://example.com/new-url', "Channel's URL was not changed."
 
 
 def test_search_videos_channel(test_client, test_session, video_factory):
@@ -502,16 +372,15 @@ def test_search_videos_channel(test_client, test_session, video_factory):
                          dict(primary_path='vid1.mp4', video=dict(channel_id=channel2.id)))
 
 
-def test_get_channel_videos_pagination(test_session, simple_channel, video_factory, assert_video_search):
+@pytest.mark.asyncio
+async def test_get_channel_videos_pagination(test_session, video_factory, assert_video_search, channel_factory):
+    # Create two channels, one with 50 videos...
+    channel1, channel2 = channel_factory(), channel_factory()
     for i in range(50):
-        video_factory(channel_id=simple_channel.id)
-
-    channel2 = Channel(name='Bar')
-    test_session.add(channel2)
-    test_session.flush()
-    test_session.refresh(channel2)
+        video_factory(channel_id=channel1.id)
+    # The other channel only has one video.
     video_factory(channel_id=channel2.id)
-    video_factory(title='vid2', channel_id=channel2.id, with_video_file=True)
+    video_factory(title='vid2', channel_id=channel2.id)
     test_session.commit()
 
     # Get first, second, third, and empty pages of videos.
@@ -524,9 +393,245 @@ def test_get_channel_videos_pagination(test_session, simple_channel, video_facto
     ]
     last_ids = []
     for offset, video_count in tests:
-        _, response = assert_video_search(channel_id=simple_channel.id, order_by='published_datetime', offset=offset,
-                                          limit=20)
-        assert len(response.json['file_groups']) == video_count, 'Returned videos does not match'
+        _, response = await assert_video_search(channel_id=channel1.id, order_by='published_datetime',
+                                                offset=offset,
+                                                limit=20)
+        assert len(response.json['file_groups']) == video_count, \
+            f'Returned videos does not match for ({offset}, {video_count})'
         current_ids = [i['id'] for i in response.json['file_groups']]
         assert current_ids != last_ids, f'IDs are unchanged current_ids={current_ids}'
         last_ids = current_ids
+
+
+@pytest.mark.asyncio
+async def test_channel_download_id(async_client, test_session, tag_factory, simple_channel, test_download_manager,
+                                   test_downloader):
+    tag = await  tag_factory()
+
+    # A recurring Download can be displayed on a Channel's page.
+    body = dict(
+        urls=['https://example.com/channel1'],
+        tag_names=[tag.name],
+        downloader=test_downloader.name,
+        settings=dict(channel_id=simple_channel.id),
+        frequency=120,
+    )
+    request, response = await async_client.post(f'/api/download', json=body)
+    assert response.status_code == HTTPStatus.CREATED
+    download = test_session.query(Download).one()
+    assert download.url == 'https://example.com/channel1'
+    assert download.channel_id == simple_channel.id
+
+    # A Channel relationship can be removed from a Download.
+    body = dict(
+        urls=['https://example.com/channel1'],
+        tag_names=[tag.name],
+        downloader=test_downloader.name,
+        settings=dict(),
+        frequency=240,
+    )
+    request, response = await async_client.put(f'/api/download/{download.id}', json=body)
+    assert response.status_code == HTTPStatus.NO_CONTENT
+    download = test_session.query(Download).one()
+    assert download.channel_id is None
+    assert download.frequency == 240
+
+    # A once-Download cannot be associated with a Channel.
+    body = dict(
+        urls=['https://example.com/channel1'],
+        tag_names=[tag.name],
+        downloader=test_downloader.name,
+        settings=dict(channel_id=simple_channel.id),
+    )
+    request, response = await async_client.put(f'/api/download/{download.id}', json=body)
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+
+
+@pytest.mark.asyncio
+async def test_tag_channel(async_client, test_session, test_directory, channel_factory, tag_factory, video_factory,
+                           test_channels_config, test_download_manager, test_downloader):
+    """A single Tag can be applied to a Channel."""
+    # Create channel directory in the usual videos directory.
+    videos_directory = get_videos_directory()
+    channel = channel_factory(name='Channel Name', download_frequency=120)
+    channel_directory = channel.directory
+    tag = await tag_factory('Tag Name')
+    v1, v2 = video_factory(title='video1', channel_id=channel.id), video_factory(title='video2', channel_id=channel.id)
+    # Create recurring download which uses the Channel's directory.
+    download = test_download_manager.recurring_download('https://example.com/1', 60, test_downloader.name,
+                                                        destination=str(test_directory / 'videos/Channel Name'))
+    test_session.commit()
+    save_channels_config()
+    assert get_channels_config().channels[0]['directory'] == str(test_directory / 'videos/Channel Name')
+    # Channel download downloads into the Channel's directory.
+    assert channel.downloads[0].destination == test_directory / 'videos/Channel Name'
+    # Make extra file in the Channel's directory, it should be moved.
+    (channel_directory / 'extra file.txt').write_text('extra file contents')
+    # Channel directory is in the Videos directory.
+    assert channel.directory == channel_directory
+    # Videos are in the Channel's Directory.
+    assert str(get_relative_to_media_directory(v1.video_path)) == 'videos/Channel Name/video1.mp4'
+    assert str(get_relative_to_media_directory(v2.video_path)) == 'videos/Channel Name/video2.mp4'
+    video_files = [i for i in walk(videos_directory) if i.is_file()]
+    assert len(video_files) == 3
+    # Channel's directory is indexed.
+    assert [i.path for i in test_session.query(Directory)] == [channel.directory, ]
+
+    body = dict(tag_name=tag.name, directory='videos/Tag Name/Channel Name')
+    request, response = await async_client.post(f'/api/videos/channels/{channel.id}/tag', json=body)
+    assert response.status_code == HTTPStatus.NO_CONTENT
+
+    channel = test_session.query(Channel).one()
+    assert channel.tag_name == tag.name
+    # Channel was moved to Tag's directory, old directory was removed
+    new_channel_directory = test_directory / 'videos/Tag Name/Channel Name'
+    assert channel.directory == new_channel_directory, 'Channel directory should have been changed.'
+    assert new_channel_directory.is_dir(), 'Channel should have been moved.'
+    assert next(new_channel_directory.iterdir(), None), 'Channel videos should have been moved.'
+    assert not channel_directory.exists(), 'Old Channel directory should have been deleted.'
+    # Channel download goes into the Channel's directory.
+    d1, d2 = test_session.query(Download).all()
+    assert d1.destination == test_directory / 'videos/Tag Name/Channel Name', f'{d1} was not moved'
+    assert d2.destination == test_directory / 'videos/Tag Name/Channel Name', f'{d2} was not moved'
+    # Directory record was replaced.
+    assert [i.path for i in test_session.query(Directory)] == [channel.directory, ]
+
+    # Videos were moved
+    v1, v2 = test_session.query(Video).order_by(Video.id).all()
+    assert str(get_relative_to_media_directory(v1.video_path)) == 'videos/Tag Name/Channel Name/video1.mp4'
+    assert str(get_relative_to_media_directory(v2.video_path)) == 'videos/Tag Name/Channel Name/video2.mp4'
+    # Extra file was also moved.
+    assert (new_channel_directory / 'extra file.txt').read_text() == 'extra file contents'
+    # No new files were created.
+    assert len([i for i in walk(videos_directory) if i.is_file()]) == 3
+
+    assert get_channels_config().channels[0]['directory'] == str(test_directory / 'videos/Tag Name/Channel Name')
+
+    # Remove tag, Channel/Videos should be moved back.
+    body = dict(tag_name=None, directory='videos/Channel Name')
+    request, response = await async_client.post(f'/api/videos/channels/{channel.id}/tag', json=body)
+    assert response.status_code == HTTPStatus.NO_CONTENT, response.content.decode()
+    channel = test_session.query(Channel).one()
+    assert channel.tag_name is None
+    assert str(channel.directory) == str(test_directory / 'videos/Channel Name')
+    v1, v2 = test_session.query(Video).order_by(Video.id).all()
+    assert str(get_relative_to_media_directory(v1.video_path)) == 'videos/Channel Name/video1.mp4'
+    assert str(get_relative_to_media_directory(v2.video_path)) == 'videos/Channel Name/video2.mp4'
+    assert not (test_directory / 'videos/Tag Name/Channel Name').exists()
+    # Downloads are moved back.
+    d1, d2 = test_session.query(Download).all()
+    assert d1.destination == test_directory / 'videos/Channel Name', f'{d1} was not moved'
+    assert d2.destination == test_directory / 'videos/Channel Name', f'{d2} was not moved'
+    assert [i.path for i in test_session.query(Directory)] == [channel.directory, ]
+
+    # Channel can be Tagged, without moving directories.
+    body = dict(tag_name=tag.name)
+    request, response = await async_client.post(f'/api/videos/channels/{channel.id}/tag', json=body)
+    assert response.status_code == HTTPStatus.NO_CONTENT, response.content.decode()
+    channel = test_session.query(Channel).one()
+    assert channel.tag_name == 'Tag Name'
+    assert str(channel.directory) == str(test_directory / 'videos/Channel Name')
+    assert str(get_relative_to_media_directory(v1.video_path)) == 'videos/Channel Name/video1.mp4'
+    assert str(get_relative_to_media_directory(v2.video_path)) == 'videos/Channel Name/video2.mp4'
+    # Downloads were not changed.
+    d1, d2 = test_session.query(Download).all()
+    assert d1.destination == test_directory / 'videos/Channel Name', f'{d1} was not moved'
+    assert d2.destination == test_directory / 'videos/Channel Name', f'{d2} was not moved'
+    assert [i.path for i in test_session.query(Directory)] == [channel.directory, ]
+
+
+@pytest.mark.asyncio
+async def test_create_channel_with_tag(async_client, test_session, test_directory, tag_factory):
+    """A Channel can be created with a single Tag."""
+    tag = await tag_factory()
+    assert not (test_directory / 'some/deep/new/directory').exists()
+
+    body = dict(
+        name='Channel Name',
+        directory='some/deep/new/directory',
+        tag_name=tag.name,
+    )
+    request, response = await async_client.post('/api/videos/channels', json=body)
+    assert response.status_code == HTTPStatus.CREATED, response.content.decode()
+
+    channel = test_session.query(Channel).one()
+    assert channel.tag_name == tag.name
+    assert channel.directory == (test_directory / 'some/deep/new/directory')
+    assert (test_directory / 'some/deep/new/directory').is_dir()
+
+
+@pytest.mark.asyncio
+async def test_move_channel(async_client, test_session, test_directory, channel_factory, tag_factory,
+                            video_factory, test_channels_config, test_download_manager, test_downloader):
+    """A Channel can be moved."""
+    channel = channel_factory(name='Channel Name')
+    vid1 = video_factory(channel_id=channel.id)
+    vid2 = video_factory(channel_id=channel.id)
+    test_session.commit()
+
+    assert str(channel.directory) == str(test_directory / 'videos/Channel Name')
+    assert str(vid1.video_path).startswith(str(test_directory / 'videos/Channel Name/'))
+    assert str(vid2.video_path).startswith(str(test_directory / 'videos/Channel Name/'))
+
+    body = dict(
+        name=channel.name,
+        directory=str(test_directory / 'videos/New Directory'),
+    )
+    request, response = await async_client.put(f'/api/videos/channels/{channel.id}', json=body)
+    assert response.status_code == HTTPStatus.NO_CONTENT, response.content.decode()
+    channel = Channel.find_by_id(channel.id)
+    assert str(channel.directory) == str(test_directory / 'videos/New Directory')
+    assert str(vid1.video_path).startswith(str(test_directory / 'videos/New Directory/'))
+    assert str(vid2.video_path).startswith(str(test_directory / 'videos/New Directory/'))
+    assert [i.path for i in test_session.query(Directory)] == [test_directory / 'videos/New Directory', ]
+
+
+@pytest.mark.asyncio
+async def test_move_channel_after_terminal_move(async_client, test_session, test_directory, channel_factory,
+                                                tag_factory, video_factory, test_channels_config, test_download_manager,
+                                                test_downloader):
+    """A Channel can be moved in the UI after being moved in the Terminal."""
+    channel = channel_factory(name='Channel Name')
+    vid1 = video_factory(channel_id=channel.id)
+    test_session.commit()
+
+    assert str(channel.directory) == str(test_directory / 'videos/Channel Name')
+    assert str(vid1.video_path).startswith(str(test_directory / 'videos/Channel Name/'))
+
+    # mv 'videos/Channel Name' 'videos/New Directory'
+    shutil.move(channel.directory, test_directory / 'videos/New Directory')
+
+    body = dict(
+        name=channel.name,
+        directory=str(test_directory / 'videos/New Directory'),
+    )
+    request, response = await async_client.put(f'/api/videos/channels/{channel.id}', json=body)
+    assert response.status_code == HTTPStatus.NO_CONTENT, response.content.decode()
+    channel = Channel.find_by_id(channel.id)
+    vid1 = test_session.query(Video).one()
+    assert str(channel.directory) == str(test_directory / 'videos/New Directory')
+    assert str(vid1.video_path).startswith(str(test_directory / 'videos/New Directory/'))
+
+
+@pytest.mark.asyncio
+async def test_search_tagged_channels(async_client, test_session, channel_factory, tag_factory,
+                                      video_factory):
+    """Tagged Channels can be searched."""
+    tag = await tag_factory()
+    test_session.commit()
+
+    # Can search when empty.
+    body = dict(tag_names=[tag.name])
+    request, response = await async_client.post('/api/videos/channels/search', json=body)
+    assert response.status_code == HTTPStatus.OK
+    assert len(response.json['channels']) == 0, 'No Channels should be tagged'
+
+    channel1 = channel_factory(tag_name=tag.name)
+    channel2 = channel_factory()
+    test_session.commit()
+
+    body = dict(tag_names=[tag.name])
+    request, response = await async_client.post('/api/videos/channels/search', json=body)
+    assert response.status_code == HTTPStatus.OK
+    assert len(response.json['channels']) == 1, 'Only one Channel is tagged'
+    assert response.json['channels'][0]['id'] == channel1.id

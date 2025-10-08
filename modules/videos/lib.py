@@ -1,42 +1,57 @@
 import contextlib
-import functools
+import dataclasses
 import html
 import pathlib
 import re
-import warnings
-from typing import Tuple, Optional, Generator
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Generator, Type, List
+from typing import Tuple, Optional
 
 import pytz
-from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from yt_dlp import YoutubeDL
 
-from wrolpi import before_startup, dates
+from modules.videos.models import Video
+from wrolpi import dates, flags
 from wrolpi.captions import extract_captions
-from wrolpi.common import ConfigFile, get_media_directory, register_refresh_cleanup, limit_concurrent
-from wrolpi.dates import Seconds
-from wrolpi.db import get_db_curs, get_db_session, optional_session
+from wrolpi.common import ConfigFile, extract_domain, logger, \
+    escape_file_name, get_media_directory, background_task, Base, get_wrolpi_config
+from wrolpi.dates import Seconds, from_timestamp
+from wrolpi.db import get_db_curs, get_db_session
+from wrolpi.downloader import Download, download_manager
 from wrolpi.errors import UnknownDirectory
-from wrolpi.vars import PYTEST
+from wrolpi.events import Events
+from wrolpi.files.lib import split_path_stem_and_suffix
+from wrolpi.switches import register_switch_handler, ActivateSwitchMethod
+from wrolpi.vars import YTDLP_CACHE_DIR, PYTEST, WROLPI_HOME
 from .common import is_valid_poster, convert_image, \
-    generate_video_poster, logger, REQUIRED_OPTIONS, ConfigError, \
-    get_video_duration
-from .models import Channel, Video
+    generate_video_poster, ConfigError, \
+    extract_video_duration
+from .errors import UnknownChannel
+from .models import Channel
 
 logger = logger.getChild(__name__)
 
 DEFAULT_DOWNLOAD_FREQUENCY = Seconds.week
 
-
-class VideoInfoJSON(object):
-    channel_source_id = None
-    duration = None
-    title = None
-    url = None
-    view_count = None
+REQUIRED_OPTIONS = ['name', 'directory']
 
 
-def process_video_info_json(video: Video) -> VideoInfoJSON:
+@dataclasses.dataclass
+class VideoInfoJSON:
+    channel_source_id: str | None = None
+    channel_url: str | None = None
+    duration: int | None = None
+    epoch: int | None = None
+    timestamp: datetime | None = None
+    title: str | None = None
+    upload_date: datetime | None = None
+    url: str | None = None
+    view_count: int | None = None
+
+
+def extract_video_info_json(video: Video) -> VideoInfoJSON:
     """
     Parse the Video's info json file, return the relevant data.
     """
@@ -45,22 +60,25 @@ def process_video_info_json(video: Video) -> VideoInfoJSON:
         title = info_json.get('fulltitle') or info_json.get('title')
         video_info_json.title = html.unescape(title) if title else None
 
-        video_info_json.duration = info_json.get('duration') or None
-        video_info_json.view_count = info_json.get('view_count') or None
+        upload_date = dates.strpdate(i) if (i := info_json.get('upload_date')) else None
+        if upload_date:
+            upload_date = upload_date.astimezone(pytz.UTC)
+        timestamp = None
+        try:
+            timestamp = dates.from_timestamp(info_json['timestamp']) if info_json.get('timestamp') else None
+        except Exception:
+            pass
+
+        video_info_json.channel_source_id = info_json.get('channel_id') or info_json.get('uploader_id') or None
+        video_info_json.channel_url = info_json.get('channel_url') or info_json.get('uploader_url') or None
+        video_info_json.duration = int(i) if (i := info_json.get('duration')) else None
+        video_info_json.epoch = int(i) if (i := info_json.get('epoch')) else None
+        video_info_json.timestamp = timestamp
+        video_info_json.upload_date = upload_date
         video_info_json.url = info_json.get('webpage_url') or info_json.get('url') or None
-        video_info_json.channel_source_id = info_json.get('channel_id') or None
+        video_info_json.view_count = int(i) if (i := info_json.get('view_count')) else None
 
     return video_info_json
-
-
-@optional_session
-@functools.lru_cache
-def get_channel_id_by_source_id(session: Session, source_id: str) -> Optional[int]:
-    """Return the id of the Channel which matches the provided `source_id`.
-
-    These are cached results."""
-    channel = session.query(Channel).filter_by(source_id=source_id).one_or_none()
-    return channel.id if channel else None
 
 
 EXTRACT_SUBTITLES = False
@@ -76,21 +94,36 @@ def validate_video(video: Video, channel_generate_poster: bool):
     A Video is also valid when it has a JPEG poster, if any.  If no poster can be
     found, it will be generated from the video file.
     """
-    info_json_path = video.info_json_path
-    json_data_missing = bool(video.file_group.title) and bool(video.file_group.length) and bool(video.view_count) \
-                        and bool(video.file_group.url)
-    if info_json_path and json_data_missing is False:
+    json_published_datetime = None
+
+    if video.info_json_path:
         # These properties can be found in the info json.
-        video_info_json = process_video_info_json(video)
+        video_info_json = extract_video_info_json(video)
         video.file_group.title = video_info_json.title
         video.file_group.length = video_info_json.duration
         video.file_group.url = video_info_json.url
+        json_published_datetime = video.file_group.published_datetime = (
+                video_info_json.timestamp  # The exact second the video was published.
+                or video_info_json.upload_date  # The day the video was published.
+                or video.file_group.published_datetime
+        )
+        video.file_group.download_datetime = from_timestamp(video_info_json.epoch) if video_info_json.epoch else None
         # View count will probably be overwritten by more recent data when this Video's Channel is
         # updated.
         video.view_count = video.view_count or video_info_json.view_count
 
-        if video_info_json.channel_source_id:
-            video.channel_id = get_channel_id_by_source_id(source_id=video_info_json.channel_source_id)
+        if video_info_json.channel_source_id or video_info_json.channel_url:
+            from modules.videos.channel.lib import get_channel
+            try:
+                if channel := get_channel(
+                        source_id=video_info_json.channel_source_id,
+                        url=video_info_json.channel_url,
+                        directory=video.video_path.parent,
+                        return_dict=False,
+                ):
+                    video.channel_id = channel.id
+            except UnknownChannel:
+                pass
 
     video_path = video.video_path
     if not video_path:
@@ -106,7 +139,8 @@ def validate_video(video: Video, channel_generate_poster: bool):
             if not published_date.tzinfo:
                 published_date = published_date.astimezone(pytz.UTC)
         video.file_group.title = video.file_group.title or html.unescape(title)
-        video.file_group.published_datetime = published_date
+        # Trust info json upload_date before file name datetime.
+        video.file_group.published_datetime = json_published_datetime or published_date
         video.source_id = video.source_id or source_id
 
     if channel_generate_poster:
@@ -127,7 +161,7 @@ def validate_video(video: Video, channel_generate_poster: bool):
                 video.file_group.length = float(video_streams[0]['duration'])
         else:
             # Slowest method.
-            video.file_group.length = get_video_duration(video_path)
+            video.file_group.length = extract_video_duration(video_path)
 
     if video_path and not video.caption_paths and video.file_group.d_text and not EXTRACT_SUBTITLES:
         # Caption file was deleted, clear out old captions.
@@ -162,11 +196,8 @@ def convert_or_generate_poster(video: Video) -> Tuple[Optional[pathlib.Path], Op
             # Poster is not valid, convert it and place it in the new location.
             try:
                 convert_image(old, new)
-                if not new.is_file():
+                if not new.is_file() or not new.stat().st_size:
                     raise FileNotFoundError(f'Failed to convert poster: {new}')
-                if old != new:
-                    # Only remove the old one if we are not converting in-place.
-                    old.unlink(missing_ok=True)
                 logger.info(f'Converted invalid poster {repr(str(old))} to {repr(str(new))}')
                 return new, None
             except Exception as e:
@@ -185,19 +216,32 @@ def convert_or_generate_poster(video: Video) -> Tuple[Optional[pathlib.Path], Op
     return None, None
 
 
+@dataclass
+class ChannelDictValidator:
+    name: str
+    directory: str
+    download_frequency: int
+    url: str = None
+
+
+@dataclass
+class ChannelsConfigValidator:
+    version: int = None
+    channels: list[ChannelDictValidator] = dataclasses.field(default_factory=list)
+
+
 class ChannelsConfig(ConfigFile):
     file_name = 'channels.yaml'
     default_config = dict(
-        channels={
-            'wrolpi': dict(
-                name='WROLPi',
-                url='https://www.youtube.com/channel/UC4t8bw1besFTyjW7ZBCOIrw/videos',
-                directory='videos/wrolpi',
-                download_frequency=604800,
-            )
-        },
-        favorites=dict(),
+        channels=[dict(
+            name='WROLPi',
+            url='https://www.youtube.com/channel/UC4t8bw1besFTyjW7ZBCOIrw/videos',
+            directory='videos/wrolpi',
+            download_frequency=604800,
+        )],
+        version=0,
     )
+    validator = ChannelsConfigValidator
 
     @property
     def channels(self) -> dict:
@@ -207,15 +251,81 @@ class ChannelsConfig(ConfigFile):
     def channels(self, value: dict):
         self.update({'channels': value})
 
-    @property
-    def favorites(self) -> dict:
-        warnings.warn('Favorites have been moved to Tags', DeprecationWarning)
-        return self._config['favorites']
+    def import_config(self, file: pathlib.Path = None, send_events=False):
+        from modules.videos.channel.lib import get_channel
+        super().import_config()
+        try:
+            channels = self.channels
+            channel_directories = [i['directory'] for i in channels]
+            if len(channel_directories) != len(set(channel_directories)):
+                raise RuntimeError('Refusing to import channels config because it contains duplicate directories!')
+            updated_channel_ids = set()
 
-    @favorites.setter
-    def favorites(self, value: dict):
-        warnings.warn('Favorites have been moved to Tags', DeprecationWarning)
-        self.update({'favorites': value})
+            with get_db_session(commit=True) as session:
+                for data in channels:
+                    # A Channel's directory is saved (in config) relative to the media directory.
+                    directory = get_media_directory() / data['directory']
+                    for option in (i for i in REQUIRED_OPTIONS if i not in data):
+                        raise ConfigError(f'Channel "{directory}" is required to have "{option}"')
+
+                    # Try to find Channel by directory because it is unique.
+                    channel = Channel.get_by_path(directory, session)
+                    if not channel:
+                        try:
+                            # Try to find Channel using other attributes before creating new Channel.
+                            channel = get_channel(
+                                session,
+                                source_id=data.get('source_id'),
+                                url=data.get('url'),
+                                directory=str(directory),
+                                return_dict=False,
+                            )
+                        except UnknownChannel:
+                            # Channel not yet in the DB, add it.
+                            channel = Channel(directory=directory)
+                            session.add(channel)
+                            channel.flush()
+                            # TODO refresh the files in the channel.
+                            logger.warning(f'Creating new Channel from config: {directory}')
+
+                    # Copy existing channel data, update all values from the config.  This is necessary to clear out
+                    # values not in the config.
+                    full_data = channel.dict()
+                    full_data.update(data)
+                    channel.update(full_data)
+                    updated_channel_ids.add(channel.id)
+
+                    if not channel.source_id and channel.url and flags.have_internet.is_set():
+                        # If we can download from a channel, we must have its source_id.
+                        if download_manager.can_download and channel.download_missing_data:
+                            logger.info(f'Fetching channel source id for {channel}')
+                            background_task(fetch_channel_source_id(channel.id))
+
+                    channel_import_logger.debug(f'Updated {repr(channel.name)}'
+                                                f' url={channel.url}'
+                                                f' source_id={channel.source_id}'
+                                                f' directory={channel.directory}'
+                                                )
+
+            with get_db_session(commit=True) as session:
+                # Delete any Channels that were deleted from the config.
+                for channel in session.query(Channel):
+                    if channel.id not in updated_channel_ids:
+                        logger.warning(f'Deleting {channel} because it is not in the config.')
+                        channel.delete_with_videos()
+
+            # Create any missing Downloads.  Associated Downloads with any necessary Channels.
+            with get_db_session() as session:
+                link_channel_and_downloads(session)
+
+            self.successful_import = True
+        except Exception as e:
+            self.successful_import = False
+            message = f'Failed to import {self.get_relative_file()} config!'
+            if send_events:
+                channel_import_logger.warning(message, exc_info=e)
+                Events.send_config_import_failed(message)
+            raise
 
 
 CHANNELS_CONFIG: ChannelsConfig = ChannelsConfig()
@@ -224,7 +334,11 @@ TEST_CHANNELS_CONFIG: ChannelsConfig = None
 
 def get_channels_config() -> ChannelsConfig:
     global TEST_CHANNELS_CONFIG
-    if isinstance(TEST_CHANNELS_CONFIG, ConfigFile):
+    if PYTEST and not TEST_CHANNELS_CONFIG:
+        logger.warning('Test did not initialize the channels config')
+        return
+
+    if TEST_CHANNELS_CONFIG:
         return TEST_CHANNELS_CONFIG
 
     global CHANNELS_CONFIG
@@ -235,125 +349,172 @@ def get_channels_config() -> ChannelsConfig:
 def set_test_channels_config():
     global TEST_CHANNELS_CONFIG
     TEST_CHANNELS_CONFIG = ChannelsConfig()
-    yield
+    TEST_CHANNELS_CONFIG.initialize()
+    yield TEST_CHANNELS_CONFIG
     TEST_CHANNELS_CONFIG = None
+
+
+@dataclass
+class VideoDownloaderConfigYtDlpOptionsValidator:
+    continue_dl: bool
+    file_name_format: str
+    nooverwrites: bool
+    quiet: bool
+    merge_output_format: str
+    writeautomaticsub: bool
+    writeinfojson: bool
+    writesubtitles: bool
+    writethumbnail: bool
+    youtube_include_dash_manifest: bool
+
+    def __post_init__(self):
+        from modules.videos.downloader import preview_filename
+        try:
+            preview_filename(self.file_name_format)
+        except Exception as e:
+            raise ValueError(f'file_name_format is invalid: {str(e)}')
+
+
+@dataclass
+class VideoDownloaderConfigValidator:
+    video_resolutions: List[str] = field(default_factory=lambda: ['1080p', '720p', '480p', 'maximum'])
+    version: int = None
+    yt_dlp_options: VideoDownloaderConfigYtDlpOptionsValidator = field(default_factory=dict)
+    yt_dlp_extra_args: str = ''
+    always_use_browser_profile: bool = False
+    browser_profile: str = ''
+
+    def __post_init__(self):
+        allowed_fields = {i.name for i in dataclasses.fields(VideoDownloaderConfigYtDlpOptionsValidator)}
+        yt_dlp_options = {k: v for k, v in dict(self.yt_dlp_options).items() if k in allowed_fields}
+        VideoDownloaderConfigYtDlpOptionsValidator(**yt_dlp_options)
+        self.yt_dlp_options = yt_dlp_options
 
 
 class VideoDownloaderConfig(ConfigFile):
     file_name = 'videos_downloader.yaml'
     default_config = dict(
-        continue_dl=True,
-        dateafter='19900101',
-        file_name_format='%(uploader)s_%(upload_date)s_%(id)s_%(title)s.%(ext)s',
-        nooverwrites=True,
-        quiet=False,
-        writeautomaticsub=True,
-        writeinfojson=True,
-        writesubtitles=True,
-        writethumbnail=True,
-        youtube_include_dash_manifest=False,
+        video_resolutions=['1080p', '720p', '480p', 'maximum'],
+        version=0,
+        yt_dlp_options=dict(
+            continue_dl=True,
+            file_name_format='%(uploader)s_%(upload_date)s_%(id)s_%(title)s.%(ext)s',
+            merge_output_format='mp4',
+            nooverwrites=True,
+            quiet=False,
+            writeautomaticsub=True,
+            writeinfojson=True,
+            writesubtitles=True,
+            writethumbnail=True,
+            youtube_include_dash_manifest=False,
+        ),
+        yt_dlp_extra_args='',
+        always_use_browser_profile=False,
+        browser_profile='',
     )
+    validator = VideoDownloaderConfigValidator
 
     @property
     def continue_dl(self) -> bool:
-        return self._config['continue_dl']
-
-    @continue_dl.setter
-    def continue_dl(self, value: bool):
-        self.update({'continue_dl': value})
+        return self._config['yt_dlp_options']['continue_dl']
 
     @property
-    def dateafter(self) -> str:
-        return self._config['dateafter']
+    def video_resolutions(self) -> List[str]:
+        return self._config['video_resolutions']
 
-    @dateafter.setter
-    def dateafter(self, value: str):
-        self.update({'dateafter': value})
+    @video_resolutions.setter
+    def video_resolutions(self, value: List[str]):
+        self.update({'video_resolutions': value})
 
     @property
     def file_name_format(self) -> str:
-        return self._config['file_name_format']
-
-    @file_name_format.setter
-    def file_name_format(self, value: str):
-        self.update({'file_name_format': value})
+        return self._config['yt_dlp_options']['file_name_format']
 
     @property
     def nooverwrites(self) -> bool:
-        return self._config['nooverwrites']
+        return self._config['yt_dlp_options']['nooverwrites']
 
-    @nooverwrites.setter
-    def nooverwrites(self, value: bool):
-        self.update({'nooverwrites': value})
+    @property
+    def merge_output_format(self) -> bool:
+        return self._config['yt_dlp_options']['merge_output_format']
 
     @property
     def quiet(self) -> bool:
-        return self._config['quiet']
-
-    @quiet.setter
-    def quiet(self, value: bool):
-        self.update({'quiet': value})
+        return self._config['yt_dlp_options']['quiet']
 
     @property
     def writeautomaticsub(self) -> bool:
-        return self._config['writeautomaticsub']
-
-    @writeautomaticsub.setter
-    def writeautomaticsub(self, value: bool):
-        self.update({'writeautomaticsub': value})
+        return self._config['yt_dlp_options']['writeautomaticsub']
 
     @property
     def writeinfojson(self) -> bool:
-        return self._config['writeinfojson']
-
-    @writeinfojson.setter
-    def writeinfojson(self, value: bool):
-        self.update({'writeinfojson': value})
+        return self._config['yt_dlp_options']['writeinfojson']
 
     @property
     def writesubtitles(self) -> bool:
-        return self._config['writesubtitles']
-
-    @writesubtitles.setter
-    def writesubtitles(self, value: bool):
-        self.update({'writesubtitles': value})
+        return self._config['yt_dlp_options']['writesubtitles']
 
     @property
     def writethumbnail(self) -> bool:
-        return self._config['writethumbnail']
-
-    @writethumbnail.setter
-    def writethumbnail(self, value: bool):
-        self.update({'writethumbnail': value})
+        return self._config['yt_dlp_options']['writethumbnail']
 
     @property
     def youtube_include_dash_manifest(self) -> bool:
-        return self._config['youtube_include_dash_manifest']
+        return self._config['yt_dlp_options']['youtube_include_dash_manifest']
 
-    @youtube_include_dash_manifest.setter
-    def youtube_include_dash_manifest(self, value: bool):
-        self.update({'youtube_include_dash_manifest': value})
+    @property
+    def yt_dlp_options(self) -> dict:
+        return self._config['yt_dlp_options']
+
+    @yt_dlp_options.setter
+    def yt_dlp_options(self, value: dict):
+        self.update({'yt_dlp_options': value})
+
+    @property
+    def yt_dlp_extra_args(self) -> str:
+        return self._config['yt_dlp_extra_args']
+
+    @yt_dlp_extra_args.setter
+    def yt_dlp_extra_args(self, value: str):
+        self.update({**self._config, 'yt_dlp_extra_args': value})
+
+    @property
+    def browser_profile(self) -> str:
+        return self._config['browser_profile']
+
+    @browser_profile.setter
+    def browser_profile(self, value: str):
+        self.update({**self._config, 'browser_profile': value})
+
+    @property
+    def always_use_browser_profile(self) -> bool:
+        return self._config['always_use_browser_profile']
+
+    @always_use_browser_profile.setter
+    def always_use_browser_profile(self, value: bool):
+        self.update({**self._config, 'always_use_browser_profile': value})
+
+    def import_config(self, file: pathlib.Path = None, send_events=False):
+        super().import_config(file, send_events)
+        self.successful_import = True
 
 
-VIDEO_DOWNLOADER_CONFIG: VideoDownloaderConfig = VideoDownloaderConfig()
-TEST_VIDEO_DOWNLOADER_CONFIG: VideoDownloaderConfig = None
+VIDEOS_DOWNLOADER_CONFIG: VideoDownloaderConfig = VideoDownloaderConfig()
+TEST_VIDEOS_DOWNLOADER_CONFIG: VideoDownloaderConfig = None
 
 
-def get_downloader_config() -> VideoDownloaderConfig:
-    global TEST_VIDEO_DOWNLOADER_CONFIG
-    if isinstance(TEST_VIDEO_DOWNLOADER_CONFIG, VideoDownloaderConfig):
-        return TEST_VIDEO_DOWNLOADER_CONFIG
+def get_videos_downloader_config() -> VideoDownloaderConfig:
+    global TEST_VIDEOS_DOWNLOADER_CONFIG
+    if isinstance(TEST_VIDEOS_DOWNLOADER_CONFIG, VideoDownloaderConfig):
+        return TEST_VIDEOS_DOWNLOADER_CONFIG
 
-    global VIDEO_DOWNLOADER_CONFIG
-    return VIDEO_DOWNLOADER_CONFIG
+    global VIDEOS_DOWNLOADER_CONFIG
+    return VIDEOS_DOWNLOADER_CONFIG
 
 
 def set_test_downloader_config(enabled: bool):
-    global TEST_VIDEO_DOWNLOADER_CONFIG
-    if enabled:
-        TEST_VIDEO_DOWNLOADER_CONFIG = VideoDownloaderConfig()
-    else:
-        TEST_VIDEO_DOWNLOADER_CONFIG = None
+    global TEST_VIDEOS_DOWNLOADER_CONFIG
+    TEST_VIDEOS_DOWNLOADER_CONFIG = VideoDownloaderConfig() if enabled else None
 
 
 def get_channels_config_from_db(session: Session) -> dict:
@@ -363,162 +524,149 @@ def get_channels_config_from_db(session: Session) -> dict:
     return dict(channels=channels)
 
 
-@optional_session()
-def save_channels_config(session: Session = None):
+@register_switch_handler('save_channels_config')
+def save_channels_config():
     """Get the Channel information from the DB, save it to the config."""
-    config = get_channels_config_from_db(session)
-    channels_config = get_channels_config()
-    channels_config.update(config)
+    with get_db_session() as session:
+        config = get_channels_config_from_db(session)
+        channels_config = get_channels_config()
 
+    if PYTEST and not channels_config:
+        logger.warning('Refusing to save channels config because test did not initialize a test config!')
+        return
+
+    channels_config.update(config)
+    logger.info('save_channels_config completed')
+
+
+save_channels_config: ActivateSwitchMethod
 
 channel_import_logger = logger.getChild('channel_import')
 
 
-@before_startup
-@register_refresh_cleanup
-@limit_concurrent(1)
+async def fetch_channel_source_id(channel_id: int):
+    # If we can download from a channel, we must have its source_id.
+    try:
+        with get_db_session() as session:
+            from modules.videos.channel.lib import get_channel
+            channel = Channel.find_by_id(channel_id)
+            channel.source_id = channel.source_id or get_channel_source_id(channel.url)
+            if not channel.source_id:
+                channel_import_logger.warning(f'Unable to fetch source_id for {channel.url}')
+            else:
+                session.commit()
+                save_channels_config.activate_switch()
+    except Exception as e:
+        logger.error(f'Failed to get Channel source id of id={channel_id}', exc_info=e)
+
+
 def import_channels_config():
     """Import channel settings to the DB.  Existing channels will be updated."""
-    if PYTEST and not TEST_CHANNELS_CONFIG:
-        channel_import_logger.warning(
-            f'Not importing channels during this test.  Use `test_channels_config` fixture if you would '
-            f'like to call this.')
+    if PYTEST and not get_channels_config():
+        logger.warning('Skipping import_channels_config for this test')
         return
 
-    channel_import_logger.info('Importing videos config')
-    try:
-        config = get_channels_config()
-        channels = config.channels
-        channel_directories = [i['directory'] for i in channels]
-
-        save_config = False
-        with get_db_session(commit=True) as session:
-            for data in channels:
-                if isinstance(data, str):
-                    # Outdated style config.
-                    # TODO remove this after beta.
-                    data = channels[data]
-                # A Channel's directory is saved (in config) relative to the media directory.
-                directory = get_media_directory() / data['directory']
-                for option in (i for i in REQUIRED_OPTIONS if i not in data):
-                    raise ConfigError(f'Channel "{directory}" is required to have "{option}"')
-
-                channel = session.query(Channel).filter(
-                    or_(
-                        Channel.directory == str(directory),
-                        Channel.directory == str(data['directory']),
-                        Channel.directory == str(directory.relative_to(get_media_directory())),
-                    ),
-                ).one_or_none()
-                if not channel:
-                    # Channel not yet in the DB, add it.
-                    channel = Channel(directory=directory)
-                    session.add(channel)
-                    session.flush([channel, ])
-                    # TODO refresh the files in the channel.
-                    logger.warning(f'Creating new Channel from config {channel}')
-
-                # Only name and directory are required
-                channel.name = data['name']
-                channel.directory = directory
-
-                # A URL should not be an empty string
-                data['url'] = data['url'] or None
-
-                # Copy existing channel data, update all values from the config.  This is necessary to clear out
-                # values not in the config.
-                full_data = channel.dict()
-                full_data.update(data)
-                channel.update(full_data)
-
-                if not channel.source_id and channel.url:
-                    # If we can download from a channel, we must have its source_id.
-                    channel.source_id = get_channel_source_id(channel.url)
-                    save_config = True
-                    if not channel.source_id:
-                        channel_import_logger.warning(f'Unable to fetch source_id for {channel.url}')
-                    else:
-                        session.commit()
-
-                channel_import_logger.debug(f'Updated {repr(channel.name)}'
-                                            f' url={channel.url}'
-                                            f' source_id={channel.source_id}'
-                                            f' directory={channel.directory}'
-                                            f' download_frequency={channel.download_frequency}'
-                                            )
-
-        with get_db_session(commit=True) as session:
-            # Delete any Channels that were deleted from the config.
-            for channel in session.query(Channel):
-                if str(channel.directory) not in channel_directories:
-                    logger.warning(f'Deleting {channel} because it is not in the config.')
-                    channel.delete_with_videos()
-
-        if save_config:
-            # Information about the channel was fetched, store it.
-            save_channels_config()
-
-    except Exception as e:
-        channel_import_logger.warning('Failed to load channels config!', exc_info=e)
-        if PYTEST:
-            # Do not interrupt startup, only raise during testing.
-            raise
+    channel_import_logger.info('Importing channels config')
+    get_channels_config().import_config()
+    channel_import_logger.info('Importing channels config completed')
 
 
-YDL = YoutubeDL()
-YDL.params['logger'] = logger.getChild('youtube-dl')
+def link_channel_and_downloads(session: Session, channel_: Type[Base] = Channel, download_: Type[Base] = Download):
+    """Create any missing Downloads for any Channel.url/Channel.directory that has a Download.  Associate any Download
+    related to a Channel."""
+    # Only Downloads with a frequency can be a Channel Download.
+    downloads = list(session.query(download_).filter(download_.frequency.isnot(None)).all())
+    # Download.url is unique and cannot be null.
+    downloads_by_url = {i.url: i for i in downloads}
+    # Many Downloads may share the same destination.
+    downloads_with_destination = [i for i in downloads if (i.settings or dict()).get('destination')]
+    channels = session.query(channel_).all()
+
+    need_commit = False
+    for channel in channels:
+        directory = str(channel.directory)
+        for download in downloads_with_destination:
+            if download.settings['destination'] == directory and not download.channel_id:
+                download.channel_id = channel.id
+                need_commit = True
+
+        download = downloads_by_url.get(channel.url)
+        if download and not download.channel_id:
+            download.channel_id = channel.id
+            need_commit = True
+
+        # Get any Downloads for a Channel's RSS feed.
+        rss_url = channel.get_rss_url()
+        if rss_url and (download := downloads_by_url.get(rss_url)):
+            download.channel_id = channel.id
+            need_commit = True
+
+    # Associate any Download which shares a Channel's URL.
+    for download in downloads:
+        channel = channel_.get_by_url(download.url, session)
+        if channel and not download.channel_id:
+            download.channel_id = channel.id
+            need_commit = True
+
+    if need_commit:
+        session.commit()
+
+
+YDL = YoutubeDL(dict(cachedir=YTDLP_CACHE_DIR))
+ydl_logger = YDL.params['logger'] = logger.getChild('youtube-dl')
 YDL.add_default_info_extractors()
 
 
 def get_channel_source_id(url: str) -> str:
     channel_info = YDL.extract_info(url, download=False, process=False)
-    return channel_info.get('uploader_id') or channel_info['channel_id']
+    return channel_info.get('channel_id') or channel_info['uploader_id']
 
 
 async def get_statistics():
     with get_db_curs() as curs:
         curs.execute('''
-        SELECT
-            -- total videos
-            COUNT(v.id) AS "videos",
-            -- total videos downloaded over the past week/month/year
-            COUNT(v.id) FILTER (WHERE published_datetime >= current_date - interval '1 week') AS "week",
-            COUNT(v.id) FILTER (WHERE published_datetime >= current_date - interval '1 month') AS "month",
-            COUNT(v.id) FILTER (WHERE published_datetime >= current_date - interval '1 year') AS "year",
-            -- sum of all video lengths in seconds
-            COALESCE(SUM(fg.length), 0) AS "sum_duration",
-            -- sum of all video file sizes
-            COALESCE(SUM(fg.size), 0)::BIGINT AS "sum_size",
-            -- largest video
-            COALESCE(MAX(fg.size), 0) AS "max_size"
-        FROM
-            video v
-            LEFT JOIN file_group fg on v.file_group_id = fg.id
-        ''')
+                     SELECT
+                         -- total videos
+                         COUNT(v.id)                                                                        AS "videos",
+                         -- total videos downloaded over the past week/month/year
+                         COUNT(v.id) FILTER (WHERE published_datetime >= current_date - interval '1 week')  AS "week",
+                         COUNT(v.id) FILTER (WHERE published_datetime >= current_date - interval '1 month') AS "month",
+                         COUNT(v.id) FILTER (WHERE published_datetime >= current_date - interval '1 year')  AS "year",
+                         -- sum of all video lengths in seconds
+                         COALESCE(SUM(fg.length), 0)                                                        AS "sum_duration",
+                         -- sum of all video file sizes
+                         COALESCE(SUM(fg.size), 0)::BIGINT                                                  AS "sum_size",
+                         -- largest video
+                         COALESCE(MAX(fg.size), 0)                                                          AS "max_size",
+                         -- Videos may or may not have comments.
+                         COUNT(v.id) FILTER ( WHERE v.have_comments = TRUE )                                AS "have_comments",
+                         COUNT(v.id) FILTER ( WHERE v.have_comments = FALSE AND v.comments_failed = FALSE
+                             and fg.censored = false and
+                                                    fg.url is not null)                                     AS "missing_comments",
+                         COUNT(v.id) FILTER ( WHERE v.comments_failed = TRUE )                              AS "failed_comments",
+                         COUNT(v.id) FILTER ( WHERE fg.censored = TRUE )                                    as "censored_videos"
+                     FROM video v
+                              LEFT JOIN file_group fg on v.file_group_id = fg.id
+                     ''')
         video_stats = dict(curs.fetchone())
 
         # Get the total videos downloaded every month for the past two years.
         curs.execute('''
-        SELECT
-            DATE_TRUNC('month', months.a),
-            COUNT(video.id)::BIGINT,
-            SUM(size)::BIGINT AS "size"
-        FROM
-            generate_series(
-                date_trunc('month', current_date) - interval '2 years',
-                date_trunc('month', current_date) - interval '1 month',
-                '1 month'::interval) AS months(a),
-            video
-            LEFT JOIN file_group fg on video.file_group_id = fg.id
-        WHERE
-            published_datetime >= date_trunc('month', months.a)
-            AND published_datetime < date_trunc('month', months.a) + interval '1 month'
-            AND published_datetime IS NOT NULL
-        GROUP BY
-            1
-        ORDER BY
-            1
-        ''')
+                     SELECT DATE_TRUNC('month', months.a),
+                            COUNT(video.id)::BIGINT,
+                            SUM(size)::BIGINT AS "size"
+                     FROM generate_series(
+                                  date_trunc('month', current_date) - interval '2 years',
+                                  date_trunc('month', current_date) - interval '1 month',
+                                  '1 month'::interval) AS months(a),
+                          video
+                              LEFT JOIN file_group fg on video.file_group_id = fg.id
+                     WHERE published_datetime >= date_trunc('month', months.a)
+                       AND published_datetime < date_trunc('month', months.a) + interval '1 month'
+                       AND published_datetime IS NOT NULL
+                     GROUP BY 1
+                     ORDER BY 1
+                     ''')
         monthly_videos = [dict(i) for i in curs.fetchall()]
 
         historical_stats = dict(monthly_videos=monthly_videos)
@@ -528,11 +676,11 @@ async def get_statistics():
             if monthly_videos else 0
 
         curs.execute('''
-        SELECT
-            COUNT(id) AS "channels"
-        FROM
-            channel
-        ''')
+                     SELECT COUNT(c.id)                                       AS "channels",
+                            COUNT(c.id) FILTER ( WHERE c.tag_id IS NOT NULL ) AS "tagged_channels"
+                     FROM channel c
+                              LEFT JOIN public.tag t on t.id = c.tag_id
+                     ''')
         channel_stats = dict(curs.fetchone())
     ret = dict(statistics=dict(
         videos=video_stats,
@@ -542,8 +690,10 @@ async def get_statistics():
     return ret
 
 
-NAME_PARSER = re.compile(r'(.*?)_((?:\d+?)|(?:NA))_(?:(.{5,15})_)?(.*)\.'
-                         r'(jpg|webp|flv|mp4|part|info\.json|description|webm|..\.srt|..\.vtt)')
+NAME_PARSER = re.compile(
+    r'(?:(.*?)_)?((?:\d+?)|(?:NA))_(?:(.{5,25})_)?(.*)'
+    r'\.(jpg|webp|flv|mp4|part|info\.json|description|webm|..\.srt|..\.vtt)',  # the file suffix
+    re.IGNORECASE)
 
 
 def parse_video_file_name(video_path: pathlib.Path) -> \
@@ -551,7 +701,14 @@ def parse_video_file_name(video_path: pathlib.Path) -> \
     """
     A Video's file name can have data in it, this attempts to extract what may be there.
 
-    Example: {channel_name}_{published_datetime}_{source_id}_title{ext}
+    {published_date} is assumed to always be %Y%m%d
+
+    Examples:
+        NA_{published_date}_{source_id}_{title}{ext}
+        {channel_name}_NA_{source_id}_{title}{ext}
+        {channel_name}_{published_date}_{source_id}_{title}{ext}  # Typical name format from WROLPi.
+        {published_date}_{title}{ext}
+        {title}{ext}
     """
     video_str = str(video_path)
     if match := NAME_PARSER.match(video_str):
@@ -567,8 +724,8 @@ def parse_video_file_name(video_path: pathlib.Path) -> \
             return channel, date, source_id, title
 
     # Return the stem as a last resort
-    title = pathlib.Path(video_path).stem.strip()
-    return None, None, None, title
+    title, _ = split_path_stem_and_suffix(video_path)
+    return None, None, None, title.strip()
 
 
 def find_orphaned_video_files(directory: pathlib.Path) -> Generator[pathlib.Path, None, None]:
@@ -593,3 +750,80 @@ def find_orphaned_video_files(directory: pathlib.Path) -> Generator[pathlib.Path
         ''')
         results = (pathlib.Path(j['path']) for i in curs.fetchall() for j in i[0])
         yield from results
+
+
+def format_videos_destination(channel_name: str = None, channel_tag: str = None, channel_url: str = None) \
+        -> pathlib.Path:
+    """Return the directory where Videos should be downloaded according to the WROLPi Config.
+
+    @warning: Directory may or may not exist."""
+    videos_destination = get_wrolpi_config().videos_destination
+
+    channel_domain = ''
+    if channel_url:
+        try:
+            channel_domain = extract_domain(channel_url)
+        except Exception as e:
+            logger.error(f'Failed to extract domain from Channel URL: {channel_url}', exc_info=e)
+            if PYTEST:
+                raise
+
+    if channel_name and not isinstance(channel_name, str):
+        raise RuntimeError('channel name must be string')
+    if channel_tag and not isinstance(channel_tag, str):
+        raise RuntimeError('channel tag must be string')
+
+    name = escape_file_name(channel_name) if channel_name else ''
+    variables = dict(
+        channel_name=name,
+        channel_tag=channel_tag or '',
+        channel_domain=channel_domain,
+    )
+
+    try:
+        videos_destination = videos_destination % variables
+    except KeyError as e:
+        msg = f'Cannot download to the "videos_destination" from Settings: {videos_destination}'
+        raise FileNotFoundError(msg) from e
+
+    videos_destination = get_media_directory() / videos_destination.lstrip('/')
+
+    return videos_destination
+
+
+def get_browser_profiles(home: pathlib.Path = WROLPI_HOME) -> dict:
+    """Searches the provided home directory for Chromium and Firefox profiles."""
+    logger.debug(f'Searching for browser profiles in {home}')
+
+    profiles = dict(chromium_profiles=[], firefox_profiles=[])
+
+    chromium_directory = home / '.config/chromium'
+    default_chromium_profile = chromium_directory / 'Default'
+
+    if default_chromium_profile.is_dir():
+        profiles['chromium_profiles'].append(default_chromium_profile)
+    chromium_profiles = chromium_directory.glob('Profile *')
+    for chromium_profile in chromium_profiles:
+        if chromium_profile.is_dir():
+            profiles['chromium_profiles'].append(chromium_profile)
+
+    firefox_profiles_directory = home / '.mozilla/firefox'
+    firefox_profiles_file = firefox_profiles_directory / 'profiles.ini'
+    if firefox_profiles_file.is_file():
+        # Read the profile.ini and get the default profile path.
+        firefox_profiles_file = firefox_profiles_file.read_text()
+
+        default_firefox_profile = re.findall(r'Default=(.*)', firefox_profiles_file)
+        if default_firefox_profile:
+            default_firefox_profile = firefox_profiles_directory / default_firefox_profile[0]
+
+            if default_firefox_profile.is_dir():
+                profiles['firefox_profiles'].append(default_firefox_profile)
+
+    return profiles
+
+
+def browser_profile_to_yt_dlp_arg(profile: pathlib.Path) -> str:
+    """Takes a Path and returns a string that can be used as a yt-dlp `--cookies-from-browser` argument."""
+    *_, browser, profile = str(profile).split('/')
+    return f'{browser}:{profile}'

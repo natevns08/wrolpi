@@ -3,7 +3,8 @@ from http import HTTPStatus
 
 import pytest
 
-from modules.archive import lib
+from modules.archive import lib, Archive
+from wrolpi.test.common import skip_circleci, skip_macos
 
 
 def check_results(test_client, data, ids):
@@ -82,20 +83,20 @@ def test_archives_search(test_session, archive_directory, archive_factory, test_
 
 
 @pytest.mark.asyncio
-async def test_search_archive_tags(test_session, test_async_client, archive_factory, tag_factory):
+async def test_search_archive_tags(test_session, async_client, archive_factory, tag_factory):
     """Tagged Archives can be searched."""
-    tag = tag_factory()
+    tag = await tag_factory()
     archive_factory(domain='example.com', tag_names=[tag.name, ])
     test_session.commit()
 
     content = {'search_str': '', 'domain': 'example.com', 'tag_names': [tag.name, ]}
-    request, response = await test_async_client.post('/api/archive/search', content=json.dumps(content))
+    request, response = await async_client.post('/api/archive/search', content=json.dumps(content))
     assert response.status_code == HTTPStatus.OK
     assert response.json['file_groups']
     assert response.json['totals']['file_groups'] == 1
 
     content = {'search_str': '', 'domain': 'example.com', 'tag_names': ['does not exist', ]}
-    request, response = await test_async_client.post('/api/archive/search', content=json.dumps(content))
+    request, response = await async_client.post('/api/archive/search', content=json.dumps(content))
     assert response.status_code == HTTPStatus.OK
     assert response.json['file_groups'] == []
     assert response.json['totals']['file_groups'] == 0
@@ -227,3 +228,32 @@ def test_archive_and_domain_crud(test_session, test_client, archive_factory):
     request, response = test_client.get(f'/api/archive/domains')
     assert response.status_code == HTTPStatus.OK
     assert response.json['domains'] == []
+
+
+@skip_macos
+@skip_circleci
+@pytest.mark.asyncio
+async def test_archive_upload(test_session, async_client, singlefile_contents_factory, make_multipart_form,
+                              await_switches, events_history):
+    """Test converting a SingleFile from the SingleFile browser extension to an Archive."""
+    singlefile_contents = singlefile_contents_factory(title='upload title', url='https://example.com/single-file-url')
+    forms = [
+        dict(name='url', value='https://example.com/form-url'),
+        dict(name='singlefile_contents', value=singlefile_contents, filename='singlefile_contents')
+    ]
+    body = make_multipart_form(forms)
+    headers = {'Content-Type': 'multipart/form-data; boundary=-----------------------------sanic'}
+    request, response = await async_client.post('/api/archive/upload', content=body, headers=headers)
+    assert response.status_code == HTTPStatus.OK
+
+    await await_switches()
+
+    archive, = test_session.query(Archive).all()
+    assert archive.singlefile_path.is_file(), 'Singlefile should have been saved.'
+    assert archive.readability_path.is_file(), 'Readability should be extracted.'
+    assert archive.readability_json_path.is_file(), 'Readability json should be extracted.'
+    assert archive.screenshot_path.is_file(), 'Screenshot should have been created'
+    assert archive.file_group.title == 'upload title', 'Title was not correct'
+    assert archive.file_group.url == 'https://example.com/single-file-url', 'SingleFile URL should be trusted'
+    events = list(events_history)
+    assert events and events[0]['event'] == 'upload_archive', 'Event should have been sent.'

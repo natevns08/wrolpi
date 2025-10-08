@@ -3,10 +3,13 @@ Description=WROLPi Help Documents
 PartOf=wrolpi.target
 
 [Service]
-ExecStart=/opt/wrolpi-help/venv/bin/mkdocs serve -a 0.0.0.0:8086
+Type=simple
+ExecStart=/bin/bash -c 'source /opt/wrolpi-help/venv/bin/activate && exec mkdocs serve -a 0.0.0.0:9086'
 Group=wrolpi
 User=wrolpi
 WorkingDirectory=/opt/wrolpi-help/
+# Below the App, but below the user.
+Nice=1
 
 [Install]
 WantedBy=default.target

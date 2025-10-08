@@ -1,7 +1,7 @@
 import json
 import pathlib
 import re
-from typing import Iterable, List, Optional, Union
+from typing import Iterable, List, Optional
 
 import pytz
 from sqlalchemy import Column, Integer, String, ForeignKey, BigInteger
@@ -9,12 +9,13 @@ from sqlalchemy.orm import relationship, Session, validates
 from sqlalchemy.orm.collections import InstrumentedList
 
 from wrolpi import dates
-from wrolpi.common import ModelHelper, Base, logger
+from wrolpi.common import ModelHelper, Base, logger, get_title_from_html, get_wrolpi_config, get_media_directory
+from wrolpi.dates import now
 from wrolpi.db import optional_session
 from wrolpi.errors import UnknownArchive
 from wrolpi.files.models import FileGroup
 from wrolpi.media_path import MediaPathType
-from wrolpi.tags import Tag, TagFile
+from wrolpi.tags import TagFile
 from wrolpi.vars import PYTEST
 from .errors import InvalidArchive
 
@@ -57,6 +58,35 @@ class Archive(Base, ModelHelper):
         archive = Archive.get_by_id(id_, session=session)
         if not archive:
             raise UnknownArchive(f'Cannot find Archive with id {id_}')
+        return archive
+
+    @staticmethod
+    @optional_session
+    def get_by_path(path: pathlib.Path | str, session: Session = None) -> Optional['Archive']:
+        archive = session.query(Archive).join(FileGroup).filter(FileGroup.primary_path == str(path)).one_or_none()
+        return archive
+
+    @staticmethod
+    @optional_session
+    def find_by_path(path: pathlib.Path | str, session: Session = None) -> Optional['Archive']:
+        archive = Archive.get_by_path(path, session)
+        if archive:
+            return archive
+        raise UnknownArchive(f'Cannot find Archive with path: {path}')
+
+    @staticmethod
+    def can_model(file_group: FileGroup) -> bool:
+        from modules.archive.lib import is_singlefile_file
+        if file_group.mimetype.startswith('text') and is_singlefile_file(file_group.primary_path):
+            return True
+        return False
+
+    @staticmethod
+    def do_model(file_group: FileGroup, session: Session) -> 'Archive':
+        from modules.archive import model_archive
+        archive = model_archive(file_group, session)
+        archive.validate()
+        file_group.indexed = True
         return archive
 
     def my_paths(self, *mimetypes: str) -> List[pathlib.Path]:
@@ -111,8 +141,7 @@ class Archive(Base, ModelHelper):
     @property
     def singlefile_file(self) -> Optional[dict]:
         from modules.archive.lib import is_singlefile_file
-        files = self.file_group.my_files('text/html')
-        for file in files:
+        for file in self.file_group.my_html_files():
             if is_singlefile_file(file['path']):
                 return file
 
@@ -242,7 +271,6 @@ class Archive(Base, ModelHelper):
 
     def apply_singlefile_title(self):
         """Get the title from the Singlefile, if it's missing."""
-        from modules.archive.lib import get_title_from_html
         if self.singlefile_path and not self.file_group.title:
             self.file_group.title = get_title_from_html(self.singlefile_path.read_text())
 
@@ -286,9 +314,13 @@ class Archive(Base, ModelHelper):
         archive = model_archive(file_group, session)
         return archive
 
-    def add_tag(self, tag_or_tag_name: Union[Tag, str]) -> TagFile:
-        tag = Tag.find_by_name(tag_or_tag_name) if isinstance(tag_or_tag_name, str) else tag_or_tag_name
-        return self.file_group.add_tag(tag)
+    def add_tag(self, tag_id_or_name: int | str, session: Session = None) -> TagFile:
+        return self.file_group.add_tag(tag_id_or_name, session)
+
+    @property
+    def location(self):
+        """The location where this Archive can be viewed in the UI."""
+        return f'/archive/{self.id}'
 
 
 class Domain(Base, ModelHelper):
@@ -315,3 +347,21 @@ class Domain(Base, ModelHelper):
         if len(value.split('.')) < 2:
             raise ValueError(f'Domain must contain at least one "." domain={repr(value)}')
         return value
+
+    @property
+    def download_directory(self) -> pathlib.Path:
+        archive_destination = get_wrolpi_config().archive_destination
+
+        now_ = now()
+        variables = dict(
+            domain=self.domain,
+            year=now_.year,
+            month=now_.month,
+            day=now_.day,
+        )
+        archive_destination = archive_destination % variables
+        archive_destination = pathlib.Path(archive_destination.lstrip('/'))
+        if not archive_destination.is_absolute():
+            archive_destination = get_media_directory() / archive_destination
+
+        return archive_destination

@@ -12,34 +12,26 @@ alias la='ll -a'
 EOF
 
 # Create WROLPi user.  This user will own the media directory, API, and App.
-# The `pi` user will be the maintainer's user.
 useradd -md /home/wrolpi wrolpi -s "$(command -v bash)"
-usermod -aG pi wrolpi
 
-# Change default postgresql port to 5432.
-sed -i 's/port = 5433/port = 5432/' /etc/postgresql/15/main/postgresql.conf
+# Change postgresql "main" cluster port to 5432.
+sed -i 's/port =.*/port = 5432/' /etc/postgresql/15/main/postgresql.conf
 
 # Install Node console commands.
-npm i -g serve@12.0.1 single-file-cli@1.0.15 readability-extractor@0.0.6 carto@1.2.0
+npm i -g serve@12.0.1 single-file-cli@2.0.73 readability-extractor@0.0.6 carto@1.2.0
 
 # Put the latest WROLPi master in /opt/wrolpi.
 git clone -b master https://github.com/lrnselfreliance/wrolpi.git /opt/wrolpi
 git config --global --add safe.directory /opt/wrolpi
 
-# Install Python requirements.
+# Install Python requirements.  Try multiple times because pypi may stop responding.
 python3 -m venv /opt/wrolpi/venv
-/opt/wrolpi/venv/bin/pip3 install -r /opt/wrolpi/requirements.txt
+/opt/wrolpi/venv/bin/pip3 install -r /opt/wrolpi/requirements.txt ||
+  /opt/wrolpi/venv/bin/pip3 install -r /opt/wrolpi/requirements.txt ||
+  /opt/wrolpi/venv/bin/pip3 install -r /opt/wrolpi/requirements.txt
 
 # Install webapp.
 (cd /opt/wrolpi/app && npm install && npm run build)
-
-# Add wrolpi database password to pi user
-cat >/home/pi/.pgpass <<'EOF'
-127.0.0.1:5432:gis:_renderd:wrolpi
-127.0.0.1:5432:wrolpi:wrolpi:wrolpi
-EOF
-chown -R pi:pi /home/pi
-chmod 0600 /home/pi/.pgpass
 
 chown -R wrolpi:wrolpi /opt/wrolpi
 
@@ -58,9 +50,20 @@ chown wrolpi:wrolpi /media/wrolpi
 
 cp /opt/wrolpi/etc/raspberrypios/wrolpi-*.service /etc/systemd/system/
 cp /opt/wrolpi/etc/raspberrypios/wrolpi.target /etc/systemd/system/
+# Enable first startup script.
+systemctl enable wrolpi-first-startup.service
+
+# Copy MOTD scripts, delete original.
+cp /opt/wrolpi/etc/raspberrypios/motd/20-wrolpi.motd /etc/update-motd.d/20-wrolpi
+cp /opt/wrolpi/etc/raspberrypios/motd/30-wrolpi-first.motd /etc/update-motd.d/30-wrolpi
+chmod +x /etc/update-motd.d/*
+truncate -s 0 /etc/motd
 
 # NetworkManager for the hotspot.
 systemctl enable NetworkManager
+
+# Enable iperf3 for speed testing.
+systemctl enable iperf3
 
 set +x
 

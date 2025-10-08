@@ -5,7 +5,6 @@ import {
     CardHeader,
     CardMeta,
     Container,
-    Dropdown,
     GridColumn,
     GridRow,
     Image,
@@ -24,9 +23,9 @@ import {
     ExternalCardLink,
     FileIcon,
     findPosterPath,
-    HelpHeader,
     humanFileSize,
-    isoDatetimeToString,
+    InfoHeader,
+    isoDatetimeToAgoPopup,
     mimetypeColor,
     PageContainer,
     PreviewPath,
@@ -39,15 +38,16 @@ import {
 import {deleteArchives, postDownload, tagFileGroup, untagFileGroup} from "../api";
 import {Link, Route, Routes, useNavigate, useParams} from "react-router-dom";
 import Message from "semantic-ui-react/dist/commonjs/collections/Message";
-import {useArchive, useDomains, useSearchArchives, useSearchDomain, useSearchOrder} from "../hooks/customHooks";
+import {useArchive, useDomains, useSearchArchives, useSearchOrder} from "../hooks/customHooks";
 import {FileCards, FileRowTagIcon, FilesView} from "./Files";
 import Grid from "semantic-ui-react/dist/commonjs/collections/Grid";
 import _ from "lodash";
 import {Media, ThemeContext} from "../contexts/contexts";
-import {Button, Card, CardIcon, darkTheme, Header, Loader, Placeholder, Segment, Tab, TabPane} from "./Theme";
+import {Button, Card, CardIcon, darkTheme, Header, Loader, Placeholder, Popup, Segment, Tab, TabPane} from "./Theme";
 import {SortableTable} from "./SortableTable";
 import {taggedImageLabel, TagsSelector} from "../Tags";
 import {toast} from "react-semantic-toasts-2";
+import {API_ARCHIVE_UPLOAD_URI, Downloaders} from "./Vars";
 
 function archiveFileLink(path, directory = false) {
     if (path) {
@@ -84,11 +84,15 @@ function ArchivePage() {
     const {data, size} = archiveFile;
 
     const singlefileUrl = data.singlefile_path ? `/media/${encodeMediaPath(data.singlefile_path)}` : null;
+    const readabilityUrl = data.readability_path ? `/media/${encodeMediaPath(data.readability_path)}` : null;
     const screenshotUrl = data.screenshot_path ? `/media/${encodeMediaPath(data.screenshot_path)}` : null;
 
     const singlefileButton = <ExternalCardLink to={singlefileUrl}>
         <Button content='View' color='violet'/>
     </ExternalCardLink>;
+    const readButton = <ExternalCardLink to={readabilityUrl}>
+        <Button content='Read' color='blue' disabled={!!!readabilityUrl}/>
+    </ExternalCardLink>
 
     const screenshot = screenshotUrl ?
         <Image src={screenshotUrl} size='large' style={{marginTop: '1em', marginBottom: '1em'}}/> :
@@ -104,14 +108,18 @@ function ArchivePage() {
         })
         navigate(-1);
     }
+
     const localUpdateArchive = async () => {
-        await postDownload([data.url], 'archive');
-        toast({
-            type: 'success',
-            title: 'Archive Downloading',
-            description: 'Archive update has been scheduled.',
-            time: 2000,
-        })
+        const downloadData = {urls: [archiveFile.url], downloader: Downloaders.Archive};
+        const response = await postDownload(downloadData);
+        if (response.ok) {
+            toast({
+                type: 'success',
+                title: 'Archive Downloading',
+                description: 'Archive update has been scheduled.',
+                time: 2000,
+            });
+        }
     }
 
     const updateButton = <APIButton
@@ -162,11 +170,11 @@ function ArchivePage() {
         await fetchArchive();
     }
 
-    const archivedDatetimeString = isoDatetimeToString(archiveFile.download_datetime, true);
-    const publishedDatetimeString = archiveFile.published_datetime ? isoDatetimeToString(archiveFile.published_datetime, true)
+    const archivedDatetimeString = isoDatetimeToAgoPopup(archiveFile.download_datetime, true);
+    const publishedDatetimeString = archiveFile.published_datetime ? isoDatetimeToAgoPopup(archiveFile.published_datetime, true)
         : 'unknown';
     const modifiedDatetimeString = archiveFile.published_modified_datetime
-        ? isoDatetimeToString(archiveFile.published_modified_datetime, true)
+        ? isoDatetimeToAgoPopup(archiveFile.published_modified_datetime, true)
         : 'unknown';
 
     const aboutPane = {
@@ -243,18 +251,23 @@ function ArchivePage() {
             </Grid>
 
             {singlefileButton}
+            {readButton}
             {updateButton}
             {deleteButton}
         </Segment>
 
         <Segment>
-            <TagsSelector selectedTagNames={archiveFile['tags']} onAdd={localAddTag} onRemove={localRemoveTag}/>
+            <TagsSelector
+                selectedTagNames={archiveFile['tags']}
+                onAdd={localAddTag}
+                onRemove={localRemoveTag}
+            />
         </Segment>
 
         <Tab menu={tabMenu} panes={tabPanes}/>
 
         <Segment>
-            <HelpHeader
+            <InfoHeader
                 headerContent='History'
                 popupContent='Other archives of this URL created at different times.'
             />
@@ -279,6 +292,9 @@ export function ArchiveCard({file}) {
     const domain = data ? data.domain : null;
     const domainUrl = `/archive?domain=${domain}`;
 
+    const title = file.title || data.url;
+    const header = <ExternalCardLink to={singlefileUrl} className='card-title-ellipsis'>{title}</ExternalCardLink>;
+    const dt = file.published_datetime || file.published_modified_datetime || file.modified;
     return <Card color={mimetypeColor(file.mimetype)}>
         <div>
             <ExternalCardLink to={singlefileUrl}>
@@ -288,9 +304,9 @@ export function ArchiveCard({file}) {
         <CardContent {...s}>
             <CardHeader>
                 <Container textAlign='left'>
-                    <ExternalCardLink to={singlefileUrl} className='card-title-ellipsis'>
-                        {file.title || data.url}
-                    </ExternalCardLink>
+                    <Popup on='hover'
+                           trigger={header}
+                           content={title}/>
                 </Container>
             </CardHeader>
             {domain &&
@@ -298,9 +314,7 @@ export function ArchiveCard({file}) {
                     <span {...s}>{domain}</span>
                 </CardLink>}
             <CardMeta {...s}>
-                <p>
-                    {isoDatetimeToString(file.published_datetime)}
-                </p>
+                {isoDatetimeToAgoPopup(dt, false)}
             </CardMeta>
             <CardDescription>
                 <Link to={`/archive/${data.id}`}>
@@ -379,29 +393,47 @@ export function DomainsPage() {
     </>;
 }
 
-export function SearchDomain() {
-    // A Dropdown which allows the user to filter by Archive domains.
-    const {domain, domains, setDomain} = useSearchDomain();
+function ArchiveSettingsPage() {
+    const {t} = React.useContext(ThemeContext);
 
-    const handleChange = (e, {value}) => {
-        setDomain(value);
-    }
+    const urlClipboardButton = <APIButton
+        icon='copy'
+        onClick={() => navigator.clipboard.writeText(API_ARCHIVE_UPLOAD_URI)}
+    />;
+    const dataFieldNameClipboardButton = <APIButton
+        icon='copy'
+        onClick={() => navigator.clipboard.writeText('singlefile_contents')}
+    />;
+    const urlFieldNameClipboardButton = <APIButton
+        icon='copy'
+        onClick={() => navigator.clipboard.writeText('url')}
+    />;
 
-    let domainOptions = [];
+    return <PageContainer>
+        <Header as='h1'>SingleFile Browser Extension</Header>
 
-    if (domains && domains.length > 0) {
-        domainOptions = domains.map(i => {
-            return {key: i['domain'], value: i['domain'], text: i['domain']}
-        });
-    }
-    return <>
-        <Dropdown selection search clearable fluid
-                  placeholder='Domains'
-                  options={domainOptions}
-                  onChange={handleChange}
-                  value={domain}
+        <p {...t}>
+            These are the settings necessary to configure the <a
+            href="https://github.com/gildas-lormeau/SingleFile?tab=readme-ov-file#install">SingleFile Browser
+            Extension</a> to automatically upload to your WROLPi.
+        </p>
+
+        <label {...t}>Upload URL</label>
+        <Input fluid
+               value={API_ARCHIVE_UPLOAD_URI}
+               label={urlClipboardButton}
         />
-    </>
+        <label {...t}>Data Field Name</label>
+        <Input fluid
+               value='singlefile_contents'
+               label={dataFieldNameClipboardButton}
+        />
+        <label {...t}>URL Field Name</label>
+        <Input fluid
+               value='url'
+               label={urlFieldNameClipboardButton}
+        />
+    </PageContainer>
 }
 
 function ArchivesPage() {
@@ -482,18 +514,24 @@ function ArchivesPage() {
     </div>;
 
     const {body, paginator, selectButton, viewButton, limitDropdown, tagQuerySelector} = FilesView(
-        archives,
-        activePage,
-        totalPages,
-        selectElm,
-        selectedArchives,
-        onSelect,
-        setPage,
-        !!searchStr,
+        {
+            files: archives,
+            activePage: activePage,
+            totalPages: totalPages,
+            selectElem: selectElm,
+            selectedKeys: selectedArchives,
+            onSelect: onSelect,
+            setPage: setPage,
+            headlines: !!searchStr
+        },
     );
 
+
+    const [localSearchStr, setLocalSearchStr] = React.useState(searchStr || '');
     const searchInput = <SearchInput
-        searchStr={searchStr}
+        onChange={setLocalSearchStr}
+        onClear={() => setLocalSearchStr(null)}
+        searchStr={localSearchStr}
         onSubmit={setSearchStr}
         placeholder='Search Archives...'
     />;
@@ -548,15 +586,15 @@ export function ArchiveRowCells({file}) {
         poster = <FileIcon file={file} size='large'/>;
     }
 
-    let dataCell = file.published_datetime ? isoDatetimeToString(file.published_datetime) : '';
+    let dataCell = file.published_datetime ? isoDatetimeToAgoPopup(file.published_datetime) : '';
     if (sort === 'published_modified_datetime') {
-        dataCell = file.published_modified_datetime ? isoDatetimeToString(file.published_modified_datetime) : '';
+        dataCell = file.published_modified_datetime ? isoDatetimeToAgoPopup(file.published_modified_datetime) : '';
     } else if (sort === 'download_datetime') {
-        dataCell = file.download_datetime ? isoDatetimeToString(file.download_datetime) : '';
+        dataCell = file.download_datetime ? isoDatetimeToAgoPopup(file.download_datetime) : '';
     } else if (sort === 'size') {
         dataCell = humanFileSize(file.size);
     } else if (sort === 'viewed') {
-        dataCell = isoDatetimeToString(file.viewed);
+        dataCell = isoDatetimeToAgoPopup(file.viewed);
     }
 
     // Fragment for SelectableRow
@@ -578,12 +616,14 @@ export function ArchiveRoute() {
     const links = [
         {text: 'Archives', to: '/archive', end: true},
         {text: 'Domains', to: '/archive/domains'},
+        {text: 'Settings', to: '/archive/settings'},
     ];
     return <PageContainer>
         <TabLinks links={links}/>
         <Routes>
             <Route path='/' element={<ArchivesPage/>}/>
             <Route path='domains' element={<DomainsPage/>}/>
+            <Route path='settings' element={<ArchiveSettingsPage/>}/>
             <Route path=':archiveId' element={<ArchivePage/>}/>
         </Routes>
     </PageContainer>

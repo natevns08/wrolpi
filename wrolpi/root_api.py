@@ -1,60 +1,59 @@
 import asyncio
-import json
+import pathlib
 import re
-from datetime import datetime, date, timezone
-from decimal import Decimal
-from functools import wraps
 from http import HTTPStatus
-from pathlib import Path
-from typing import Union
 
 import vininfo.exceptions
-from sanic import Sanic, response, Blueprint, __version__ as sanic_version
-from sanic.blueprint_group import BlueprintGroup
+from sanic import response, Blueprint, __version__ as sanic_version
 from sanic.request import Request
-from sanic.response import HTTPResponse
 from sanic_ext import validate
 from sanic_ext.extensions.openapi import openapi
 from vininfo import Vin
 from vininfo.details._base import VinDetails
 
-from wrolpi import admin, status, flags, schema, dates
+from modules.archive.api import archive_bp
+from modules.inventory import inventory_bp
+from modules.map.api import map_bp
+from modules.otp.api import otp_bp
+from modules.videos.api import videos_bp
+from modules.zim.api import zim_bp
+from wrolpi import admin, flags, schema, dates
 from wrolpi import tags
 from wrolpi.admin import HotspotStatus
-from wrolpi.common import logger, get_config, wrol_mode_enabled, Base, get_media_directory, \
-    wrol_mode_check, native_only, disable_wrol_mode, enable_wrol_mode, get_global_statistics, url_strip_host, LOG_LEVEL, \
-    set_global_log_level
+from wrolpi.api_utils import json_response, api_app
+from wrolpi.common import logger, get_wrolpi_config, wrol_mode_enabled, get_media_directory, \
+    wrol_mode_check, native_only, disable_wrol_mode, enable_wrol_mode, get_global_statistics, url_strip_host, \
+    set_global_log_level, get_relative_to_media_directory, search_other_estimates
+from wrolpi.config_api import config_bp
 from wrolpi.dates import now
+from wrolpi.db import get_db_session
 from wrolpi.downloader import download_manager
-from wrolpi.errors import WROLModeEnabled, APIError, HotspotError, InvalidDownload, \
-    HotspotPasswordTooShort, NativeOnly, InvalidConfig
+from wrolpi.errors import WROLModeEnabled, HotspotError, HotspotPasswordTooShort, InvalidConfig, \
+    ValidationError
 from wrolpi.events import get_events, Events
-from wrolpi.files.lib import get_file_statistics, estimate_search
-from wrolpi.vars import API_HOST, API_PORT, DOCKERIZED, API_DEBUG, API_ACCESS_LOG, API_WORKERS, API_AUTO_RELOAD, \
-    truthy_arg
+from wrolpi.files import files_bp
+from wrolpi.files.lib import get_file_statistics, search_file_suggestion_count
+from wrolpi.tags import Tag
+from wrolpi.vars import DOCKERIZED, IS_RPI, IS_RPI4, IS_RPI5, API_HOST, API_PORT, API_WORKERS, API_DEBUG, \
+    API_ACCESS_LOG, truthy_arg, API_AUTO_RELOAD
 from wrolpi.version import __version__
 
 logger = logger.getChild(__name__)
 
-api_app = Sanic(name='api_app')
 api_app.config.FALLBACK_ERROR_FORMAT = 'json'
 
 api_bp = Blueprint('RootAPI', url_prefix='/api')
 
-BLUEPRINTS = [api_bp, ]
-
-
-def get_blueprint(name: str, url_prefix: str) -> Blueprint:
-    """
-    Create a new Sanic blueprint.  This will be attached to the app just before run.  See `root_api.run_webserver`.
-    """
-    bp = Blueprint(name, url_prefix)
-    add_blueprint(bp)
-    return bp
-
-
-def add_blueprint(bp: Union[Blueprint, BlueprintGroup]):
-    BLUEPRINTS.append(bp)
+# Blueprints order here defines what order they are displayed in OpenAPI Docs.
+api_app.blueprint(api_bp)
+api_app.blueprint(archive_bp)
+api_app.blueprint(config_bp)
+api_app.blueprint(files_bp)
+api_app.blueprint(inventory_bp)
+api_app.blueprint(map_bp)
+api_app.blueprint(otp_bp)
+api_app.blueprint(videos_bp)
+api_app.blueprint(zim_bp)
 
 
 def run_webserver(
@@ -65,8 +64,6 @@ def run_webserver(
         access_log: bool = API_ACCESS_LOG,
 ):
     # Attach all blueprints after they have been defined.
-    for bp in BLUEPRINTS:
-        api_app.blueprint(bp)
 
     kwargs = dict(
         host=host,
@@ -122,13 +119,21 @@ async def index(_):
 
 
 @api_bp.route('/echo', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
-@openapi.description('Echo whatever is sent to this.')
-@openapi.response(HTTPStatus.OK, schema.EchoResponse)
+@openapi.definition(
+    description='Echo whatever is sent to this.',
+    response=schema.EchoResponse,
+)
 async def echo(request: Request):
+    try:
+        request_json = request.json
+    except Exception as e:
+        logger.error('Failed to parse request JSON', exc_info=e)
+        request_json = None
+    request_headers = dict(request.headers)
     ret = dict(
         form=request.form,
-        headers=dict(request.headers),
-        json=request.json,
+        headers=request_headers,
+        json=request_json,
         method=request.method,
         args=request.args,
     )
@@ -136,43 +141,56 @@ async def echo(request: Request):
 
 
 @api_bp.route('/settings', methods=['GET', 'OPTIONS'])
-@openapi.description('Get WROLPi settings')
-@openapi.response(HTTPStatus.OK, schema.SettingsResponse)
+@openapi.definition(
+    description='Get WROLPi settings',
+    response=schema.SettingsResponse,
+)
 def get_settings(_: Request):
-    config = get_config()
+    wrolpi_config = get_wrolpi_config()
+
+    ignored_directories = [get_relative_to_media_directory(i) for i in wrolpi_config.ignored_directories]
 
     settings = {
-        'download_manager_disabled': download_manager.disabled.is_set(),
-        'download_manager_stopped': download_manager.stopped.is_set(),
-        'download_on_startup': config.download_on_startup,
-        'download_timeout': config.download_timeout,
-        'hotspot_device': config.hotspot_device,
-        'hotspot_on_startup': config.hotspot_on_startup,
-        'hotspot_password': config.hotspot_password,
-        'hotspot_ssid': config.hotspot_ssid,
+        'archive_destination': wrolpi_config.archive_destination,
+        'download_manager_disabled': download_manager.is_disabled,
+        'download_manager_stopped': download_manager.is_stopped,
+        'download_on_startup': wrolpi_config.download_on_startup,
+        'download_timeout': wrolpi_config.download_timeout,
+        'hotspot_device': wrolpi_config.hotspot_device,
+        'hotspot_on_startup': wrolpi_config.hotspot_on_startup,
+        'hotspot_password': wrolpi_config.hotspot_password,
+        'hotspot_ssid': wrolpi_config.hotspot_ssid,
         'hotspot_status': admin.hotspot_status().name,
-        'log_level': LOG_LEVEL.value,
-        'ignore_outdated_zims': config.ignore_outdated_zims,
+        'ignore_outdated_zims': wrolpi_config.ignore_outdated_zims,
+        'ignored_directories': ignored_directories,
+        'log_level': api_app.shared_ctx.log_level.value,
+        'map_destination': wrolpi_config.map_destination,
+        'nav_color': wrolpi_config.nav_color,
         'media_directory': str(get_media_directory()),  # Convert to string to avoid conversion to relative.
-        'throttle_on_startup': config.throttle_on_startup,
+        'throttle_on_startup': wrolpi_config.throttle_on_startup,
         'throttle_status': admin.throttle_status().name,
         'version': __version__,
-        'wrol_mode': config.wrol_mode,
+        'videos_destination': wrolpi_config.videos_destination,
+        'wrol_mode': wrolpi_config.wrol_mode,
+        'zims_destination': wrolpi_config.zims_destination,
     }
     return json_response(settings)
 
 
 @api_bp.patch('/settings')
-@openapi.description('Update WROLPi settings')
-@validate(json=schema.SettingsRequest)
-def update_settings(request: Request, body: schema.SettingsRequest):
+@openapi.definition(
+    description='Update WROLPi settings',
+    body=schema.SettingsRequest,
+    validate=True,
+)
+async def update_settings(_: Request, body: schema.SettingsRequest):
     if wrol_mode_enabled() and body.wrol_mode is None:
         # Cannot update settings while WROL Mode is enabled, unless you want to disable WROL Mode.
         raise WROLModeEnabled()
 
     if body.wrol_mode is False:
         # Disable WROL Mode
-        disable_wrol_mode()
+        await disable_wrol_mode()
         return response.empty()
     elif body.wrol_mode is True:
         # Enable WROL Mode
@@ -183,21 +201,41 @@ def update_settings(request: Request, body: schema.SettingsRequest):
         raise HotspotPasswordTooShort()
 
     # Remove any keys with None values, then save the config.
-    config = {k: v for k, v in body.__dict__.items() if v is not None}
-    wrolpi_config = get_config()
+    new_config = {k: v for k, v in body.__dict__.items() if v is not None}
+    wrolpi_config = get_wrolpi_config()
 
-    if not config:
+    if not new_config:
         raise InvalidConfig()
 
-    log_level = config.pop('log_level', None)
+    if body.archive_destination and pathlib.Path(body.archive_destination).is_absolute():
+        raise InvalidConfig('Archive directory must be relative to media directory')
+    elif not body.archive_destination:
+        new_config['archive_destination'] = wrolpi_config.default_config['archive_destination']
+
+    if body.videos_destination and pathlib.Path(body.videos_destination).is_absolute():
+        raise InvalidConfig('Videos directory must be relative to media directory')
+    elif not body.videos_destination:
+        new_config['videos_destination'] = wrolpi_config.default_config['videos_destination']
+
+    if body.map_destination and pathlib.Path(body.map_destination).is_absolute():
+        raise InvalidConfig('Map directory must be relative to media directory')
+    elif not body.map_destination:
+        new_config['map_destination'] = wrolpi_config.default_config['map_destination']
+
+    if body.zims_destination and pathlib.Path(body.zims_destination).is_absolute():
+        raise InvalidConfig('Zims directory must be relative to media directory')
+    elif not body.zims_destination:
+        new_config['zims_destination'] = wrolpi_config.default_config['zims_destination']
+
+    log_level = new_config.pop('log_level', None)
     if isinstance(log_level, int):
         set_global_log_level(log_level)
 
     old_password = wrolpi_config.hotspot_password
-    wrolpi_config.update(config)
+    wrolpi_config.update(new_config)
 
     # If the password was changed, we need to restart the hotspot.
-    password_changed = (new_password := config.get('hotspot_password')) and old_password != new_password
+    password_changed = (new_password := new_config.get('hotspot_password')) and old_password != new_password
 
     if body.hotspot_status is True or (password_changed and admin.hotspot_status() == HotspotStatus.connected):
         # Turn on Hotspot
@@ -212,10 +250,12 @@ def update_settings(request: Request, body: schema.SettingsRequest):
 
 
 @api_bp.post('/valid_regex')
-@openapi.description('Check if the regex is valid.')
-@openapi.response(HTTPStatus.OK, schema.RegexResponse)
-@openapi.response(HTTPStatus.BAD_REQUEST, schema.RegexResponse)
-@validate(schema.RegexRequest)
+@openapi.definition(
+    description='Check if the regex is valid.',
+    body=schema.RegexRequest,
+    response=schema.RegexResponse,
+    validate=True,
+)
 def valid_regex(_: Request, body: schema.RegexRequest):
     try:
         re.compile(body.regex)
@@ -225,39 +265,70 @@ def valid_regex(_: Request, body: schema.RegexRequest):
 
 
 @api_bp.post('/download')
-@openapi.description('Download all the URLs that are provided.')
-@validate(schema.DownloadRequest)
+@openapi.definition(
+    description='Download all the URLs that are provided.',
+    body=schema.DownloadRequest,
+    validate=True,
+)
 @wrol_mode_check
 async def post_download(_: Request, body: schema.DownloadRequest):
-    downloader = download_manager.get_downloader_by_name(body.downloader)
-    if not downloader:
-        raise InvalidDownload(f'Cannot find downloader with name {body.downloader}')
+    # Raises an InvalidDownload if the Downloader cannot be found.
+    download_manager.find_downloader_by_name(body.downloader)
 
-    excluded_urls = [i.strip() for i in body.excluded_urls.split(',')] if body.excluded_urls else None
-    destination = str(get_media_directory() / body.destination) if body.destination else None
-
-    if body.suffix and not body.suffix.startswith('.'):
-        raise InvalidDownload(f'Suffix must start with a "."')
-
-    # Don't overwrite settings if restarting download.
-    settings = None
-    if excluded_urls or destination or body.tag_names or body.suffix or body.depth:
-        settings = dict(excluded_urls=excluded_urls, destination=destination, tag_names=body.tag_names,
-                        suffix=body.suffix,
-                        depth=body.depth)
-
+    kwargs = dict(downloader_name=body.downloader,
+                  sub_downloader_name=body.sub_downloader, reset_attempts=True,
+                  destination=body.destination, tag_names=body.tag_names,
+                  settings=body.settings)
     if body.frequency:
-        download_manager.recurring_download(body.urls[0], body.frequency, downloader_name=body.downloader,
-                                            sub_downloader_name=body.sub_downloader, reset_attempts=True,
-                                            settings=settings)
+        download_manager.recurring_download(body.urls[0], body.frequency, **kwargs)
     else:
-        download_manager.create_downloads(body.urls, downloader_name=body.downloader, reset_attempts=True,
-                                          sub_downloader_name=body.sub_downloader, settings=settings)
+        download_manager.create_downloads(body.urls, **kwargs)
+    if download_manager.disabled.is_set() or download_manager.stopped.is_set():
+        # Downloads are disabled, warn the user.
+        Events.send_downloads_disabled('Download created. But, downloads are disabled.')
+
+    return response.empty(status=HTTPStatus.CREATED)
+
+
+@api_bp.put('/download/<download_id:int>')
+@openapi.definition(
+    description='Update properties of the Download',
+    body=schema.DownloadRequest,
+    validate=True,
+)
+@wrol_mode_check
+async def put_download(_: Request, download_id: int, body: schema.DownloadRequest):
+    # Raises an InvalidDownload if the Downloader cannot be found.
+    download_manager.find_downloader_by_name(body.downloader)
+
+    if len(body.urls) != 1:
+        raise ValidationError('Only one URL can be specified when updating a Download')
+
+    with get_db_session(commit=True) as session:
+        download_manager.update_download(
+            id_=download_id,
+            url=body.urls[0],
+            downloader=body.downloader,
+            destination=body.destination,
+            frequency=body.frequency,
+            tag_names=body.tag_names,
+            sub_downloader=body.sub_downloader,
+            settings=body.settings,
+            session=session,
+        )
     if download_manager.disabled.is_set() or download_manager.stopped.is_set():
         # Downloads are disabled, warn the user.
         Events.send_downloads_disabled('Download created. But, downloads are disabled.')
 
     return response.empty()
+
+
+@api_bp.delete('/download/<download_id:int>')
+@openapi.description('Delete a download')
+@wrol_mode_check
+async def delete_download(_: Request, download_id: int):
+    deleted = download_manager.delete_download(download_id)
+    return response.empty(HTTPStatus.NO_CONTENT if deleted else HTTPStatus.NOT_FOUND)
 
 
 @api_bp.post('/download/<download_id:int>/restart')
@@ -268,9 +339,18 @@ async def restart_download(_: Request, download_id: int):
 
 
 @api_bp.get('/download')
-@openapi.description('Get all Downloads that need to be processed.')
+@openapi.description('Get all Downloads so they can be displayed to the User.')
 async def get_downloads(_: Request):
     data = download_manager.get_fe_downloads()
+
+    # Convert `destination` to relative.
+    for download in data['once_downloads']:
+        download['destination'] = get_relative_to_media_directory(download['destination']) \
+            if download['destination'] else None
+    for download in data['recurring_downloads']:
+        download['destination'] = get_relative_to_media_directory(download['destination']) \
+            if download['destination'] else None
+
     return json_response(data)
 
 
@@ -284,6 +364,7 @@ async def kill_download(_: Request, download_id: int):
 @api_bp.post('/download/kill')
 @openapi.description('Kill all downloads.  Disable downloading.')
 async def kill_downloads(_: Request):
+    logger.warning('Disabled downloads')
     download_manager.disable()
     return response.empty()
 
@@ -291,7 +372,7 @@ async def kill_downloads(_: Request):
 @api_bp.post('/download/enable')
 @openapi.description('Enable and start downloading.')
 async def enable_downloads(_: Request):
-    download_manager.enable()
+    await download_manager.enable()
     return response.empty()
 
 
@@ -309,12 +390,18 @@ async def clear_failed(_: Request):
     return response.empty()
 
 
-@api_bp.delete('/download/<download_id:[0-9,]+>')
-@openapi.description('Delete a download')
-@wrol_mode_check
-async def delete_download(_: Request, download_id: int):
-    deleted = download_manager.delete_download(download_id)
-    return response.empty(HTTPStatus.NO_CONTENT if deleted else HTTPStatus.NOT_FOUND)
+@api_bp.post('/download/retry_once')
+@openapi.description('Retry failed once-downloads')
+async def retry_once(_: Request):
+    download_manager.retry_downloads(reset_attempts=True)
+    return response.empty()
+
+
+@api_bp.post('/download/delete_once')
+@openapi.description('Delete all once downloads')
+async def delete_once(_: Request):
+    download_manager.delete_once()
+    return response.empty()
 
 
 @api_bp.get('/downloaders')
@@ -330,7 +417,7 @@ async def get_downloaders(_: Request):
 @openapi.description('Turn on the hotspot')
 @native_only
 async def hotspot_on(_: Request):
-    result = admin.enable_hotspot()
+    result = admin.enable_hotspot(overwrite=True)
     if result:
         return response.empty()
     return response.empty(HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -367,9 +454,11 @@ async def throttle_off(_: Request):
 
 
 @api_bp.get('/status')
-@openapi.description('Get the status of CPU/load/etc.')
-async def get_status(_: Request):
-    s = await status.get_status()
+@openapi.definition(
+    description='Get the status of CPU/load/etc.',
+    response=schema.StatusResponse,
+)
+async def get_status(request: Request):
     downloads = dict()
     if flags.db_up.is_set():
         try:
@@ -377,27 +466,37 @@ async def get_status(_: Request):
         except Exception as e:
             logger.debug('Unable to get download status', exc_info=e)
 
+    sanic_workers = dict()
+    if hasattr(request.app, 'multiplexer'):
+        # `multiplexer` may be empty while testing.
+        sanic_workers = {
+            i: {'pid': j['pid'], 'state': j['state']}
+            for i, j in request.app.multiplexer.workers.items()
+            if i.startswith('Sanic-Server')
+        }
+
     ret = dict(
-        bandwidth=s.bandwidth,
-        cpu_info=s.cpu_info,
-        disk_bandwidth=s.disk_bandwidth,
         dockerized=DOCKERIZED,
         downloads=downloads,
-        drives=s.drives,
         flags=flags.get_flags(),
+        hotspot_ssid=admin.get_current_ssid(get_wrolpi_config().hotspot_device),
         hotspot_status=admin.hotspot_status().name,
-        load=s.load,
-        memory_stats=s.memory_stats,
+        is_rpi4=IS_RPI4,
+        is_rpi5=IS_RPI5,
+        is_rpi=IS_RPI,
+        sanic_workers=sanic_workers,
         throttle_status=admin.throttle_status().name,
         version=__version__,
         wrol_mode=wrol_mode_enabled(),
+        # Include all stats from status worker.
+        **api_app.shared_ctx.status,
     )
     return json_response(ret)
 
 
 @api_bp.get('/statistics')
 @openapi.definition(
-    summary='Get summary statistics of all files',
+    description='Get summary statistics of all files',
 )
 async def get_statistics(_):
     file_statistics = get_file_statistics()
@@ -409,9 +508,14 @@ async def get_statistics(_):
 
 
 @api_bp.get('/events/feed')
+@openapi.description('Get all events after the provided date.')
 @validate(query=schema.EventsRequest)
-async def feed(_: Request, query: schema.EventsRequest):
+async def feed(request: Request, query: schema.EventsRequest):
+    # Get the current datetime from the API.  The frontend will use this to request any events that happen after it's
+    # previous request.  The API decides what the time is, just in case the RPi's clock is wrong, or no NTP is
+    # available.
     start = now()
+
     after = None if query.after == 'None' else dates.strpdate(query.after)
     events = get_events(after)
     return json_response(dict(events=events, now=start))
@@ -419,21 +523,22 @@ async def feed(_: Request, query: schema.EventsRequest):
 
 @api_bp.get('/tag')
 @openapi.definition(
-    summary='Get a list of all Tags',
+    description='Get a list of all Tags',
 )
 async def get_tags_request(_: Request):
     tags_ = tags.get_tags()
     return json_response(dict(tags=tags_))
 
 
-@api_bp.post('/tag')
-@api_bp.post('/tag/<tag_id:int>')
-@validate(schema.TagRequest)
+@api_bp.post('/tag', name='tag_crate')
+@api_bp.post('/tag/<tag_id:int>', name='tag_update')
 @openapi.definition(
-    summary='Create or update a Tag',
+    description='Create or update a Tag',
+    body=schema.TagRequest,
+    validate=True,
 )
 async def post_tag(_: Request, body: schema.TagRequest, tag_id: int = None):
-    tags.upsert_tag(body.name, body.color, tag_id)
+    await tags.upsert_tag(body.name, body.color, tag_id)
     if tag_id:
         return response.empty(HTTPStatus.OK)
     else:
@@ -442,7 +547,7 @@ async def post_tag(_: Request, body: schema.TagRequest, tag_id: int = None):
 
 @api_bp.delete('/tag/<tag_id:int>')
 async def delete_tag_request(_: Request, tag_id: int):
-    tags.delete_tag(tag_id)
+    Tag.find_by_id(tag_id).delete()
     return response.empty()
 
 
@@ -456,7 +561,12 @@ async def post_notify(_: Request, body: schema.NotifyRequest):
 
 
 @api_bp.post('/vin_number_decoder')
-@validate(schema.VINDecoderRequest)
+@openapi.definition(
+    description='Decode a VIN number',
+    body=schema.VINDecoderRequest,
+    response=schema.VINDecoderResponse,
+    validate=True,
+)
 async def post_vin_number_decoder(_: Request, body: schema.VINDecoderRequest):
     try:
         vin = Vin(body.vin_number)
@@ -489,163 +599,75 @@ async def post_vin_number_decoder(_: Request, body: schema.VINDecoderRequest):
 
 
 @api_bp.post('/restart')
+@openapi.definition(description='Restart the system')
+@native_only
 async def post_restart(_: Request):
-    if DOCKERIZED:
-        raise NativeOnly(f'Cannot restart when running in Docker')
-
     await admin.shutdown(reboot=True)
     return response.empty(HTTPStatus.NO_CONTENT)
 
 
 @api_bp.post('/shutdown')
+@openapi.definition(description='Shutdown the system')
+@native_only
 async def post_shutdown(_: Request):
-    if DOCKERIZED:
-        raise NativeOnly(f'Cannot shutdown when running in Docker')
-
     await admin.shutdown()
     return response.empty(HTTPStatus.NO_CONTENT)
 
 
 @api_bp.post('/search_suggestions')
-@validate(json=schema.SearchSuggestionsRequest)
+@openapi.definition(
+    description='Suggest related Channels/Domains/etc. to the user.',
+    body=schema.SearchSuggestionsRequest,
+    validate=True,
+)
 async def post_search_suggestions(_: Request, body: schema.SearchSuggestionsRequest):
-    """Used by the Global search to suggest related Channels/Domains/etc. to the user.
-
-    @note: Does not handle Tags, unlike search_estimates"""
     from modules.videos.channel.lib import search_channels_by_name
     from modules.archive.lib import search_domains_by_name
-    from modules.zim import lib as zim_lib
 
-    file_groups, channels, domains = await asyncio.gather(
-        estimate_search(body.search_str, []),
-        search_channels_by_name(body.search_str),
+    channels, domains = await asyncio.gather(
+        search_channels_by_name(body.search_str, order_by_video_count=body.order_by_video_count),
         search_domains_by_name(body.search_str),
     )
 
-    # Get estimates using libzim.
-    zims_estimates = zim_lib.get_estimates(body.search_str)
-
     ret = dict(
-        file_groups=file_groups,
-        zims_estimates=zims_estimates,
         channels=channels,
         domains=domains,
     )
     return json_response(ret)
 
 
-@api_bp.post('/search_estimates')
-@validate(json=schema.SearchEstimateRequest)
-async def post_search_estimates(_: Request, body: schema.SearchEstimateRequest):
-    """Get an estimated count of FileGroups/Zims which may or may not have been tagged."""
-    from modules.zim.models import Zims
-
-    if not body.search_str and not body.tag_names:
-        return response.empty(HTTPStatus.BAD_REQUEST)
-
-    file_groups = await estimate_search(body.search_str, body.tag_names)
-
-    if body.tag_names:
-        # Get actual count of entries tagged with the tag names.
-        zims_estimates = list()
-        for zim, count in Zims.entries_with_tags(body.tag_names).items():
-            d = dict(
-                estimate=count,
-                **zim.__json__(),
-            )
-            zims_estimates.append(d)
-    else:
-        # Get estimates using libzim.
-        zims_estimates = list()
-        for zim, estimate in Zims.estimate(body.search_str).items():
-            d = dict(
-                estimate=estimate,
-                **zim.__json__(),
-            )
-            zims_estimates.append(d)
+@api_bp.post('/search_file_estimates')
+@openapi.definition(
+    description='Get a count of FileGroup suggestions.',
+    body=schema.SearchFileEstimateRequest,
+    validate=True,
+)
+async def post_search_file_estimates(_: Request, body: schema.SearchFileEstimateRequest):
+    """Used by the Global search to suggest FileGroup count to the user."""
+    file_groups = await search_file_suggestion_count(
+        body.search_str,
+        body.tag_names,
+        body.mimetypes,
+        body.months,
+        body.from_year,
+        body.to_year,
+        body.any_tag,
+    )
 
     ret = dict(
         file_groups=file_groups,
-        zims_estimates=zims_estimates
     )
     return json_response(ret)
 
 
-class CustomJSONEncoder(json.JSONEncoder):
-
-    def default(self, obj):
-        try:
-            if hasattr(obj, '__json__'):
-                # Get __json__ before others.
-                return obj.__json__()
-            elif isinstance(obj, datetime):
-                # API always returns dates in UTC.
-                if obj.tzinfo:
-                    obj = obj.astimezone(timezone.utc)
-                else:
-                    # A datetime with no timezone is UTC.
-                    obj = obj.replace(tzinfo=timezone.utc)
-                obj = obj.isoformat()
-                return obj
-            elif isinstance(obj, date):
-                # API always returns dates in UTC.
-                obj = datetime(obj.year, obj.month, obj.day, tzinfo=timezone.utc)
-                return obj.isoformat()
-            elif isinstance(obj, Decimal):
-                return str(obj)
-            elif isinstance(obj, Base):
-                if hasattr(obj, 'dict'):
-                    return obj.dict()
-            elif isinstance(obj, Path):
-                media_directory = get_media_directory()
-                try:
-                    path = obj.relative_to(media_directory)
-                except ValueError:
-                    # Path may not be absolute.
-                    path = obj
-                if str(path) == '.':
-                    return ''
-                return str(path)
-            return super(CustomJSONEncoder, self).default(obj)
-        except Exception as e:
-            logger.fatal(f'Failed to JSON encode {obj}', exc_info=e)
-            raise
-
-
-@wraps(response.json)
-def json_response(*a, **kwargs) -> HTTPResponse:
-    """
-    Handles encoding date/datetime in JSON.
-    """
-    resp = response.json(*a, **kwargs, cls=CustomJSONEncoder, dumps=json.dumps)
-    return resp
-
-
-def get_error_json(exception: BaseException):
-    """Return a JSON representation of the Exception instance."""
-    if isinstance(exception, APIError):
-        # Error especially defined for WROLPi.
-        body = dict(error=str(exception), summary=exception.summary, code=exception.code)
-    else:
-        # Not a WROLPi APIError error.
-        body = dict(
-            error=str(exception),
-            summary=None,
-            code=None,
-        )
-    if exception.__cause__:
-        # This exception was caused by another, follow the stack.
-        body['cause'] = get_error_json(exception.__cause__)
-    return body
-
-
-def json_error_handler(request: Request, exception: APIError):
-    body = get_error_json(exception)
-    error = repr(str(body["error"]))
-    summary = repr(str(body["summary"]))
-    code = body['code']
-    logger.debug(f'API returning JSON error {exception=} {error=} {summary=} {code=}')
-    return json_response(body, exception.status)
-
-
-api_app.error_handler.add(APIError, json_error_handler)
+@api_bp.post('/search_other_estimates')
+@openapi.definition(
+    description='Get a count of other suggestions.',
+    body=schema.SearchOtherEstimateRequest,
+    validate=True,
+)
+async def post_search_other_estimates(_: Request, body: schema.SearchOtherEstimateRequest):
+    """Used by the Global search to suggest FileGroup count to the user."""
+    others = await search_other_estimates(body.tag_names)
+    ret = dict(others=others)
+    return json_response(ret)

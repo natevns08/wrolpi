@@ -21,8 +21,9 @@ import {
     ExternalCardLink,
     FileIcon,
     findPosterPath,
+    HandPointMessage,
     humanFileSize,
-    isoDatetimeToString,
+    isoDatetimeToAgoPopup,
     mimetypeColor,
     PageContainer,
     Paginator,
@@ -34,7 +35,6 @@ import {
 import {
     useFilesProgressInterval,
     usePages,
-    useQuery,
     useSearchFiles,
     useSearchFilter,
     useSearchView,
@@ -56,6 +56,7 @@ import {
     ModalContent,
     ModalHeader,
     Placeholder,
+    Popup,
     Progress,
     Segment
 } from "./Theme";
@@ -66,6 +67,8 @@ import {refreshFiles} from "../api";
 import {useSubscribeEventName} from "../Events";
 import {TagsSelector} from "../Tags";
 import {Headlines} from "./Headline";
+import {useSearch} from "./Search";
+import {FILES_MEDIA_URI} from "./Vars";
 
 function EbookCard({file}) {
     const {s} = useContext(ThemeContext);
@@ -75,14 +78,18 @@ function EbookCard({file}) {
     const viewerUrl = isEpub ? `/epub/epub.html?url=${downloadUrl}` : null;
 
     const color = mimetypeColor(file.mimetype);
+    const title = file.title || file.stem || file.name;
+    const header = <ExternalCardLink to={viewerUrl || downloadUrl} className='card-title-ellipsis'>
+        {title}
+    </ExternalCardLink>;
     return <Card color={color}>
         <CardPoster file={file} preview={true}/>
         <CardContent {...s}>
             <CardHeader>
                 <Container textAlign='left'>
-                    <ExternalCardLink to={viewerUrl || downloadUrl} className='card-title-ellipsis'>
-                        {file.title || file.stem || file.name}
-                    </ExternalCardLink>
+                    <Popup on='hover'
+                           trigger={header}
+                           content={title}/>
                 </Container>
             </CardHeader>
             <CardMeta>
@@ -98,18 +105,23 @@ function ImageCard({file}) {
     const {s} = useContext(ThemeContext);
     const url = `/media/${encodeMediaPath(file.primary_path)}`;
 
+    const title = file.title || file.stem || file.primary_path;
+    const header = <ExternalCardLink to={url} className='no-link-underscore card-link'>
+        <p>{textEllipsis(title)}</p>
+    </ExternalCardLink>;
+    const dt = file.published_datetime || file.published_modified_datetime || file.modified;
     return <Card color={mimetypeColor(file.mimetype)}>
         <PreviewLink file={file}>
             <CardPoster file={file}/>
         </PreviewLink>
         <CardContent {...s}>
             <CardHeader>
-                <ExternalCardLink to={url} className='no-link-underscore card-link'>
-                    <p>{textEllipsis(file.title || file.stem || file.primary_path)}</p>
-                </ExternalCardLink>
+                <Popup on='hover'
+                       trigger={header}
+                       content={title}/>
             </CardHeader>
             <CardMeta {...s}>
-                <p>{isoDatetimeToString(file.modified / 1000)}</p>
+                <p>{isoDatetimeToAgoPopup(dt, false)}</p>
             </CardMeta>
             <CardDescription {...s}>
                 <p>{humanFileSize(file.size)}</p>
@@ -140,16 +152,21 @@ function FileCard({file}) {
     const color = mimetypeColor(file.mimetype);
     const size = file.size !== null && file.size !== undefined ? humanFileSize(file.size) : null;
 
+    const title = file.title || file.name || file.primary_path;
+    const header = <ExternalCardLink to={downloadUrl} className='card-title-ellipsis'>
+        {title}
+    </ExternalCardLink>;
+    const dt = file.published_datetime || file.published_modified_datetime || file.modified;
     return <Card color={color}>
         <CardPoster to={downloadUrl} file={file}/>
         <CardContent {...s}>
             <CardHeader>
-                <ExternalCardLink to={downloadUrl} className='card-title-ellipsis'>
-                    {file.title || file.name || file.primary_path}
-                </ExternalCardLink>
+                <Popup on='hover'
+                       trigger={header}
+                       content={title}/>
             </CardHeader>
             {author && <b {...s}>{author}</b>}
-            <p>{isoDatetimeToString(file.modified)}</p>
+            <p>{isoDatetimeToAgoPopup(dt, false)}</p>
             <p>{size}</p>
         </CardContent>
     </Card>
@@ -311,15 +328,18 @@ export function SearchLimitDropdown({limits = []}) {
 }
 
 export function FilesView(
-    files,
-    activePage,
-    totalPages,
-    selectElem,
-    selectedKeys,
-    onSelect,
-    setPage,
-    headlines = false,
-    limitOptions = [12, 24, 48, 96],
+    {
+        files,
+        activePage,
+        totalPages,
+        selectElem,
+        selectedKeys,
+        onSelect,
+        setPage,
+        headlines = false,
+        limitOptions = [12, 24, 48, 96],
+        showAnyTag = false,
+    },
 ) {
     const {view} = useSearchView();
 
@@ -360,7 +380,7 @@ export function FilesView(
 
     const viewButton = <SearchViewButton headlines={headlines}/>
     const limitDropdown = <SearchLimitDropdown limits={limitOptions}/>;
-    const tagQuerySelector = <TagsQuerySelector/>;
+    const tagQuerySelector = <TagsQuerySelector showAny={showAnyTag}/>;
 
     return {
         body,
@@ -403,6 +423,9 @@ export function SearchFilter({filters = [], modalHeader, size = 'medium'}) {
         </Form.Field>
     );
 
+    // Use violet color when filter has been applied.
+    const buttonColor = filter ? 'violet' : 'grey';
+
     if (filters && filters.length > 0) {
         return <>
             <Modal open={open} onOpen={() => handleOpen()} onClose={() => setOpen(false)} closeIcon>
@@ -420,7 +443,7 @@ export function SearchFilter({filters = [], modalHeader, size = 'medium'}) {
             <Button
                 icon='filter'
                 onClick={handleOpen}
-                primary={!!filter}
+                color={buttonColor}
                 size={size}
             />
         </>
@@ -429,23 +452,28 @@ export function SearchFilter({filters = [], modalHeader, size = 'medium'}) {
     return <></>
 }
 
-export function TagsQuerySelector({onChange}) {
-    // Creates  dropdown that the User can use to manipulate the tag query.
-    const {searchParams, updateQuery} = useQuery();
-    const activeTags = searchParams.getAll('tag');
+export function TagsQuerySelector({onChange, showAny = true}) {
+    // Creates modal that the User can use to manipulate the tag query params.
+    const {activeTags, anyTag, setTags, setAnyTag} = useSearch();
 
-    const localOnChange = (tagNames) => {
-        updateQuery({'tag': tagNames});
+    const localOnChange = (tagNames, newAnyTag) => {
+        if (newAnyTag) {
+            setAnyTag(true);
+        } else {
+            setTags(tagNames);
+        }
         if (onChange) {
-            onChange(tagNames);
+            onChange(tagNames, newAnyTag);
         }
     }
 
     return <TagsSelector hideGroup={true}
                          hideEdit={true}
-                         active={activeTags && activeTags.length > 0}
+                         showAny={showAny}
+                         active={anyTag || activeTags && activeTags.length > 0}
                          selectedTagNames={activeTags}
-                         onToggle={localOnChange}
+                         anyTag={anyTag}
+                         onChange={localOnChange}
                          style={{marginLeft: '0.3em', marginTop: '0.3em'}}
     />
 }
@@ -477,14 +505,17 @@ export function FilesSearchView({
     const {searchFiles, pages} = useSearchFiles(24, emptySearch, model);
 
     const {body, paginator, selectButton, viewButton, limitDropdown, tagQuerySelector} = FilesView(
-        searchFiles,
-        pages.activePage,
-        pages.totalPages,
-        null,
-        null,
-        null,
-        pages.setPage,
-        true,
+        {
+            files: searchFiles,
+            activePage: pages.activePage,
+            totalPages: pages.totalPages,
+            selectElem: null,
+            selectedKeys: null,
+            onSelect: null,
+            setPage: pages.setPage,
+            headlines: true,
+            showAnyTag: true,
+        },
     );
 
     return <>
@@ -569,6 +600,10 @@ function FilesPage() {
     return <>
         <FilesRefreshProgress/>
         <FileBrowser/>
+
+        <HandPointMessage>
+            <p>You can also view your media directory at <a href={FILES_MEDIA_URI}>{FILES_MEDIA_URI}</a></p>
+        </HandPointMessage>
     </>;
 }
 
@@ -604,29 +639,15 @@ const useRefresh = () => {
     }
 }
 
-export function FilesRefreshButton() {
-    const {refreshing, refreshingDirectory, wrolModeEnabled, loading, refreshFiles} = useRefresh();
-
-    return <Button icon
-                   labelPosition='left'
-                   loading={loading || refreshing || refreshingDirectory}
-                   onClick={() => refreshFiles()}
-                   disabled={wrolModeEnabled || loading || refreshing}>
-        <Icon name='refresh'/>
-        Refresh All
-    </Button>;
-}
-
-export function DirectoryRefreshButton({paths}) {
+export function FilesRefreshButton({paths}) {
     const {refreshing, refreshingDirectory, wrolModeEnabled, loading, refreshFiles} = useRefresh();
 
     return <Button icon
                    labelPosition='left'
                    loading={loading || refreshing || refreshingDirectory}
                    onClick={() => refreshFiles(paths)}
-                   disabled={wrolModeEnabled || loading || refreshing || refreshingDirectory}
-    >
+                   disabled={wrolModeEnabled || loading || refreshing}>
         <Icon name='refresh'/>
         Refresh
-    </Button>
+    </Button>;
 }

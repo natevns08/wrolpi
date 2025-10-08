@@ -7,17 +7,16 @@ from sanic.request import Request
 from sanic_ext import validate
 from sanic_ext.extensions.openapi import openapi
 
-from wrolpi.common import logger, wrol_mode_check, make_media_directory, \
-    get_media_directory, run_after, get_relative_to_media_directory
-from wrolpi.downloader import download_manager
+from wrolpi.api_utils import json_response
+from wrolpi.common import logger, wrol_mode_check, get_media_directory, get_relative_to_media_directory
 from wrolpi.events import Events
-from wrolpi.root_api import json_response
 from wrolpi.schema import JSONErrorResponse
 from wrolpi.vars import PYTEST
 from . import lib
-from .. import schema, Channel
+from .. import schema
 from ..errors import UnknownChannel
 from ..lib import save_channels_config
+from ..models import Channel
 
 channel_bp = Blueprint('Channel', url_prefix='/api/videos/channels')
 
@@ -52,8 +51,6 @@ def channel_get(_: Request, channel_id: int = None):
 @wrol_mode_check
 def channel_post(_: Request, body: schema.ChannelPostRequest):
     body.directory = get_media_directory() / body.directory
-    if not body.directory.is_dir() and body.mkdir:
-        make_media_directory(body.directory)
 
     channel = lib.create_channel(data=body, return_dict=False)
 
@@ -75,11 +72,11 @@ def channel_post(_: Request, body: schema.ChannelPostRequest):
 @openapi.response(HTTPStatus.NO_CONTENT)
 @openapi.response(HTTPStatus.BAD_REQUEST, JSONErrorResponse)
 @validate(schema.ChannelPutRequest)
-@run_after(save_channels_config)
 @wrol_mode_check
-def channel_update(_: Request, channel_id: int, body: schema.ChannelPutRequest):
+async def channel_update(_: Request, channel_id: int, body: schema.ChannelPutRequest):
     body.directory = pathlib.Path(body.directory) if body.directory else None
-    channel = lib.update_channel(data=body, channel_id=channel_id)
+    channel = await lib.update_channel(data=body, channel_id=channel_id)
+    save_channels_config.activate_switch()
     return response.raw('', HTTPStatus.NO_CONTENT,
                         headers={'Location': f'/api/videos/channels/{channel.id}'})
 
@@ -109,13 +106,35 @@ def channel_refresh(_: Request, channel_id: int):
     return response.empty()
 
 
-@channel_bp.post('/download/<channel_id:int>')
-@openapi.description('Download the latest catalog for a Channel, download any missing videos.')
-@openapi.response(HTTPStatus.NOT_FOUND, JSONErrorResponse)
+@channel_bp.post('/<channel_id:int>/tag')
+@openapi.definition(
+    description='Tag/untag a Channel with a single tag',
+    body=schema.ChannelTagRequest,
+)
+@openapi.response(HTTPStatus.NO_CONTENT)
+@openapi.response(HTTPStatus.BAD_REQUEST, JSONErrorResponse)
+@validate(schema.ChannelTagRequest)
 @wrol_mode_check
-def channel_download(_: Request, channel_id: int):
-    lib.download_channel(channel_id, reset_attempts=True)
-    if download_manager.disabled.is_set():
-        # Warn the user that downloads are disabled.
-        Events.send_downloads_disabled('Channel download created. But downloads are disabled.')
-    return response.empty()
+async def channel_tag(_: Request, channel_id: int, body: schema.ChannelTagRequest):
+    directory = None
+    if body.directory:
+        directory = pathlib.Path(body.directory)
+        directory = get_media_directory() / directory
+
+    await lib.tag_channel(body.tag_name, directory, channel_id)
+
+    return response.raw('', HTTPStatus.NO_CONTENT)
+
+
+@channel_bp.post('/search')
+@openapi.definition(
+    description='Search Channels',
+    body=schema.ChannelSearchRequest,
+)
+@validate(schema.ChannelSearchRequest)
+async def channel_search(_: Request, body: schema.ChannelSearchRequest):
+    channels = await lib.search_channels(body.tag_names)
+    ret = dict(
+        channels=channels,
+    )
+    return json_response(ret)

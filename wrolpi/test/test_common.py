@@ -4,9 +4,12 @@ import json
 import multiprocessing
 import os
 import pathlib
+import re
 import tempfile
+import time
 from datetime import date, datetime
 from decimal import Decimal
+from http import HTTPStatus
 from itertools import zip_longest
 from time import sleep
 from unittest import mock
@@ -16,8 +19,10 @@ import pytz
 
 import wrolpi.vars
 from wrolpi import common
-from wrolpi.common import cum_timer, TIMERS, print_timer, limit_concurrent, run_after
-from wrolpi.test.common import build_test_directories
+from wrolpi.common import cum_timer, TIMERS, print_timer, limit_concurrent, run_after, get_wrolpi_config, TRACE_LEVEL, \
+    is_tempfile
+from wrolpi.errors import InvalidConfig
+from wrolpi.test.common import build_test_directories, skip_circleci, skip_macos
 
 
 def test_build_video_directories(test_directory):
@@ -65,38 +70,38 @@ def test_insert_parameter():
     wherever that may be according to the function's signature.
     """
 
-    def func(foo, bar):
+    def func(foo, bar):  # noqa
         pass
 
     results = common.insert_parameter(func, 'bar', 'bar', (1,), {})
     assert results == ((1, 'bar'), {})
 
-    def func(foo, bar, baz):
+    def func(foo, bar, baz):  # noqa
         pass
 
     results = common.insert_parameter(func, 'bar', 'bar', (1, 2), {})
     assert results == ((1, 'bar', 2), {})
 
-    def func(foo, baz, bar=None):
+    def func(foo, baz, bar=None):  # noqa
         pass
 
     results = common.insert_parameter(func, 'bar', 'bar', (1, 2), {})
     assert results == ((1, 2, 'bar'), {})
 
-    def func(foo, baz, bar=None):
+    def func(foo, baz, bar=None):  # noqa
         pass
 
     results = common.insert_parameter(func, 'baz', 'baz', (1, 2), {})
     assert results == ((1, 'baz', 2), {})
 
-    def func(foo, baz, qux=None, bar=None):
+    def func(foo, baz, qux=None, bar=None):  # noqa
         pass
 
     results = common.insert_parameter(func, 'bar', 'bar', (1, 2, 3), {})
     assert results == ((1, 2, 3, 'bar'), {})
 
     # bar is not defined as a parameter!
-    def func(foo):
+    def func(foo):  # noqa
         pass
 
     pytest.raises(TypeError, common.insert_parameter, func, 'bar', 'bar', (1,), {})
@@ -216,16 +221,17 @@ def test_chdir():
 
     with common.chdir():
         assert os.getcwd() != original
-        assert str(os.getcwd()).startswith('/tmp')
+        assert is_tempfile(os.getcwd())
         assert os.environ['HOME'] != os.getcwd()
     # Replace $HOME
     with common.chdir(with_home=True):
         assert os.getcwd() != original
-        assert str(os.getcwd()).startswith('/tmp')
+        assert is_tempfile(os.getcwd())
         assert os.environ['HOME'] == os.getcwd()
 
     with tempfile.TemporaryDirectory() as d:
         # Without replacing $HOME
+        d = os.path.realpath(d)
         with common.chdir(pathlib.Path(d), with_home=True):
             assert os.getcwd() == d
             assert os.environ['HOME'] == os.getcwd()
@@ -271,7 +277,7 @@ def test_zig_zag(low, high, expected):
         ('', ''),
         ('foo', 'foo'),
         ('foo\\', 'foo'),
-        ('foo/', 'foo'),
+        ('foo/', 'foo⧸'),
         ('foo<', 'foo'),
         ('foo>', 'foo'),
         ('foo:', 'foo'),
@@ -294,6 +300,7 @@ def test_zig_zag(low, high, expected):
         ('fo  o', 'fo o'),
         ('fo   o', 'fo o'),
         ('fo    o', 'fo o'),
+        ('foo | bar', 'foo - bar'),
     ]
 )
 def test_escape_file_name(name, expected):
@@ -447,7 +454,13 @@ async def test_cum_timer():
     print_timer()
 
 
+def test_timer():
+    """`cum_timer` can be used to profile code."""
+    with common.timer(name='test_timer'):
+        time.sleep(0.1)
+
 @pytest.mark.asyncio
+@skip_macos
 async def test_limit_concurrent_async():
     """`limit_concurrent` can throw an error when the limit is reached."""
 
@@ -471,6 +484,7 @@ async def test_limit_concurrent_async():
     assert 'concurrent limit' in str(e)
 
 
+@skip_macos
 def test_limit_concurrent_sync():
     """`limit_concurrent` can throw an error when the limit is reached."""
 
@@ -723,17 +737,18 @@ def test_format_json_file():
             assert file.read_text() == unformatted
 
             common.format_json_file(file)
+            # Keys are sorted.
             assert file.read_text() == '''{
-  "one": 1,
-  "two": 2,
-  "three": 3,
-  "four": 4,
-  "five": 5,
-  "six": 6,
-  "seven": 7,
   "eight": 8,
+  "five": 5,
+  "four": 4,
   "nine": 9,
-  "ten": 10
+  "one": 1,
+  "seven": 7,
+  "six": 6,
+  "ten": 10,
+  "three": 3,
+  "two": 2
 }'''
             # The copy was deleted.
             assert len(list(file.parent.iterdir())) == 1
@@ -778,3 +793,358 @@ def test_format_html_file():
 )
 def test_chain(iterable, length, step, expected):
     assert list(common.chain(iterable, length)) == expected
+
+
+def test_find_file(test_directory, make_files_structure):
+    bar, baz, foo = make_files_structure({
+        'foo/foo.txt': 'foo',
+        'bar/bar.txt': 'bar',
+        'baz.txt': 'baz',
+    })
+
+    # Files are too deep.
+    assert common.find_file(test_directory, 'foo.txt') is None
+    assert common.find_file(test_directory, 'bar.txt') is None
+    assert common.find_file(test_directory, 'baz.txt') == baz
+    # Enough depth to find files.
+    assert common.find_file(test_directory, 'foo.txt', 2) == foo
+    assert common.find_file(test_directory, 'bar.txt', 2) == bar
+    assert common.find_file(test_directory, 'baz.txt', 2) == baz
+
+    assert common.find_file(test_directory, 'does not exist', 100) is None
+
+
+def test_config_backup(async_client, test_wrolpi_config, test_directory):
+    """Configs have a backup each day."""
+    config = common.get_wrolpi_config()
+
+    # No backups yet.
+    config.dump_config()
+    assert (test_directory / 'config').is_dir()
+    assert not (test_directory / 'config/backup').is_dir()
+    assert (test_directory / 'config/wrolpi.yaml').is_file()
+
+    # Backups directory is created.  New backup config is saved.
+    config.dump_config()
+    assert (test_directory / 'config').is_dir()
+    assert (test_directory / 'config/backup').is_dir()
+    assert (test_directory / 'config/wrolpi.yaml').is_file()
+
+    backup_file, = list((test_directory / 'config/backup').glob('*'))
+    assert re.match(r'wrolpi-\d{8}\.yaml', backup_file.name), \
+        f'{backup_file.name} is not in the expected format'
+
+
+@pytest.mark.asyncio
+@skip_circleci
+async def test_aiohttp(simple_file_server):
+    """Test that aiohttp convenience functions work."""
+    host, port = simple_file_server.server_address
+    url = f'http://{host}:{port}'  # noqa
+
+    async with common.aiohttp_get(url) as response:
+        assert response.content.read()
+        assert response.status == 200
+
+    async with common.aiohttp_head(url) as response:
+        assert response.content.read()
+        assert response.status == 200
+
+
+def test_can_connect_to_server(simple_file_server):
+    host, port = simple_file_server.server_address
+
+    assert common.can_connect_to_server(host, port)
+
+
+@pytest.mark.asyncio
+async def test_log_level(async_client, test_wrolpi_config):
+    """User can change API log level."""
+    from wrolpi.api_utils import api_app
+    try:
+        # Default log level is INFO.
+        assert api_app.shared_ctx.log_level.value == 20
+
+        # Change log level to WARNING.
+        body = dict(log_level=30)
+        request, response = await async_client.patch('/api/settings', json=body)
+        assert response.status_code == HTTPStatus.NO_CONTENT, response.json
+        assert api_app.shared_ctx.log_level.value == 30
+
+        # Change log level to TRACE.
+        body = dict(log_level=5)
+        request, response = await async_client.patch('/api/settings', json=body)
+        assert response.status_code == HTTPStatus.NO_CONTENT, response.json
+        assert api_app.shared_ctx.log_level.value == 5 == TRACE_LEVEL
+    finally:
+        # Reset log level to debug.
+        body = dict(log_level=10)
+        request, response = await async_client.patch('/api/settings', json=body)
+        assert response.status_code == HTTPStatus.NO_CONTENT, response.json
+        assert api_app.shared_ctx.log_level.value == 10
+
+
+@skip_macos
+@skip_circleci
+def test_html_screenshot(singlefile_contents_factory):
+    assert common.html_screenshot(singlefile_contents_factory())
+
+
+@pytest.mark.parametrize('color,expected', [
+    ('#ffffff', True),
+    ('#FFFFFF', True),
+    ('#fff', True),
+    ('#FFf', True),
+    ('#asdf', False),
+    ('#ffff', False),
+])
+def test_is_valid_hex_color(color, expected):
+    assert common.is_valid_hex_color(color) == expected
+
+
+@pytest.mark.parametrize('iterable,predicate,expected', [
+    ((1, 2, 2, 3, 4), lambda i: i, (1, 2, 3, 4)),
+    ([1, 1, 2, 3, 3, 3, 3, 4], None, [1, 2, 3, 4]),
+    ([1, 1, 2, 2, 3, 4, 5, 6, 7, 8], lambda i: i % 2, [1, 2]),
+    (['apple', 'banana', 'pear', 'kiwi', 'plum', 'peach'], lambda i: len(i), ['apple', 'banana', 'pear']),
+    (
+            [pathlib.Path('foo.txt'), pathlib.Path('foo.mp4'), pathlib.Path('bar.txt')],
+            lambda i: i.stem,
+            [pathlib.Path('foo.txt'), pathlib.Path('bar.txt')]
+    ),
+])
+def test_unique_by_predicate(iterable, predicate, expected):
+    assert common.unique_by_predicate(iterable, predicate) == expected
+
+
+@pytest.mark.asyncio
+async def test_config_lifecycle(await_switches, test_wrolpi_config):
+    """Test importing, dumping, updating, saving a config."""
+    config = get_wrolpi_config()
+    # Config is not imported, default values are used.
+    assert config.successful_import is False
+    assert config.wrol_mode is False
+    assert config.is_valid() is None
+    assert config.version == 0
+    assert config.zims_destination
+
+    # Bad config cannot be imported.
+    test_wrolpi_config.parent.mkdir(exist_ok=True)
+    test_wrolpi_config.write_text('bad config\ndata')
+    assert config.is_valid() is False
+    with pytest.raises(InvalidConfig) as e:
+        config.import_config()
+    assert config.successful_import is False
+    assert config.version == 0
+    assert 'invalid' in str(e)
+    assert config.zims_destination
+
+    # Cannot dump config because import was not successful.
+    with pytest.raises(RuntimeError) as e:
+        config.dump_config()
+    assert 'imported' in str(e)
+    assert config.version == 0
+
+    # Incomplete config can still be imported.  "destinations" cannot be empty
+    test_wrolpi_config.write_text('wrol_mode: true\nzims_destination: null')
+    assert config.is_valid() is True
+    config.import_config()
+    assert config.successful_import is True
+    assert config.wrol_mode is True
+    assert config.is_valid() is True
+    assert config.version == 0
+    # Default destination was used instead.
+    assert config.zims_destination
+
+    # Items from the default config are written to the file.
+    config.dump_config()
+    assert 'version: ' in test_wrolpi_config.read_text()
+    assert config.wrol_mode is True
+    assert config.is_valid() is True
+    assert config.version == 1
+
+    # Other data is ignored.
+    test_wrolpi_config.write_text('wrol_mode: false\nother_data: false')
+    assert config.is_valid() is True
+    config.import_config()
+    assert 'other_data' not in config._config, 'Extra data in config should be ignored'
+    assert config.is_valid() is True
+    assert config.wrol_mode is False
+
+    # Changing value changes both file and config data.
+    config.wrol_mode = True
+    assert config._config['wrol_mode'] is True
+    await await_switches()  # `wrol_mode = True` calls background switch
+    assert 'wrol_mode: true' in test_wrolpi_config.read_text()
+    assert 'other_data' not in test_wrolpi_config.read_text(), 'Other data should be removed on save.'
+    assert config.is_valid() is True
+    assert config.version == 2
+
+    # Cannot overwrite newer config.
+    config_data = config.read_config_file()
+    config_data['version'] = 5
+    config.write_config_data(config_data, test_wrolpi_config)
+    with pytest.raises(RuntimeError) as e:
+        config.dump_config()
+    assert 'newer config' in str(e)
+
+    # Can import, then config can be saved.
+    config.import_config()
+    config.dump_config()
+    assert config.is_valid() is True
+
+
+@pytest.mark.asyncio
+async def test_config_valid(async_client, test_wrolpi_config):
+    # Config file does not yet exist.
+    config = get_wrolpi_config()
+    assert config.is_valid() is None
+
+    config.dump_config()
+    assert config.is_valid() is True
+
+    test_wrolpi_config.write_text('bad config')
+    assert config.is_valid() is False
+
+    # Does not require all items.
+    test_wrolpi_config.write_text('wrol_mode: true')
+    assert config.is_valid() is True
+
+
+@pytest.mark.parametrize('name,expected_name', [
+    ('foo', 'foo'),
+    (pathlib.Path('foo'), pathlib.Path('foo')),
+    (
+            'this name is toooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo long.txt',
+            'this name is toooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo.txt'
+    ),
+    (
+            'some/parent/is/not/trimmed/this name is toooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo long.info.json',
+            'some/parent/is/not/trimmed/this name is toooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo.info.json'
+    ),
+    (
+            '/absolute/parent/is/not/trimmed/this name is toooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo long.info.json',
+            '/absolute/parent/is/not/trimmed/this name is toooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo.info.json'
+    ),
+    (
+            pathlib.Path(
+                '/some/parent/is/not/trimmed/this name is toooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo long.readability.json'),
+            pathlib.Path(
+                '/some/parent/is/not/trimmed/this name is tooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo.readability.json')
+    ),
+])
+def test_trim_file_name(name, expected_name):
+    assert common.trim_file_name(name) == expected_name
+
+
+async def test_cached_multiprocessing_result(async_client):
+    call_count = 0
+
+    @common.cached_multiprocessing_result
+    async def func(inc: int) -> int:
+        nonlocal call_count
+        call_count += 1
+        return inc + call_count
+
+    # First call, math is done.
+    assert await func(1) == 2
+    # Second call is cached.
+    assert await func(1) == 2
+    assert await func(1) == 2
+    # New args, math is done again.
+    assert await func(2) == 4
+    assert await func(2) == 4
+    # Kwargs are supported
+    assert await func(inc=1) == 4
+    assert await func(inc=1) == 4
+
+
+@pytest.mark.asyncio
+async def test_initialize_config_files(async_client, test_session, test_directory, test_wrolpi_config,
+                                       test_channels_config, test_tags_config, test_videos_downloader_config,
+                                       test_download_manager_config, simple_channel, test_inventory, tag_factory,
+                                       test_download_manager, test_downloader):
+    """Config files should only be created if they are missing, and they will not overwrite existing entries in the DB."""
+    from modules.videos.lib import get_videos_downloader_config, get_channels_config
+    from wrolpi.tags import get_tags_config
+    from wrolpi.downloader import get_download_manager_config
+    from modules.inventory.common import get_inventories_config
+
+    # Create some DB entries so the configs will not be imported.
+    tag1, tag2 = await tag_factory(), await tag_factory()
+    download = test_download_manager.create_download('https://example.com', downloader_name=test_downloader.name)
+    test_session.commit()
+    # Write some config files, they should not be re-created.
+    get_wrolpi_config().get_file().write_text('wrolpi')
+    get_videos_downloader_config().get_file().write_text('video downloader')
+
+    assert common.create_empty_config_files() == [], 'No configs should have been created.'
+    # Config files were not overwritten with real configs.
+    assert get_wrolpi_config().get_file().read_text() == 'wrolpi'
+    assert get_videos_downloader_config().get_file().read_text() == 'video downloader'
+
+    # WROLPi config can be created because it is now missing.
+    get_wrolpi_config().get_file().unlink()
+    assert common.create_empty_config_files() == ['wrolpi.yaml'], 'WROLPi config should have been created.'
+    assert get_wrolpi_config().is_valid()
+
+    # Videos Downloader config can be created because it is now missing.
+    get_videos_downloader_config().get_file().unlink()
+    assert common.create_empty_config_files() == ['videos_downloader.yaml'], \
+        'Videos Downloader config should have been created.'
+    assert get_videos_downloader_config().is_valid()
+
+    # Channels config file does not exist, no conflicting Channels so the file is created.
+    simple_channel.delete_with_videos()
+    assert common.create_empty_config_files() == ['channels.yaml'], 'Channels config should have been created.'
+    assert get_channels_config().is_valid()
+
+    tag1.delete()
+    tag2.delete()
+    assert common.create_empty_config_files() == ['tags.yaml'], 'Tags config should have been created.'
+    assert get_tags_config().is_valid()
+
+    download.delete()
+    assert common.create_empty_config_files() == ['download_manager.yaml'], \
+        'Download Manager config should have been created.'
+    assert get_download_manager_config().is_valid()
+
+    test_session.delete(test_inventory)
+    assert common.create_empty_config_files() == ['inventories.yaml'], 'Inventory config should have been created.'
+    assert get_inventories_config().is_valid()
+
+
+def test_get_paths_in_parent_directory(test_directory, make_files_structure):
+    make_files_structure([
+        'foo/bar.txt',
+        'foo/bar/baz.txt',
+        'qux.txt',
+    ])
+
+    paths = list(common.walk(test_directory))
+
+    assert set(common.get_paths_in_parent_directory(paths, test_directory / 'foo')) == {
+        test_directory / 'foo/bar.txt',
+        test_directory / 'foo/bar',
+        test_directory / 'foo/bar/baz.txt',
+    }
+
+    assert set(common.get_paths_in_parent_directory(paths, test_directory / 'foo/bar')) == {
+        test_directory / 'foo/bar/baz.txt',
+    }
+
+    assert set(common.get_paths_in_parent_directory(paths, test_directory)) == {
+        test_directory / 'qux.txt',
+        test_directory / 'foo',
+        test_directory / 'foo/bar.txt',
+        test_directory / 'foo/bar',
+        test_directory / 'foo/bar/baz.txt',
+    }
+
+    assert set(common.get_paths_in_media_directory(paths)) == {
+        test_directory / 'qux.txt',
+        test_directory / 'foo',
+        test_directory / 'foo/bar.txt',
+        test_directory / 'foo/bar',
+        test_directory / 'foo/bar/baz.txt',
+    }

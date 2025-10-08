@@ -1,10 +1,15 @@
 import base64
+import base64
 import gzip
 import json
+import os
 import pathlib
 import re
+import shlex
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
+from json import JSONDecodeError
 from typing import Optional, Tuple, List, Union
 from urllib.parse import urlparse
 
@@ -14,13 +19,14 @@ from sqlalchemy.orm import Session
 
 from modules.archive.models import Domain, Archive
 from wrolpi import dates
+from wrolpi.cmd import READABILITY_BIN, run_command
 from wrolpi.common import get_media_directory, logger, extract_domain, escape_file_name, aiohttp_post, \
-    format_html_string, split_lines_by_length, get_html_soup
+    format_html_string, split_lines_by_length, get_html_soup, get_title_from_html, get_wrolpi_config, html_screenshot
 from wrolpi.dates import now, Seconds
 from wrolpi.db import get_db_session, get_db_curs, optional_session
 from wrolpi.errors import UnknownArchive, InvalidOrderBy, InvalidDatetime
-from wrolpi.tags import tag_names_to_file_group_sub_select
-from wrolpi.vars import PYTEST
+from wrolpi.tags import tag_append_sub_select_where
+from wrolpi.vars import PYTEST, DOCKERIZED
 
 logger = logger.getChild(__name__)
 
@@ -48,7 +54,10 @@ class ArchiveFiles:
 
 
 def get_archive_directory() -> pathlib.Path:
-    archive_directory = get_media_directory() / 'archive'
+    archive_destination = get_wrolpi_config().archive_destination
+    variables = dict(domain='', year='', month='', day='')
+    archive_destination = archive_destination % variables
+    archive_directory = get_media_directory() / archive_destination
     return archive_directory
 
 
@@ -65,6 +74,7 @@ def get_domain_directory(url: str) -> pathlib.Path:
     return directory
 
 
+# File names include domain and datetime.
 MAXIMUM_ARCHIVE_FILE_CHARACTER_LENGTH = 200
 
 
@@ -102,13 +112,15 @@ def get_new_archive_files(url: str, title: Optional[str]) -> ArchiveFiles:
 ARCHIVE_TIMEOUT = Seconds.minute * 10  # Wait at most 10 minutes for response.
 
 
-async def request_archive(url: str) -> Tuple[str, Optional[str], Optional[str]]:
+async def request_archive(url: str, singlefile: str = None) -> Tuple[str, Optional[dict], Optional[str]]:
     """Send a request to the archive service to archive the URL."""
     logger.info(f'Sending archive request to archive service: {url}')
 
-    data = {'url': url}
+    data = dict(url=url, singlefile=singlefile)
     try:
-        contents, status = await aiohttp_post(f'{ARCHIVE_SERVICE}/json', json_=data, timeout=ARCHIVE_TIMEOUT)
+        async with aiohttp_post(f'{ARCHIVE_SERVICE}/json', json_=data, timeout=ARCHIVE_TIMEOUT) as response:
+            status = response.status
+            contents = await response.json()
         if contents and (error := contents.get('error')):
             # Report the error from the archive service.
             raise Exception(f'Received error from archive service: {error}')
@@ -163,13 +175,13 @@ async def model_archive_result(url: str, singlefile: str, readability: dict, scr
 
     if readability:
         # Write the readability parts to their own files.  Write what is left after pops to the JSON file.
-        with archive_files.readability.open('wt') as fh:
+        with archive_files.readability.open('wt') as fp:
             content = format_html_string(readability.pop('content'))
-            fh.write(content)
-        with archive_files.readability_txt.open('wt') as fh:
+            fp.write(content)
+        with archive_files.readability_txt.open('wt') as fp:
             readability_txt = readability.pop('textContent')
             readability_txt = split_lines_by_length(readability_txt)
-            fh.write(readability_txt)
+            fp.write(readability_txt)
     else:
         # No readability was returned, so there are no files.
         archive_files.readability_txt = archive_files.readability = None
@@ -186,8 +198,8 @@ async def model_archive_result(url: str, singlefile: str, readability: dict, scr
     # Always write a JSON file that contains at least the URL.
     readability = readability or {}
     readability['url'] = url
-    with archive_files.readability_json.open('wt') as fh:
-        fh.write(json.dumps(readability, indent=2))
+    with archive_files.readability_json.open('wt') as fp:
+        json.dump(readability, fp, indent=2, sort_keys=True)
 
     # Create any File models that we can, index them all.
     paths = (
@@ -201,7 +213,8 @@ async def model_archive_result(url: str, singlefile: str, readability: dict, scr
         archive.file_group.download_datetime = now()
         archive.url = url
         archive.domain = get_or_create_domain(session, url)
-        session.flush()
+        archive.flush()
+        archive.domain.flush()
 
     return archive
 
@@ -219,23 +232,12 @@ def get_or_create_domain(session: Session, url) -> Domain:
     return domain
 
 
-def get_title_from_html(html: str, url: str = None) -> str:
-    """
-    Try and get the title from the
-    """
-    soup = get_html_soup(html)
-    try:
-        return soup.title.string
-    except Exception:  # noqa
-        logger.debug(f'Unable to extract title {url}')
-
-
 SINGLEFILE_URL_EXTRACTOR = re.compile(r'Page saved with SingleFile \s+url: (http.+?)\n')
 
 
-def get_url_from_singlefile(html: bytes) -> str:
+def get_url_from_singlefile(html: bytes | str) -> str:
     """Extract URL from SingleFile contents."""
-    html = html.decode()
+    html = html.decode() if isinstance(html, bytes) else html
     if SINGLEFILE_HEADER not in html:
         raise RuntimeError(f'Not a singlefile!')
 
@@ -317,7 +319,7 @@ def parse_article_html_metadata(html: Union[bytes, str], assume_utc: bool = True
         except json.decoder.JSONDecodeError:
             # Was not valid JSON.
             schema = None
-        if isinstance(schema, dict) and schema.get('@context') in ('https://schema.org', 'http://schema.org'):
+        if isinstance(schema, dict) and (context := schema.get('@context')) and '://schema.org' in context:
             # Found https://schema.org/
             if headline := schema.get('headline'):
                 metadata.title = metadata.title or headline
@@ -351,6 +353,17 @@ def parse_article_html_metadata(html: Union[bytes, str], assume_utc: bool = True
                     metadata.author = author
                 else:
                     logger.warning(f'Unable to parse author schema: {author}')
+            elif authors := schema.get('authors'):
+                # Use the first Author.
+                author = authors[0]
+
+                if isinstance(author, dict):
+                    author = author.get('name') or author
+
+                if isinstance(author, str):
+                    metadata.author = author
+                else:
+                    logger.warning(f'Unable to parse author schema: {author}')
 
     # Assume UTC if no timezone.
     if metadata.published_datetime and not metadata.published_datetime.tzinfo and assume_utc:
@@ -372,7 +385,7 @@ def get_archive(session, archive_id: int) -> Archive:
 
 
 def delete_archives(*archive_ids: List[int]):
-    """Delete an Archive and all of it's files."""
+    """Delete an Archive and all of its files."""
     with get_db_session(commit=True) as session:
         archives: List[Archive] = list(session.query(Archive).filter(Archive.id.in_(archive_ids)))
         if not archives:
@@ -416,25 +429,26 @@ def is_singlefile_file(path: pathlib.Path) -> bool:
 def get_domains():
     with get_db_curs() as curs:
         stmt = '''
-            SELECT domains.domain AS domain, COUNT(a.id) AS url_count, SUM(fg.size)::BIGINT AS size
-            FROM domains
-                LEFT JOIN archive a on domains.id = a.domain_id
-                LEFT JOIN file_group fg on fg.id = a.file_group_id
-            GROUP BY domains.domain
-            ORDER BY domains.domain
-        '''
+               SELECT domains.domain AS domain, COUNT(a.id) AS url_count, SUM(fg.size)::BIGINT AS size
+               FROM domains
+                        LEFT JOIN archive a on domains.id = a.domain_id
+                        LEFT JOIN file_group fg on fg.id = a.file_group_id
+               GROUP BY domains.domain
+               ORDER BY domains.domain \
+               '''
         curs.execute(stmt)
         domains = [dict(i) for i in curs.fetchall()]
         return domains
 
 
 ARCHIVE_ORDERS = {
-    'published_datetime': (date := 'fg.published_datetime ASC, fg.download_datetime ASC'),
-    '-published_datetime': (_date := 'fg.published_datetime DESC NULLS LAST, fg.download_datetime DESC NULLS LAST'),
+    # Sometimes we don't have a published_datetime.  This is equivalent to COALESCE(fg.published_datetime, fg.download_datetime)
+    'published_datetime': (date := 'fg.effective_datetime ASC NULLS LAST'),
+    '-published_datetime': (_date := 'fg.effective_datetime DESC NULLS LAST'),
     'published_modified_datetime': f'fg.published_modified_datetime ASC NULLS LAST, {date}',
-    '-published_modified_datetime': f'fg.published_modified_datetime DESC, {_date}',
-    'download_datetime': 'fg.download_datetime ASC',
-    '-download_datetime': 'fg.download_datetime DESC',
+    '-published_modified_datetime': f'fg.published_modified_datetime DESC NULLS LAST, {_date}',
+    'download_datetime': 'fg.download_datetime ASC NULLS LAST',
+    '-download_datetime': 'fg.download_datetime DESC NULLS LAST',
     'rank': f'2 DESC, {_date}',
     '-rank': f'2 ASC, {date}',
     'size': 'fg.size ASC, LOWER(fg.primary_path) ASC',
@@ -443,8 +457,8 @@ ARCHIVE_ORDERS = {
     '-viewed': 'fg.viewed DESC',
 }
 ORDER_GROUP_BYS = {
-    'published_datetime': 'fg.published_datetime, fg.download_datetime',
-    '-published_datetime': 'fg.published_datetime, fg.download_datetime',
+    'published_datetime': 'fg.effective_datetime',
+    '-published_datetime': 'fg.effective_datetime',
     'published_modified_datetime': 'fg.published_modified_datetime, fg.published_datetime, fg.download_datetime',
     '-published_modified_datetime': 'fg.published_modified_datetime, fg.published_datetime, fg.download_datetime',
     'download_datetime': 'fg.download_datetime',
@@ -469,7 +483,7 @@ def search_archives(search_str: str, domain: str, limit: int, offset: int, order
         -> Tuple[List[dict], int]:
     # Always filter FileGroups to Archives.
     wheres = []
-    group_by = 'fg.published_datetime, fg.download_datetime, a.file_group_id'
+    group_by = 'fg.effective_datetime, a.file_group_id'
 
     params = dict(search_str=search_str, offset=int(offset), limit=int(limit))
     order_by = ARCHIVE_ORDERS['-published_datetime']
@@ -492,11 +506,7 @@ def search_archives(search_str: str, domain: str, limit: int, offset: int, order
         if order in NO_NULL_ORDERS:
             wheres.append(NO_NULL_ORDERS[order])
 
-    if tag_names:
-        # Filter all FileGroups by those that have been tagged with the provided tag names.
-        tags_stmt, params_ = tag_names_to_file_group_sub_select(tag_names)
-        params.update(params_)
-        wheres.append(f'fg.id = ANY({tags_stmt})')
+    wheres, params = tag_append_sub_select_where(wheres, params, tag_names)
 
     if search_str and headline:
         headline = ''',
@@ -543,3 +553,75 @@ async def search_domains_by_name(name: str, limit: int = 5, session: Session = N
         .limit(limit) \
         .all()
     return domains
+
+
+async def html_to_readability(html: str | bytes, url: str, timeout: int = 120):
+    """Extract the readability dict from the provided HTML."""
+    with tempfile.NamedTemporaryFile('wb', suffix='.html') as singlefile_file:
+        singlefile_file.write(html.encode() if isinstance(html, str) else html)
+        singlefile_file.flush()
+        os.fsync(singlefile_file.fileno())
+
+        cmd = ('/usr/bin/nice', '-n15',  # Nice above map importing, but very low priority.
+               READABILITY_BIN, singlefile_file.name, shlex.quote(url))
+        # Docker containers may not have this directory. But, this directory is necessary on RPi.
+        cwd = '/home/wrolpi' if os.path.isdir('/home/wrolpi') else None
+        result = await run_command(cmd, cwd=cwd, timeout=timeout)
+
+        logger.debug(f'readability for {url} exited with {result.return_code}')
+        stdout, stderr = result.stdout.decode(), result.stderr.decode()
+        if result.return_code == 0:
+            if not stdout:
+                raise RuntimeError('readability stdout was empty')
+            try:
+                readability = json.loads(stdout)
+            except TypeError or JSONDecodeError:
+                # JSON was invalid.
+                e = ChildProcessError(stdout if stdout else 'No stdout')
+                if stderr:
+                    e = ChildProcessError(stderr)
+                raise RuntimeError(f'Failed to extract readability from {url}') from e
+            logger.debug(f'done readability for {url}')
+            return readability
+        else:
+            logger.error(f'Failed to extract readability for {url}')
+            e = ChildProcessError(stdout if stdout else 'No stdout')
+            if stderr:
+                e = ChildProcessError(stderr)
+            raise RuntimeError(f'Failed to extract readability for {url} got {result.return_code}') from e
+
+
+async def singlefile_to_archive(singlefile: bytes) -> Archive:
+    """
+    Convert a SingleFile to an Archive.
+
+    This is done by extracting readability, creating a screenshot, then attaching them to an Archive/FileGroup.
+    """
+    # Get URL first because it does some simple checking of `singlefile`
+    url = get_url_from_singlefile(singlefile)
+    singlefile = singlefile.encode() if isinstance(singlefile, str) else singlefile
+
+    if DOCKERIZED:
+        # Perform the archive in the Archive docker container.  (Typically in the development environment).
+        singlefile = base64.b64encode(singlefile).decode()
+        logger.debug(f'singlefile_to_archive sending to archive service: {url}')
+        singlefile, readability, screenshot = await request_archive(url, singlefile=singlefile)
+    else:
+        # JSON from readability-extractor
+        readability = dict()
+        try:
+            logger.debug(f'singlefile_to_archive extracting readability: {url}')
+            readability = await html_to_readability(singlefile, url)
+        except RuntimeError as e:
+            logger.error(f'Failed to extract readability from: {url}', exc_info=e)
+
+        screenshot = None
+        try:
+            logger.debug(f'singlefile_to_archive creating screenshot: {url}')
+            screenshot = html_screenshot(singlefile)
+        except Exception as e:
+            logger.error(f'Failed to extract screenshot from: {url}', exc_info=e)
+
+    logger.trace(f'singlefile_to_archive modeling: {url}')
+    archive: Archive = await model_archive_result(url, singlefile, readability, screenshot)
+    return archive

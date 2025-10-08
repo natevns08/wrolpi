@@ -5,9 +5,14 @@ from typing import Optional, List, Dict
 @dataclass
 class ZimSearchRequest:
     search_str: Optional[str] = None
-    tag_names: List[str] = field(default_factory=lambda: list())
+    tag_names: List[str] = field(default_factory=list)
     offset: Optional[int] = 0
     limit: Optional[int] = 10
+
+
+@dataclass
+class ZimAutoSearchRequest:
+    auto_search: bool
 
 
 @dataclass
@@ -93,3 +98,10 @@ class ZimSubscribeRequest:
 class OutdatedZims:
     outdated: List[str]
     current: List[str]
+
+
+@dataclass
+class SearchEstimateRequest:
+    search_str: Optional[str] = None
+    tag_names: List[str] = field(default_factory=list)
+    any_tag: bool = False

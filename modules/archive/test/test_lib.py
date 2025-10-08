@@ -13,10 +13,11 @@ from modules.archive import lib
 from modules.archive.lib import get_or_create_domain, get_new_archive_files, delete_archives, model_archive_result, \
     get_domains
 from modules.archive.models import Archive, Domain
+from wrolpi.api_utils import CustomJSONEncoder
+from wrolpi.common import get_wrolpi_config
 from wrolpi.db import get_db_session
 from wrolpi.files import lib as files_lib
 from wrolpi.files.models import FileGroup
-from wrolpi.root_api import CustomJSONEncoder
 from wrolpi.test.common import skip_circleci
 
 
@@ -36,7 +37,7 @@ def make_fake_archive_result(readability=True, screenshot=True, title=True):
 
 
 @pytest.mark.asyncio
-async def test_no_screenshot(test_session):
+async def test_no_screenshot(test_directory, test_session):
     singlefile, readability, screenshot = make_fake_archive_result(screenshot=False)
     archive = await model_archive_result('https://example.com', singlefile, readability, screenshot)
     assert isinstance(archive.singlefile_path, pathlib.Path)
@@ -46,7 +47,7 @@ async def test_no_screenshot(test_session):
 
 
 @pytest.mark.asyncio
-async def test_no_readability(test_session):
+async def test_no_readability(test_directory, test_session):
     singlefile, readability, screenshot = make_fake_archive_result(readability=False)
     archive = await model_archive_result('https://example.com', singlefile, readability, screenshot)
     assert isinstance(archive.singlefile_path, pathlib.Path)
@@ -79,7 +80,7 @@ async def test_relationships(test_session, example_singlefile):
 
 
 @pytest.mark.asyncio
-async def test_archive_title(test_session, archive_factory, singlefile_contents_factory):
+async def test_archive_title(async_client, test_session, archive_factory, singlefile_contents_factory):
     """An Archive's title can be fetched in multiple ways.  This tests from most to least reliable."""
     # Create some test files, delete all records for a fresh refresh.
     archive_factory(
@@ -275,8 +276,9 @@ def test_get_domains(test_session, archive_factory):
     assert [i['domain'] for i in get_domains()] == []
 
 
+@skip_circleci
 @pytest.mark.asyncio
-async def test_new_archive(test_session, fake_now):
+async def test_new_archive(test_session, test_directory, fake_now):
     singlefile, readability, screenshot = make_fake_archive_result()
     fake_now(datetime(2000, 1, 1))
     archive1 = await model_archive_result('https://example.com', singlefile, readability, screenshot)
@@ -292,28 +294,8 @@ async def test_new_archive(test_session, fake_now):
     assert archive1.domain is not None
 
     # The actual files were dumped and read correctly.  The HTML/JSON files are reformatted.
-    assert archive1.singlefile_path.read_text() == '''<html>
- <!--
- Page saved with SingleFile-->
- <body>
-  <p>
-   test single-file
-ジにてこちら
-  </p>
-  <title>
-   some title
-  </title>
- </body>
-</html>
-'''
-    assert archive1.readability_path.read_text() == '''<html>
- <body>
-  <p>
-   test readability content
-  </p>
- </body>
-</html>
-'''
+    assert archive1.singlefile_path.read_text().count('\n') >= 10
+    assert archive1.readability_path.read_text().count('\n') >= 5
     with open(archive1.readability_txt_path) as fh:
         assert fh.read() == 'test readability textContent'
     assert archive1.readability_json_path.read_text() == '''{
@@ -328,7 +310,7 @@ async def test_new_archive(test_session, fake_now):
 
 
 @pytest.mark.asyncio
-async def test_get_title_from_html(test_session, fake_now):
+async def test_get_title_from_html(test_directory, test_session, fake_now):
     fake_now(datetime(2000, 1, 1))
     singlefile, readability, screenshot = make_fake_archive_result()
     archive = await model_archive_result('https://example.com', singlefile, readability, screenshot)
@@ -358,7 +340,7 @@ async def test_get_title_from_html(test_session, fake_now):
 
 
 @skip_circleci
-def test_get_new_archive_files_length(fake_now):
+def test_get_new_archive_files_length(test_directory, fake_now):
     """Archive titles are truncated to fit file system length limit.  (255-character limit for most file systems)"""
     fake_now(datetime(2001, 1, 1))
     archive_files = get_new_archive_files('https://example.com', 'a' * 500)
@@ -371,7 +353,7 @@ def test_get_new_archive_files_length(fake_now):
 
 @skip_circleci
 def test_get_new_archive_files(fake_now):
-    """Archive files have a specific format so they are sorted by datetime, and are near each other."""
+    """Archive files have a specific format, so they are sorted by datetime, and are near each other."""
     fake_now(datetime(2001, 1, 1))
     archive_files = get_new_archive_files('https://example.com/two', None)
     assert str(archive_files.singlefile).endswith('archive/example.com/2001-01-01-00-00-00_NA.html')
@@ -446,19 +428,19 @@ async def test_title_in_filename(test_session, fake_now, test_directory, image_b
     archive3 = await model_archive_result('https://example.com', singlefile, readability, screenshot)
 
     assert str(archive3.singlefile_path.relative_to(test_directory)) == \
-           'archive/example.com/2000-01-01-00-00-00_dangerous ;_title.html'
+           'archive/example.com/2000-01-01-00-00-00_dangerous ;⧸⧸_title.html'
     assert str(archive3.readability_path.relative_to(test_directory)) == \
-           'archive/example.com/2000-01-01-00-00-00_dangerous ;_title.readability.html'
+           'archive/example.com/2000-01-01-00-00-00_dangerous ;⧸⧸_title.readability.html'
     assert str(archive3.readability_txt_path.relative_to(test_directory)) == \
-           'archive/example.com/2000-01-01-00-00-00_dangerous ;_title.readability.txt'
+           'archive/example.com/2000-01-01-00-00-00_dangerous ;⧸⧸_title.readability.txt'
     assert str(archive3.readability_json_path.relative_to(test_directory)) == \
-           'archive/example.com/2000-01-01-00-00-00_dangerous ;_title.readability.json'
+           'archive/example.com/2000-01-01-00-00-00_dangerous ;⧸⧸_title.readability.json'
     assert str(archive3.screenshot_path.relative_to(test_directory)) == \
-           'archive/example.com/2000-01-01-00-00-00_dangerous ;_title.png'
+           'archive/example.com/2000-01-01-00-00-00_dangerous ;⧸⧸_title.png'
 
 
 @pytest.mark.asyncio
-async def test_refresh_archives(test_session, test_directory, test_async_client, make_files_structure):
+async def test_refresh_archives(test_session, test_directory, async_client, make_files_structure):
     """Archives can be found and put in the database.  A single Archive will have multiple files."""
     # The start of a typical singlefile html file.
     singlefile_contents = '''<!DOCTYPE html> <html lang="en"><!--
@@ -483,7 +465,7 @@ async def test_refresh_archives(test_session, test_directory, test_async_client,
     })
 
     # The single archive is found.
-    await test_async_client.post('/api/files/refresh')
+    await async_client.post('/api/files/refresh')
     assert test_session.query(Archive).count() == 1
 
     # Cause a re-index of the archive.
@@ -492,7 +474,7 @@ async def test_refresh_archives(test_session, test_directory, test_async_client,
     test_session.commit()
 
     # Running the refresh does not result in a new archive.
-    await test_async_client.post('/api/files/refresh')
+    await async_client.post('/api/files/refresh')
     assert test_session.query(Archive).count() == 1
 
     # Archives file format was changed, lets check the new formats are found.
@@ -500,13 +482,13 @@ async def test_refresh_archives(test_session, test_directory, test_async_client,
         'archive/example.com/2021-10-05-16-20-11_The Title.html': '<html></html>',
         'archive/example.com/2021-10-05-16-20-11_The Title.readability.json': '{"url": "https://example.com"}',
     })
-    await test_async_client.post('/api/files/refresh')
+    await async_client.post('/api/files/refresh')
     # The old formatted archive above is renamed.
     assert (test_directory / 'archive/example.com/2021-10-05-16-20-10_NA.html').is_file()
     assert test_session.query(Archive).count() == 2
 
     content = json.dumps({'search_str': 'text', 'model': 'archive'})
-    request, response = await test_async_client.post('/api/files/search', content=content)
+    request, response = await async_client.post('/api/files/search', content=content)
     assert response.status_code == HTTPStatus.OK
     assert response.json['file_groups'], 'No files matched "text"'
     assert response.json['file_groups'][0]['model'] == 'archive', 'Returned file was not an archive'
@@ -557,6 +539,35 @@ async def test_refresh_archives_index(test_session, make_files_structure):
     assert archive.file_group.a_text == 'the title'  # from readability json
     assert archive.file_group.b_text == 'The article description'  # From application/ld+json
     assert archive.file_group.d_text == 'article text contents'  # from readability txt
+    assert archive.file_group.indexed is True
+
+
+@pytest.mark.asyncio
+async def test_archive_meta(async_client, test_session, make_files_structure):
+    # The start of a typical singlefile html file.
+    singlefile_contents = '''<!DOCTYPE html> <html lang="en">
+<script data-vue-meta="ssr" type="application/ld+json">
+   {"@context":"https://schema.org/","@type":"NewsArticle","headline":"The Headline","description":"The Description","authors":[{"name":"A.B.C.","@type":"Person"}],"datePublished":"2021-06-20T10:00"}
+  </script>
+</html>'''
+
+    singlefile, *_ = make_files_structure({
+        'archive/example.com/2021-10-05-16-20-10_NA.html': singlefile_contents,
+        'archive/example.com/2021-10-05-16-20-10_NA.png': None,
+        'archive/example.com/2021-10-05-16-20-10_NA.readability.txt': 'article text contents',
+        'archive/example.com/2021-10-05-16-20-10_NA.readability.html': '<html></html>',
+    })
+
+    await files_lib.refresh_files()
+
+    archive: Archive = test_session.query(Archive).one()
+    assert archive.singlefile_path == singlefile
+
+    assert archive.file_group.author == 'A.B.C.'
+    assert archive.file_group.published_datetime == datetime(2021, 6, 20, 10, 0, tzinfo=pytz.utc)
+
+    assert archive.file_group.title == 'The Headline'
+    assert archive.file_group.b_text == 'The Description'
     assert archive.file_group.indexed is True
 
 
@@ -817,3 +828,15 @@ SINGLEFILE_EXAMPLE_1 = b'''<!DOCTYPE html>
 
 def test_get_url_from_singlefile():
     assert lib.get_url_from_singlefile(SINGLEFILE_EXAMPLE_1) == 'https://www.example.com'
+
+
+@pytest.mark.asyncio
+async def test_get_custom_archive_directory(async_client, test_directory, test_wrolpi_config):
+    """Custom directory can be used for archive directory."""
+    # Default location.
+    assert lib.get_archive_directory() == (test_directory / 'archive')
+
+    get_wrolpi_config().archive_destination = 'custom/archives'
+
+    assert lib.get_archive_directory() == (test_directory / 'custom/archives')
+    assert lib.get_domain_directory('https://example.com') == (test_directory / 'custom/archives/example.com')

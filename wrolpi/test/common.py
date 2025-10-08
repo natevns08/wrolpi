@@ -1,3 +1,4 @@
+import json
 import os
 import pathlib
 import tempfile
@@ -9,15 +10,17 @@ from typing import List
 import mock
 import pytest
 
+from wrolpi.api_utils import CustomJSONEncoder
 from wrolpi.common import get_media_directory
-from wrolpi.conftest import ROUTES_ATTACHED, test_db, test_client  # noqa
+from wrolpi.conftest import test_db, test_client  # noqa
 from wrolpi.db import postgres_engine
+from wrolpi.vars import CIRCLECI, IS_MACOS
 
 TEST_CONFIG_PATH = tempfile.NamedTemporaryFile(mode='rt', delete=False)
 
-skip_circleci = pytest.mark.skipif(
-    os.environ.get('CIRCLECI', '').strip().lower() == 'true',
-    reason='This test is not supported in Circle CI')
+skip_circleci = pytest.mark.skipif(CIRCLECI, reason='This test is not supported in Circle CI')
+skip_macos = pytest.mark.skipif(IS_MACOS, reason='This test is not supported on MacOS')
+only_macos = pytest.mark.skipif(not IS_MACOS, reason='This test is only supported on MacOS')
 
 
 def wrap_test_db(func):
@@ -149,11 +152,20 @@ def assert_dict_contains(d1: dict, d2: dict):
     if hasattr(d2, '__dict__'):
         d2 = d2.__dict__
 
+    # Sort items so error is easier to read.
+    d1 = dict(sorted(d1.items()))
+    d2 = dict(sorted(d2.items()))
+
     for k2 in d2.keys():
-        assert d1, f'dict 1 is empty: {d1}'
-        assert d2, f'dict 1 is empty: {d2}'
-        assert k2 in d1, f'dict 1 does not contain {k2}'
-        if isinstance(d1[k2], dict):
-            assert_dict_contains(d1[k2], d2[k2])
-        else:
-            assert d1[k2] == d2[k2], f'{repr(k2)} of value {repr(d1[k2])} does not equal {repr(d2[k2])} in dict 1'
+        try:
+            assert d1, f'dict 1 is empty: {d1}'
+            assert d2, f'dict 1 is empty: {d2}'
+            assert k2 in d1, f'dict 1 does not contain {k2}'
+            if isinstance(d1[k2], dict):
+                assert_dict_contains(d1[k2], d2[k2])
+            else:
+                assert d1[k2] == d2[k2], f'{repr(k2)} of value {repr(d1[k2])} does not equal {repr(d2[k2])} in dict 1'
+        except AssertionError as e:
+            d1_str = json.dumps(d1, indent=1, cls=CustomJSONEncoder)
+            d2_str = json.dumps(d2, indent=1, cls=CustomJSONEncoder)
+            raise AssertionError(f'{d1_str}\n\n{d2_str}\n\nDictionaries above are unequal') from e

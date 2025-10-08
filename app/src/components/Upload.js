@@ -1,7 +1,7 @@
 import React from "react";
 import {useDropzone} from "react-dropzone";
 import {Form, Header, Icon, Progress, Segment} from "./Theme";
-import {DirectorySearch, mimetypeIconName} from "./Common";
+import {DirectorySearch, mimetypeIconName, Toggle} from "./Common";
 import {useUploadFile} from "../hooks/customHooks";
 import _ from "lodash";
 import {ThemeContext} from "../contexts/contexts";
@@ -9,8 +9,20 @@ import Grid from "semantic-ui-react/dist/commonjs/collections/Grid";
 import {Form as SForm} from "semantic-ui-react";
 
 export function Upload({disabled}) {
-    const {setFiles, progresses, destination, setDestination, doClear} = useUploadFile();
     const {t} = React.useContext(ThemeContext);
+
+    const {
+        setFiles,
+        progresses,
+        destination,
+        setDestination,
+        doClear,
+        tagsSelector,
+        overwrite,
+        setOverwrite,
+        overallProgress,
+        inProgress,
+    } = useUploadFile();
 
     const onDrop = React.useCallback(async (acceptedFiles) => {
         if (acceptedFiles && acceptedFiles.length > 0) {
@@ -18,7 +30,7 @@ export function Upload({disabled}) {
         }
     }, [destination]);
 
-    const {getRootProps, getInputProps} = useDropzone({onDrop});
+    const {getRootProps, getInputProps} = useDropzone({onDrop, disabled: inProgress});
 
     React.useEffect(() => {
         if (!destination) {
@@ -26,10 +38,6 @@ export function Upload({disabled}) {
             doClear();
         }
     }, [destination]);
-
-    const handleDestination = (value) => {
-        setDestination(value);
-    }
 
     let progressBars;
     if (!_.isEmpty(progresses)) {
@@ -69,8 +77,20 @@ export function Upload({disabled}) {
         <Form>
             <SForm.Field required>
                 <label>Destination</label>
-                <DirectorySearch onSelect={handleDestination} disabled={disabled}/>
+                <DirectorySearch
+                    onSelect={i => setDestination(i)}
+                    disabled={disabled || inProgress}
+                    style={{marginBottom: '0.5em'}}
+                />
+                {tagsSelector}
             </SForm.Field>
+
+            <Toggle
+                checked={overwrite}
+                label='Overwrite'
+                onChange={() => setOverwrite(!overwrite)}
+                disabled={disabled || inProgress}
+            />
         </Form>
 
         {destination ?
@@ -78,8 +98,7 @@ export function Upload({disabled}) {
                 <Grid columns={1}>
                     <Grid.Row>
                         <Grid.Column style={{padding: '1em'}}>
-                            <Form onSubmit={() => {
-                            }}>
+                            <Form>
                                 <div {...getRootProps()}>
                                     <input {...getInputProps()}/>
                                     <Grid textAlign='center'>
@@ -103,6 +122,17 @@ export function Upload({disabled}) {
 
         <br/>
 
+        <Grid>
+            <Grid.Row columns={1}>
+                <Grid.Column>
+                    {progresses && Object.keys(progresses).length > 1 && <Progress progress
+                                  percent={overallProgress}
+                                  color='blue'
+                                  label='Overall Progress'
+                        />}
+                </Grid.Column>
+            </Grid.Row>
+        </Grid>
         <Grid columns={2}>
             {progressBars}
         </Grid>

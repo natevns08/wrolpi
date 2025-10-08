@@ -1,3 +1,5 @@
+import pathlib
+from dataclasses import field, dataclass
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
@@ -5,12 +7,11 @@ from typing import List, Tuple
 
 from pint import Quantity
 
-from wrolpi import before_startup
 from wrolpi.common import logger, Base, ConfigFile
 from wrolpi.db import get_db_session
-from .errors import NoInventories, InventoriesVersionMismatch
-from .inventory import get_items, get_inventories, increment_inventories_version, \
-    get_inventories_version, get_unit_registry
+from wrolpi.events import Events
+from .errors import NoInventories
+from .inventory import get_items, get_inventories, get_unit_registry
 from .models import Inventory, Item
 
 MY_DIR: Path = Path(__file__).parent
@@ -117,12 +118,19 @@ def cleanup_quantity(quantity: Quantity) -> Quantity:
     return Decimal(num) * unit
 
 
+@dataclass
+class InventoriesConfigValidator:
+    version: int = None
+    inventories: list[str] = field(default_factory=list)
+
+
 class InventoriesConfig(ConfigFile):
     file_name = 'inventories.yaml'
     default_config = dict(
         inventories=[],
-        version=1,
+        version=0,
     )
+    validator = InventoriesConfigValidator
 
     @property
     def inventories(self) -> dict:
@@ -132,13 +140,61 @@ class InventoriesConfig(ConfigFile):
     def inventories(self, value: dict):
         self.update({'inventories': value})
 
-    @property
-    def version(self) -> int:
-        return self._config['version']
+    def dump_config(self, file: pathlib.Path = None, send_events=False, overwrite=False):
+        inventories = []
+        for inventory in get_inventories():
+            inventories.append(inventory.dict())
 
-    @version.setter
-    def version(self, value: int):
-        self.update({'version': value})
+        if not inventories:
+            raise NoInventories('No Inventories are in the database!')
+
+        self._config['inventories'] = inventories
+        super().dump_config(file, send_events, overwrite)
+
+    def import_config(self, file: pathlib.Path = None, send_events=False):
+        super().import_config(file)
+
+        try:
+            with get_db_session(commit=True) as session:
+                db_inventories = session.query(Inventory).all()
+                db_inventories_by_name = {i.name: i for i in db_inventories}
+                config_inventories = [i['name'] for i in self.inventories]
+                for inventory_dict in self.inventories:
+                    if inventory_dict['name'] not in db_inventories_by_name:
+                        inventory = Inventory(
+                            name=inventory_dict['name'],
+                            created_at=inventory_dict['created_at'],
+                            deleted_at=inventory_dict['deleted_at'],
+                        )
+                        session.add(inventory)
+                        # Get the Inventory from the DB so we can use its ID.
+                        inventory.flush()
+                        db_inventories_by_name[inventory.name] = inventory
+
+                # Delete any inventories no longer in the config.
+                for name, inventory in db_inventories_by_name.items():
+                    if name not in config_inventories:
+                        session.delete(inventory)
+
+                for inventory_dict in self.inventories:
+                    # Items are complex and do not have useful primary keys.  Delete all items, create new items.
+                    session.query(Item).filter(Item.inventory_id == inventory_dict['id']).delete()
+                    inventory = db_inventories_by_name[inventory_dict['name']]
+                    for item in inventory_dict['items']:
+                        del item['inventory_id']
+                        del item['id']
+                        item = Item(inventory=inventory, inventory_id=inventory.id, **item)
+                        session.add(item)
+                        item.flush()
+
+            self.successful_import = True
+        except Exception as e:
+            self.successful_import = False
+            message = f'Failed to import {self.file_name}'
+            logger.error(message, exc_info=e)
+            if send_events:
+                Events.send_config_import_failed(message)
+            raise
 
 
 INVENTORIES_CONFIG: InventoriesConfig = InventoriesConfig()
@@ -162,49 +218,10 @@ def set_test_inventories_config(enabled: bool):
         TEST_INVENTORIES_CONFIG = None
 
 
-def save_inventories_file():
-    """Write all inventories and their respective items to a YAML file."""
-    config = get_inventories_config()
-
-    inventories = []
-    for inventory in get_inventories():
-        inventories.append(inventory.dict())
-
-    if not inventories:
-        raise NoInventories('No Inventories are in the database!')
-
-    with increment_inventories_version() as version:
-        if config.version and config.version > version:
-            raise InventoriesVersionMismatch(
-                f'Inventories config version is {config.version} but DB version is {get_inventories_version()}')
-
-        config.inventories = inventories
-        config.version = version
-        config.save()
+def save_inventories_config():
+    """Write all inventories and their respective items to a WROLPi Config file."""
+    get_inventories_config().background_dump.activate_switch()
 
 
-@before_startup
-def import_inventories_file():
-    config = get_inventories_config()
-
-    inventories = get_inventories()
-    inventories_names = {i.name for i in inventories}
-    new_inventories = [i for i in config.inventories if i['name'] not in inventories_names]
-    with get_db_session(commit=True) as session:
-        for inventory in new_inventories:
-            items = inventory['items']
-            inventory = Inventory(
-                name=inventory['name'],
-                created_at=inventory['created_at'],
-                deleted_at=inventory['deleted_at'],
-            )
-            session.add(inventory)
-            # Get the Inventory from the DB so we can use it's ID.
-            session.flush()
-            session.refresh(inventory)
-
-            for item in items:
-                del item['inventory_id']
-                item = Item(inventory_id=inventory.id, **item)
-                item.inventory_id = inventory.id
-                session.add(item)
+def import_inventories_config():
+    get_inventories_config().import_config()

@@ -10,7 +10,7 @@ import {MoreRoute} from "./components/Apps";
 import {InventoryRoute} from "./components/Inventory";
 import {ArchiveRoute} from "./components/Archive";
 import {FilesRoute} from "./components/Files";
-import {StatusProvider} from "./hooks/customHooks";
+import {QueryProvider, StatusProvider} from "./hooks/customHooks";
 import {MapRoute} from "./components/Map";
 import {MediaContextProvider, mediaStyles, StatusContext, ThemeContext} from "./contexts/contexts";
 import {Header, ThemeProvider} from "./components/Theme";
@@ -21,7 +21,6 @@ import {SemanticToastContainer} from "react-semantic-toasts-2";
 import {FilePreviewProvider} from "./components/FilePreview";
 import {TagsProvider} from "./Tags";
 import {ZimRoute} from "./components/Zim";
-import {SearchSuggestionsProvider} from "./components/Search";
 
 function PageNotFound() {
     const {t} = useContext(ThemeContext);
@@ -38,8 +37,12 @@ function Dot() {
 function Footer() {
     const {t} = useContext(ThemeContext);
     const {status} = useContext(StatusContext);
-    let {version} = status;
-    version = version ? `v${version}` : null;
+    let version;
+    try {
+        version = status?.version ? `v${status.version}` : null;
+    } catch (e) {
+        // Not logging because this is not that important.
+    }
     return <Container textAlign='center' style={{marginTop: '1.5em', marginBottom: '1em', ...t}}>
         <span {...t}>
             WROLPi {version} <Dot/>
@@ -49,32 +52,20 @@ function Footer() {
     </Container>
 }
 
-function HelpPage() {
-    return <iframe
-        title='map'
-        src={`http://${window.location.hostname}:8086/`}
-        style={{
-            position: 'fixed',
-            height: '100%',
-            width: '100%',
-            border: 'none',
-        }}/>
-}
-
 function Root() {
-    return <ThemeProvider>
-        <TagsProvider>
-            <FilePreviewProvider>
-                <SearchSuggestionsProvider>
+    return <QueryProvider>
+        <ThemeProvider>
+            <TagsProvider>
+                <FilePreviewProvider>
                     <header>
                         <NavBar/>
                     </header>
                     <Outlet/>
                     <Footer/>
-                </SearchSuggestionsProvider>
-            </FilePreviewProvider>
-        </TagsProvider>
-    </ThemeProvider>
+                </FilePreviewProvider>
+            </TagsProvider>
+        </ThemeProvider>
+    </QueryProvider>
 }
 
 const router = createBrowserRouter(createRoutesFromElements(<Route
@@ -89,7 +80,6 @@ const router = createBrowserRouter(createRoutesFromElements(<Route
     <Route path='videos/channel/:channelId/video/:videoId' exact element={<VideoWrapper/>}/>
     <Route path="videos/*" element={<VideosRoute/>}/>
     <Route path="admin/*" element={<AdminRoute/>}/>
-    <Route path="help/*" element={<HelpPage/>}/>
     <Route path="more/*" element={<MoreRoute/>}/>
     <Route path="inventory/*" element={<InventoryRoute/>}/>
     <Route path='archive/*' element={<ArchiveRoute/>}/>

@@ -77,19 +77,21 @@ You can try out WROLPi by running the docker containers.
     * `git clone https://github.com/lrnselfreliance/wrolpi.git`
 3. Change directory into the code base.
     * `cd wrolpi`
-4. Build the containers.
+4. Initialize git submodules
+    * `git submodule update --init`
+5. Build the containers.
     * `docker-compose build --parallel`
-5. Create volumes.
+6. Create volumes.
     * `docker volume create --name=openstreetmap-data`
     * `docker volume create --name=openstreetmap-rendered-tiles`
-6. Start the database.
+7. Start the database.
     * `docker-compose up -d db`
-7. Initialize the database.
+8. Initialize the database.
     * `docker-compose run --rm api db upgrade`
-8. Start the docker containers.
+9. Start the docker containers.
     * `docker-compose up`
-9. Browse to WROLPi.
-    * http://0.0.0.0:8080
+10. Browse to WROLPi.
+    * https://0.0.0.0:8443
 
 # Debian 12 Install
 
@@ -99,14 +101,14 @@ Steps necessary to initialize your WROLPi after installing the Debian image from
 2. Insert the thumb-drive into the laptop, boot to the thumb-drive
     1. Select "Start Installer"
     2. Install Debian 12 as you would like.
-       1. It is recommended to use the hostname **wrolpi**
-       2. (WROLPi will be installed during the installation without your intervention.)
+        1. It is recommended to use the hostname **wrolpi**
+        2. (WROLPi will be installed during the installation without your intervention.)
 3. Unplug the thumb-drive after the installation has completed
 4. Login as the user _you_ created during installation.
 5. Switch to the root user: `su -`
 6. Initialize the WROLPi databases using the repair script: `/opt/wrolpi/repair.sh`
 7. Reboot: `reboot`
-8. Browse to http://wrolpi.local or the IP address of your WROLPi!
+8. Browse to https://wrolpi.local or the IP address of your WROLPi!
 
 # Raspberry Pi Install
 
@@ -118,7 +120,7 @@ Steps necessary to initialize your WROLPi after installing the Raspberry Pi imag
     * `echo '/dev/sda1 /media/wrolpi auto defaults,nofail 0 0' | sudo tee -a /etc/fstab`
 4. Initialize the WROLPi databases using the repair script: `sudo /opt/wrolpi/repair.sh`
 5. Reboot `sudo reboot`
-6. Join the Hotspot or browse to http://wrolpi.local or the IP address of your WROLPi!
+6. Join the Hotspot or browse to https://wrolpi.local or the IP address of your WROLPi!
 
 # Charter
 
@@ -127,6 +129,8 @@ Steps necessary to initialize your WROLPi after installing the Raspberry Pi imag
 1. Storage is cheaper than power.
 2. Two is one, one is none.
 3. Run silently.
+4. Primary, secondary, tertiary.
+5. Secure as a bookshelf in your home.
 
 ## Physical properties
 

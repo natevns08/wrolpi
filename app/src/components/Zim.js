@@ -5,6 +5,7 @@ import {
     Divider,
     Header,
     Icon,
+    Loader,
     Modal,
     ModalActions,
     ModalContent,
@@ -32,13 +33,16 @@ import {
     APIButton,
     encodeMediaPath,
     ErrorMessage,
+    HandPointMessage,
     humanFileSize,
+    IframeViewer,
     InfoMessage,
     normalizeEstimate,
     PageContainer,
     Paginator,
     TabLinks,
     TagIcon,
+    Toggle,
     useTitle,
     WarningMessage
 } from "./Common";
@@ -50,6 +54,7 @@ import {
     fetchZimSubscriptions,
     refreshFiles,
     saveSettings,
+    setZimAutoSearch,
     tagZimEntry,
     untagZimEntry,
     zimSubscribe,
@@ -62,8 +67,7 @@ import {Link, Route, Routes} from "react-router-dom";
 import {SortableTable} from "./SortableTable";
 import {toast} from "react-semantic-toasts-2";
 import _ from "lodash";
-
-const VIEWER_URL = `http://${window.location.hostname}:8085/`;
+import {ZIM_VIEWER_URI} from "./Vars";
 
 export const OutdatedZimsMessage = ({onClick}) => {
     const [open, setOpen] = React.useState(false);
@@ -153,16 +157,13 @@ export const OutdatedZimsMessage = ({onClick}) => {
 }
 
 export const KiwixRestartMessage = () => {
-    return <Message icon warning>
-        <SIcon name='exclamation'/>
-        <Message.Content>
-            <Message.Header>Kiwix must be restarted</Message.Header>
-            <p>New Zim files have been downloaded; you must restart your containers.</p>
+    return <WarningMessage>
+        <Message.Header>Kiwix must be restarted</Message.Header>
+        <p>New Zim files have been downloaded; you must restart your containers.</p>
 
-            <p>Run the following to restart your containers:</p>
-            <pre>  docker-compose restart</pre>
-        </Message.Content>
-    </Message>
+        <p>Run the following to restart your containers:</p>
+        <pre>  docker-compose restart</pre>
+    </WarningMessage>
 }
 
 const ZimSearchEntry = ({zimId, onTag, onUntag, entry}) => {
@@ -204,12 +205,11 @@ const ZimSearchEntry = ({zimId, onTag, onUntag, entry}) => {
                onClose={() => setOpen(false)}>
             <ModalContent>
                 <div className='full-height'>
-                    <iframe title='textModal' src={url}
-                            style={{
-                                height: '100%', width: '100%', border: 'none', position: 'absolute', top: 0,
-                                // Use white to avoid iframe displaying with dark-theme.
-                                backgroundColor: '#ffffff',
-                            }}/>
+                    <ZimViewer src={url} style={{
+                        height: '100%', width: '100%', border: 'none', position: 'absolute', top: 0,
+                        // Use white to avoid iframe displaying with dark-theme.
+                        backgroundColor: '#ffffff',
+                    }}/>
                 </div>
             </ModalContent>
             <ModalActions>
@@ -258,6 +258,8 @@ const ZimAccordion = ({data, index, activeIndex, onClick, searchStr, activeTags}
         <Paginator activePage={pages.activePage} totalPages={pages.totalPages} onPageChange={pages.setPage}/>
     </center>;
 
+    const label = <Label color={estimate > 0 ? 'violet' : undefined}>{normalizeEstimate(estimate)}</Label>;
+
     return <React.Fragment>
         <AccordionTitle
             index={index}
@@ -265,7 +267,7 @@ const ZimAccordion = ({data, index, activeIndex, onClick, searchStr, activeTags}
             onClick={() => onClick(index, activeIndex)}
         >
             <Header as='h3'>
-                <Icon name='dropdown'/> {title} <Label>{normalizeEstimate(estimate)}</Label>
+                <Icon name='dropdown'/> {title} {label}
             </Header>
         </AccordionTitle>
         <AccordionContent active={index === activeIndex}>
@@ -286,16 +288,16 @@ const ZimsRefreshWarning = () => {
     </Message>;
 }
 
-export const ZimSearchView = ({estimates}) => {
+export const ZimSearchView = ({suggestions, loading}) => {
     const [activeIndex, setActiveIndex] = React.useState(null);
     const {searchStr, activeTags, setTags} = useSearch();
-    const {zimsEstimates} = estimates;
+    const {zimsEstimates} = suggestions;
 
     const handleClick = (index, activeIndex_) => {
         setActiveIndex(index === activeIndex_ ? -1 : index);
     }
 
-    let body = <ZimsRefreshWarning/>;
+    let body;
     if (!_.isEmpty(zimsEstimates)) {
         body = zimsEstimates.map((i, index) => <ZimAccordion
             key={i['path']}
@@ -306,24 +308,36 @@ export const ZimSearchView = ({estimates}) => {
             activeTags={activeTags}
             onClick={handleClick}
         />);
+    } else if (loading) {
+        body = <AccordionContent>
+            <Segment placeholder>
+                <Loader active={true}/>
+            </Segment>
+        </AccordionContent>;
+    } else if (_.isEmpty(zimsEstimates)) {
+        body = <ZimsRefreshWarning/>;
     }
 
     return <>
-        <TagsQuerySelector onChange={setTags}/>
+        <TagsQuerySelector onChange={(i, j) => setTags(i)}/>
         <Accordion>
             {body}
         </Accordion>
     </>
 }
 
-const ViewerMessage = () => {
+const DownloadMessage = () => {
     return <InfoMessage>
         <p>More Zim files are available from the full Kiwix library&nbsp;
             <a href='https://download.kiwix.org/'>https://download.kiwix.org/</a>
         </p>
-
-        <p>You can view your Zim files using the Kiwix app, or at <a href={VIEWER_URL}>{VIEWER_URL}</a></p>
     </InfoMessage>
+}
+
+const ViewerMessage = () => {
+    return <HandPointMessage>
+        <p>You can view your Zim files using the Kiwix app, or at <a href={ZIM_VIEWER_URI}>{ZIM_VIEWER_URI}</a></p>
+    </HandPointMessage>
 }
 
 const ZimCatalogItemRow = ({item, subscriptions, iso_639_codes, fetchSubscriptions}) => {
@@ -331,9 +345,9 @@ const ZimCatalogItemRow = ({item, subscriptions, iso_639_codes, fetchSubscriptio
     const subscription = name in subscriptions ? subscriptions[name] : null;
     const subscriptionLanguage = subscription ? subscription['language'] : 'en';
 
-    const [langauge, setLanguage] = useState(subscriptionLanguage);
+    const [language, setLanguage] = useState(subscriptionLanguage);
     const [pending, setPending] = useState(false);
-    const languageChange = subscription ? langauge !== subscription['language'] : false;
+    const languageChange = subscription ? language !== subscription['language'] : false;
 
     const wrolModeEnabled = useWROLMode();
 
@@ -344,7 +358,7 @@ const ZimCatalogItemRow = ({item, subscriptions, iso_639_codes, fetchSubscriptio
             if (subscription && !languageChange) {
                 success = await zimUnsubscribe(subscription['id']);
             } else {
-                success = await zimSubscribe(name, langauge);
+                success = await zimSubscribe(name, language);
             }
         } catch (e) {
             console.error(e);
@@ -375,7 +389,7 @@ const ZimCatalogItemRow = ({item, subscriptions, iso_639_codes, fetchSubscriptio
     const languageDropdown = <Dropdown fluid search selection
                                        placeholder='Language'
                                        options={languageOptions}
-                                       value={langauge}
+                                       value={language}
                                        disabled={wrolModeEnabled}
                                        onChange={handleLanguageChange}
     />;
@@ -433,12 +447,28 @@ class ManageZim extends React.Component {
         }
     }
 
-    zimFileTableRow = (zim, sortData) => {
-        const {path, size} = zim;
+    zimFileTableRow = (zim, sortData, localFetchZims) => {
+        const {id, path, size, auto_search} = zim;
+
+        const toggleZimAutoSearch = async () => {
+            try {
+                await setZimAutoSearch(id, !auto_search);
+            } catch (e) {
+                throw e;
+            } finally {
+                await localFetchZims();
+            }
+        }
+        const toggle = <Toggle
+            checked={auto_search}
+            onChange={toggleZimAutoSearch}
+            popupContent='Enable/Disable searching this Zim file in the Global Search.'
+        />
 
         return <TableRow key={path}>
             <TableCell>{path}</TableCell>
             <TableCell>{humanFileSize(size)}</TableCell>
+            <TableCell>{toggle}</TableCell>
         </TableRow>
     }
 
@@ -448,6 +478,7 @@ class ManageZim extends React.Component {
         const zimFilesHeaders = [
             {key: 'path', text: 'Path', sortBy: 'path', width: 14},
             {key: 'size', text: 'Size', sortBy: 'size', width: 2},
+            {key: 'search', text: 'Search', sortBy: 'auto_search', width: 2},
         ];
         let zimFilesBody = <Placeholder>
             <PlaceholderHeader>
@@ -457,8 +488,9 @@ class ManageZim extends React.Component {
         </Placeholder>;
         if (zims && zims.length >= 1) {
             zimFilesBody = <SortableTable
+                tableProps={{striped: true}}
                 data={zims}
-                rowFunc={this.zimFileTableRow}
+                rowFunc={(i, sortData) => this.zimFileTableRow(i, sortData, this.fetchZims.bind(this))}
                 rowKey='path'
                 tableHeaders={zimFilesHeaders}
             />;
@@ -512,22 +544,25 @@ class ManageZim extends React.Component {
 
             <Divider/>
 
+            <DownloadMessage/>
             <ViewerMessage/>
         </PageContainer>
     }
 }
 
-function ZimViewer() {
-    return <iframe
-        title='zim'
-        src={VIEWER_URL}
-        style={{
-            position: 'fixed',
-            height: '100%',
-            width: '100%',
-            border: 'none',
-            backgroundColor: '#FFFFFF',
-        }}/>
+function ZimViewer({src = ZIM_VIEWER_URI, style = null}) {
+    const fallback = <Segment>
+        <Header as='h3'>Failed to fetch Zim service.</Header>
+        <p>You may need to give permission to access the page: <a href={src}>{src}</a></p>
+
+        <p>If the above does not work, try starting the service:</p>
+        <pre>sudo systemctl start wrolpi-kiwix</pre>
+
+        <p>Check the logs</p>
+        <pre>journalctl -u wrolpi-kiwix</pre>
+    </Segment>;
+
+    return <IframeViewer title='zim' src={src} fallback={fallback} style={style}/>
 }
 
 export function ZimRoute() {

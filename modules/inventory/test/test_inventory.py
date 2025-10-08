@@ -1,20 +1,18 @@
 from decimal import Decimal
-from decimal import Decimal
 from itertools import zip_longest
 from typing import List, Iterable
 
 import pytest
 import sqlalchemy
-import yaml
 from pint import Quantity
 
 from wrolpi.common import Base
 from wrolpi.db import get_db_session
 from wrolpi.test.common import PytestCase
-from .. import init
+from .. import init_inventory
 from ..common import sum_by_key, get_inventory_by_category, get_inventory_by_subcategory, get_inventory_by_name, \
-    compact_unit, cleanup_quantity, save_inventories_file, import_inventories_file, get_inventories_config
-from ..errors import NoInventories, InventoriesVersionMismatch
+    compact_unit, cleanup_quantity, save_inventories_config, import_inventories_config
+from ..errors import NoInventories
 from ..inventory import get_inventories, save_inventory, update_inventory, \
     delete_inventory, get_categories, get_unit_registry
 from ..models import Item, Inventory
@@ -67,7 +65,7 @@ class TestInventory(PytestCase):
         """
         This exists rather than setUp because the DB is wrapped.
         """
-        init(force=True)
+        init_inventory(force=True)
 
         with get_db_session(commit=True) as session:
             for item in TEST_ITEMS:
@@ -266,54 +264,31 @@ def test_sum_by_key(items, expected):
     assert sum_by_key(items, lambda i: (i.category,)) == expected
 
 
-def test_no_inventories(test_session, test_directory):
+def test_no_inventories(async_client, test_session, test_directory):
     """Can't save empty inventories."""
     try:
-        save_inventories_file()
+        save_inventories_config()
     except NoInventories:
         pass
 
 
-def test_inventories_version(test_session, test_directory, init_test_inventory):
-    """You can't save over a newer version of an inventory."""
-    for item in TEST_ITEMS:
-        item = Item(**item)
-        test_session.add(item)
-    test_session.commit()
-
-    # Version is set to 1 on first save.
-    save_inventories_file()
-    config = get_inventories_config()
-    assert config.version == 1
-
-    # Version is incremented when saving.
-    save_inventories_file()
-    config = get_inventories_config()
-    assert config.version == 2
-
-    # Version is greater than what will be saved.
-    with config.get_file().open('wt') as fh:
-        config._config['version'] = 5
-        yaml.dump(config._config, fh)
-    with pytest.raises(InventoriesVersionMismatch):
-        save_inventories_file()
-
-
-def test_inventories_config(test_session, test_directory, init_test_inventory):
+@pytest.mark.asyncio
+async def test_inventories_config(await_switches, test_session, test_directory, init_test_inventory):
     for item in TEST_ITEMS:
         item = Item(**item)
         test_session.add(item)
     test_session.commit()
 
     # Save the Inventories/Items that were created above.
-    save_inventories_file()
+    save_inventories_config()
+    await await_switches()
 
     # Clear out the DB so the import will be tested
     test_session.query(Item).delete()
     test_session.query(Inventory).delete()
     test_session.commit()
 
-    import_inventories_file()
+    import_inventories_config()
 
     inventories = get_inventories()
     assert len(inventories) == 1
@@ -327,3 +302,16 @@ def test_inventories_config(test_session, test_directory, init_test_inventory):
     test_items = {(i['name'], i['brand'], i['count']) for i in TEST_ITEMS[:-1]}
     db_items = {(i.name, i.brand, i.count) for i in non_deleted_items}
     assert test_items == db_items
+
+    # An extra Inventory with items should be deleted from the DB.
+    inventory = Inventory(name='delete me')
+    test_session.add(inventory)
+    inventory.flush()
+    test_session.add(Item(inventory_id=inventory.id))
+    test_session.commit()
+    assert test_session.query(Inventory).count() == 2
+    assert {i for i, in test_session.query(Inventory.name)} == {'Food Storage', 'delete me'}
+
+    import_inventories_config()
+    assert test_session.query(Inventory).count() == 1
+    assert test_session.query(Inventory).one().name == 'Food Storage'

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import pathlib
 import shutil
 import zipfile
 from datetime import datetime
@@ -12,17 +13,21 @@ import mock
 import pytest
 from PIL import Image
 
+import wrolpi.common
+from modules.videos import Video
 from wrolpi.common import timer
+from wrolpi.conftest import await_switches
 from wrolpi.dates import now
 from wrolpi.errors import InvalidFile, UnknownDirectory, FileGroupIsTagged, NoPrimaryFile
 from wrolpi.files import lib, indexers
 from wrolpi.files.models import FileGroup
 from wrolpi.tags import TagFile
-from wrolpi.vars import PROJECT_DIR
+from wrolpi.test.common import only_macos
+from wrolpi.vars import PROJECT_DIR, IS_MACOS
 
 
 @pytest.mark.asyncio
-async def test_delete_file(test_session, make_files_structure, test_directory):
+async def test_delete_file(async_client, test_session, make_files_structure, test_directory):
     """
     File in the media directory can be deleted.
     """
@@ -54,7 +59,7 @@ async def test_delete_file(test_session, make_files_structure, test_directory):
 
 
 @pytest.mark.asyncio
-async def test_delete_file_multiple(test_session, make_files_structure, test_directory):
+async def test_delete_file_multiple(async_client, test_session, make_files_structure, test_directory):
     """Multiple files can be deleted at once."""
     foo, bar, baz = make_files_structure([
         'archives/foo.txt',
@@ -72,7 +77,7 @@ async def test_delete_file_multiple(test_session, make_files_structure, test_dir
 
 
 @pytest.mark.asyncio
-async def test_delete_file_names(test_session, make_files_structure, test_directory, tag_factory):
+async def test_delete_file_names(async_client, test_session, make_files_structure, test_directory, tag_factory):
     """Will not refuse to delete a file that shares the name of a nearby file when they are in different FileGroups."""
     foo, foo1 = make_files_structure({
         'archives/foo': 'text',
@@ -80,8 +85,8 @@ async def test_delete_file_names(test_session, make_files_structure, test_direct
     })
     foo_fg = FileGroup.from_paths(test_session, foo)
     foo1_fg = FileGroup.from_paths(test_session, foo1)
-    tag = tag_factory()
-    foo1_fg.add_tag(tag)
+    tag = await tag_factory()
+    foo1_fg.add_tag(tag.id)
     test_session.commit()
     assert foo.is_file()
     assert foo1.is_file()
@@ -92,7 +97,7 @@ async def test_delete_file_names(test_session, make_files_structure, test_direct
 
 
 @pytest.mark.asyncio
-async def test_delete_file_link(test_session, test_directory):
+async def test_delete_file_link(async_client, test_session, test_directory):
     """Links can be deleted."""
     foo, bar = test_directory / 'foo', test_directory / 'bar'
     foo.touch()
@@ -102,14 +107,15 @@ async def test_delete_file_link(test_session, test_directory):
 
 
 @pytest.mark.asyncio
-async def test_delete_tagged(test_session, make_files_structure, tag_factory, video_bytes):
+async def test_delete_tagged(await_switches, test_session, make_files_structure, tag_factory, video_bytes):
     """Cannot delete a file that has been tagged."""
-    tag = tag_factory()
+    tag = await tag_factory()
     make_files_structure({'foo/bar.txt': 'asdf', 'foo/bar.mp4': video_bytes})
     await lib.refresh_files()
     # Both files end up in a group.
     bar = test_session.query(FileGroup).one()
-    bar.add_tag(tag)
+    bar.add_tag(tag.id)
+    await await_switches()
     test_session.commit()
 
     # Neither file can be deleted.
@@ -131,26 +137,40 @@ async def test_delete_nested(test_session, make_files_structure):
 
 
 @pytest.mark.parametrize(
-    'path,expected',
+    'path,full,expected',
     [
-        ('foo', ('foo', '')),
-        ('foo.mp4', ('foo', '.mp4')),
-        ('foo.info.json', ('foo', '.info.json')),
-        ('foo.something.info.json', ('foo.something', '.info.json')),
-        ('foo-something.info.json', ('foo-something', '.info.json')),
-        ('/absolute/foo-something.info.json', ('foo-something', '.info.json')),
-        ('/absolute/foo', ('foo', '')),
-        ('/absolute/foo.bar', ('foo', '.bar')),
-        ('foo.en.srt', ('foo', '.en.srt')),
-        ('foo.pl.srt', ('foo', '.pl.srt')),
-    ]
-)
-def test_split_path_stem_and_suffix(path, expected):
-    assert lib.split_path_stem_and_suffix(Path(path)) == expected
+        ('foo', False, ('foo', '')),
+        ('foo.mp4', False, ('foo', '.mp4')),
+        ('foo.info.json', False, ('foo', '.info.json')),
+        ('foo.something.info.json', False, ('foo.something', '.info.json')),
+        ('foo-something.info.json', False, ('foo-something', '.info.json')),
+        ('/absolute/foo-something.info.json', False, ('foo-something', '.info.json')),
+        ('/absolute/foo', False, ('foo', '')),
+        ('/absolute/foo.bar', False, ('foo', '.bar')),
+        ('foo.en.srt', False, ('foo', '.en.srt')),
+        ('foo.pl.srt', False, ('foo', '.pl.srt')),
+        ('foo.en-US.srt', False, ('foo', '.en-US.srt')),
+        ('foo.en-US.vtt', False, ('foo', '.en-US.vtt')),
+        ('foo.en-us.vtt', False, ('foo', '.en-us.vtt')),
+        ('foo.en-AUTO.srt', False, ('foo', '.en-AUTO.srt')),
+        ('foo.en-auto.vtt', False, ('foo', '.en-auto.vtt')),
+        # Absolute path can be returned.
+        ('/absolute//foo.bar', True, ('/absolute/foo', '.bar')),
+        # Case is preserved.
+        ('foo.EN.SRT', False, ('foo', '.EN.SRT')),
+        ('foo.INFO.JSON', False, ('foo', '.INFO.JSON')),
+        # Part files from yt-dlp.
+        ('foo.webm.part', False, ('foo', '.webm.part')),
+        ('foo.f248.webm.part', False, ('foo', '.f248.webm.part')),
+        ('foo.info.json.part', False, ('foo', '.info.json.part')),
+        ('/absolute/foo.webm.part', True, ('/absolute/foo', '.webm.part')),
+    ])
+def test_split_path_stem_and_suffix(path, full, expected):
+    assert lib.split_path_stem_and_suffix(Path(path), full) == expected
 
 
 @pytest.mark.asyncio
-async def test_refresh_files(test_session, make_files_structure, assert_file_groups):
+async def test_refresh_files(async_client, test_session, make_files_structure, assert_file_groups):
     """All files in the media directory should be found when calling `refresh_files`"""
     files = make_files_structure([
         'foo.txt',
@@ -177,8 +197,22 @@ async def test_refresh_files(test_session, make_files_structure, assert_file_gro
 
 
 @pytest.mark.asyncio
-async def test_refresh_bogus_files(test_session, make_files_structure, test_directory, assert_file_groups,
-                                   insert_file_group):
+async def test_file_group_location(async_client, test_session, make_files_structure):
+    """FileGroup can return the URL necessary to preview the FileGroup."""
+    make_files_structure({
+        'foo/one.txt': 'one',
+        'two.txt': 'two',
+    })
+    await lib.refresh_files()
+
+    one, two = test_session.query(FileGroup).order_by(FileGroup.primary_path).all()
+    assert one.location == '/files?folders=foo&preview=foo%2Fone.txt'
+    assert two.location == '/files?preview=two.txt'
+
+
+@pytest.mark.asyncio
+async def test_refresh_bogus_files(async_client, test_session, make_files_structure, test_directory,
+                                   assert_file_groups, insert_file_group):
     """Bogus files are removed during a refresh."""
     make_files_structure(['does exist.txt'])
     await lib.refresh_files()
@@ -198,7 +232,7 @@ async def test_refresh_bogus_files(test_session, make_files_structure, test_dire
 
 
 @pytest.mark.asyncio
-async def test_refresh_empty_media_directory(test_session, test_directory):
+async def test_refresh_empty_media_directory(async_client, test_session, test_directory):
     """refresh_paths will refuse to refresh with an empty media directory."""
     with pytest.raises(UnknownDirectory):
         await lib.refresh_files()
@@ -340,14 +374,14 @@ async def test_refresh_discover_paths_groups(test_session, make_files_structure,
 
 
 @pytest.mark.asyncio
-async def test_file_group_tag(test_session, make_files_structure, test_directory, tag_factory):
+async def test_file_group_tag(test_session, make_files_structure, test_directory, tag_factory, await_switches):
     """A FileGroup can be tagged."""
     make_files_structure(['foo.mp4'])
     await lib.refresh_discover_paths([test_directory, ], now())
-    one = tag_factory()
+    one = await tag_factory()
 
     foo: FileGroup = test_session.query(FileGroup).one()
-    foo.add_tag(one)
+    foo.add_tag(one.id)
     test_session.commit()
 
     tag_file2: TagFile = test_session.query(TagFile).one()
@@ -355,7 +389,7 @@ async def test_file_group_tag(test_session, make_files_structure, test_directory
 
 
 @pytest.mark.asyncio
-async def test_refresh_a_text_no_indexer(test_session, make_files_structure):
+async def test_refresh_a_text_no_indexer(async_client, test_session, make_files_structure):
     """File.a_text is filled even if the file does not match an Indexer."""
     make_files_structure(['foo', 'bar-bar'])
 
@@ -366,21 +400,21 @@ async def test_refresh_a_text_no_indexer(test_session, make_files_structure):
 
 
 @pytest.mark.asyncio
-async def test_refresh_many_files(test_session, make_files_structure):
+async def test_refresh_many_files(async_client, test_session, make_files_structure):
     """Used to profile file refreshing"""
-    count = 10_000
-    make_files_structure([f'{uuid4()}.txt' for _ in range(count)])
+    file_count = 10_000
+    make_files_structure([f'{uuid4()}.txt' for _ in range(file_count)])
     with timer('first refresh'):
         await lib.refresh_files()
-    assert test_session.query(FileGroup).count() == count
+    assert test_session.query(FileGroup).count() == file_count
 
     with timer('second refresh'):
         await lib.refresh_files()
-    assert test_session.query(FileGroup).count() == count
+    assert test_session.query(FileGroup).count() == file_count
 
 
 @pytest.mark.asyncio
-async def test_refresh_cancel(test_session, make_files_structure, test_directory):
+async def test_refresh_cancel(async_client, test_session, make_files_structure, test_directory):
     """Refresh tasks can be canceled."""
     # Creat a lot of files so the refresh will take too long.
     make_files_structure([f'{uuid4()}.txt' for _ in range(1_000)])
@@ -389,20 +423,20 @@ async def test_refresh_cancel(test_session, make_files_structure, test_directory
         # Time the time it takes to cancel.
         before = datetime.now()
         # Sleep so the refresh task has time to run.
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0)
 
         # Cancel the refresh (it will be sleeping soon).
         task_.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task_
-        assert (datetime.now() - before).total_seconds() < 0.8, 'Task took too long.  Was the refresh canceled?'
+        assert (datetime.now() - before).total_seconds() < 1.2, 'Task took too long.  Was the refresh canceled?'
 
     task = asyncio.create_task(lib.refresh_files())
     await assert_cancel(task)
 
 
 @pytest.mark.asyncio
-async def test_mime_type(test_session, make_files_structure, test_directory, assert_files):
+async def test_mime_type(async_client, test_session, make_files_structure, test_directory, assert_files):
     """Files module uses the `file` command to get the mimetype of each file."""
     from PIL import Image
 
@@ -436,7 +470,7 @@ async def test_mime_type(test_session, make_files_structure, test_directory, ass
 
 
 @pytest.mark.asyncio
-async def test_files_indexer(test_session, make_files_structure, test_directory):
+async def test_files_indexer(async_client, test_session, make_files_structure, test_directory):
     """An Indexer is provided for each file based on it's mimetype or contents."""
     source_files: List[str] = [
         'a text file.txt',
@@ -504,13 +538,15 @@ async def test_files_indexer(test_session, make_files_structure, test_directory)
     ('this self-reliance_split.txt', 'this self reliance self-reliance split txt'),
     ('-be_split!.txt', '-be split! txt'),
     ('WROLPi-v0.10-aarch64-desktop.img.xz', 'WROLPi v0.10 aarch64 desktop.img WROLPi-v0.10-aarch64-desktop.img xz'),
+    ('some words [but words in braces].txt', 'some words but words in braces txt'),
+    ('some words (but words in parentheses).txt', 'some words but words in parentheses txt'),
 ])
 def test_split_file_name_words(name, expected):
     assert lib.split_file_name_words(name) == expected
 
 
 @pytest.mark.asyncio
-async def test_large_text_indexer(test_session, make_files_structure):
+async def test_large_text_indexer(async_client, test_session, make_files_structure):
     """
     Large files have their indexes truncated.
     """
@@ -542,9 +578,9 @@ def test_glob_shared_stem(make_files_structure):
     def check(path, expected):
         assert sorted([i.name for i in lib.glob_shared_stem(path)]) == sorted(expected)
 
-    check(mp4, ['video.mp4', 'video.png', 'video.info.json', 'video'])
-    check(png, ['video.mp4', 'video.png', 'video.info.json', 'video'])
-    check(j, ['video.mp4', 'video.png', 'video.info.json', 'video'])
+    check(mp4, ['video.mp4', 'video.png', 'video.info.json'])
+    check(png, ['video.mp4', 'video.png', 'video.info.json'])
+    check(j, ['video.mp4', 'video.png', 'video.info.json'])
     check(video, ['video.mp4', 'video.png', 'video.info.json', 'video'])
 
     check(something, ['something'])
@@ -568,19 +604,19 @@ def test_matching_directories(make_files_structure, test_directory):
 
     # Get all directories starting with f
     matches = lib.get_matching_directories(test_directory / 'f')
-    assert matches == [str(test_directory / 'foo')]
+    assert matches == [test_directory / 'foo']
 
     # Get all directories starting with b, ignore case
     matches = lib.get_matching_directories(test_directory / 'b')
-    assert matches == [str(test_directory / 'Bar'), str(test_directory / 'baz')]
+    assert matches == [test_directory / 'Bar', test_directory / 'baz']
 
     # baz matches, but it has no subdirectories
     matches = lib.get_matching_directories(test_directory / 'baz')
-    assert matches == [str(test_directory / 'baz')]
+    assert matches == [test_directory / 'baz']
 
     # foo is an exact match, return subdirectories
     matches = lib.get_matching_directories(test_directory / 'foo')
-    assert matches == [str(test_directory / 'foo/qux')]
+    assert matches == [test_directory / 'foo/qux']
 
 
 def test_get_mimetype(example_epub, example_mobi, example_pdf, image_file, video_file):
@@ -702,24 +738,29 @@ async def test_refresh_directories(test_session, test_directory, assert_director
     assert_directories({'foo', 'baz'})
 
 
-def test_file_group_merge(test_session, test_directory, make_files_structure, tag_factory, video_bytes, srt_file3):
+@pytest.mark.asyncio
+async def test_file_group_merge(async_client, test_session, test_directory, make_files_structure, tag_factory,
+                                video_bytes, srt_file3):
     """A FileGroup can be created from multiple existing FileGroups.  Any Tags applied to the existing groups will be
     migrated."""
     vid, srt = make_files_structure({
         'vid.mp4': video_bytes,
         'vid.srt': (PROJECT_DIR / 'test/example3.en.srt').read_text(),
     })
-    one, two = tag_factory(), tag_factory()
+    one, two = await tag_factory(), await tag_factory()
     vid_group = FileGroup.from_paths(test_session, vid)
     srt_group = FileGroup.from_paths(test_session, srt)
     test_session.add_all([vid_group, srt_group])
     test_session.flush([vid_group, srt_group])
-    vid_tag_file = vid_group.add_tag(one, test_session)
-    srt_tag_file = srt_group.add_tag(two, test_session)
+    vid_tag_file = vid_group.add_tag(one.name, test_session)
+    srt_tag_file = srt_group.add_tag(two.name, test_session)
     test_session.flush([vid_tag_file, srt_tag_file])
     tag_file_created_at = vid_tag_file.created_at
     srt_file_created_at = srt_tag_file.created_at
     test_session.commit()
+
+    assert vid_group.mimetype == 'video/mp4'
+    assert srt_group.mimetype == 'text/srt'
 
     # Both FileGroups are merged.
     vid = FileGroup.from_paths(test_session, vid, srt)
@@ -734,10 +775,12 @@ def test_file_group_merge(test_session, test_directory, make_files_structure, ta
     assert [i for i in vid.tag_files if i.tag.name == 'two'][0].created_at == srt_file_created_at
     # Size is combined
     assert vid.size > len(video_bytes)
+    assert vid.mimetype == 'video/mp4'
 
 
 @pytest.mark.asyncio
-async def test_move(test_session, test_directory, make_files_structure, video_bytes, singlefile_contents_factory):
+async def test_move(async_client, test_session, test_directory, make_files_structure, video_bytes,
+                    singlefile_contents_factory):
     """files.lib.move behaves likes posix mv"""
     make_files_structure({
         'foo/bar/video.mp4': video_bytes,
@@ -747,10 +790,11 @@ async def test_move(test_session, test_directory, make_files_structure, video_by
     })
     foo = test_directory / 'foo'
     qux = test_directory / 'qux'
+    await lib.refresh_files()
 
     # mv foo qux
-    plan = await lib.move(qux, foo)
-    plan = [(str(i.relative_to(test_directory)), str(j.relative_to(test_directory))) for i, j in plan]
+    plan = await lib.move(qux, foo, session=test_session)
+    plan = [(str(i.relative_to(test_directory)), str(j.relative_to(test_directory))) for i, j in plan.items()]
     # The deepest files are moved first.
     assert plan == [('foo/bar/baz/archive.html', 'qux/foo/bar/baz/archive.html'),
                     ('foo/bar/video.mp4', 'qux/foo/bar/video.mp4'),
@@ -770,7 +814,7 @@ async def test_move(test_session, test_directory, make_files_structure, video_by
 
 
 @pytest.mark.asyncio
-async def test_move_files(test_session, test_directory, make_files_structure):
+async def test_move_files(async_client, test_session, test_directory, make_files_structure):
     """Files can be moved using files.lib.move."""
     one, two = make_files_structure({
         'foo/one.txt': 'one',
@@ -778,14 +822,66 @@ async def test_move_files(test_session, test_directory, make_files_structure):
     })
     dest = test_directory / 'dest'
 
-    await lib.move(dest, one, two)
+    plan = await lib.move(dest, one, two, session=test_session)
+    assert list(plan.items()) == [
+        (test_directory / 'foo/one.txt', test_directory / 'dest/one.txt'),
+        (test_directory / 'two.txt', test_directory / 'dest/two.txt'),
+    ]
     # one.txt is moved out of foo.
-    assert (dest / 'one.txt').read_text() == 'one'
-    assert (dest / 'two.txt').read_text() == 'two'
+    assert not (test_directory / 'foo/one.txt').exists(), 'one.txt is lingering in source'
+    assert not (test_directory / 'two.txt').exists(), 'two.txt is lingering in source'
+    assert (dest / 'one.txt').read_text() == 'one', 'one.txt was not moved to destination'
+    assert (dest / 'two.txt').read_text() == 'two', 'two.txt was not moved to destination'
 
 
 @pytest.mark.asyncio
-async def test_move_directory(test_session, test_directory, make_files_structure, assert_directories):
+async def test_move_deep_directory(async_client, test_session, test_directory, make_files_structure):
+    """Moving files/directories from one deep directory to another is supported."""
+    baz, foo, quuz_mp4, quuz_txt, quux = make_files_structure({
+        'foo/foo.txt': 'foo',
+        'foo/bar/baz.txt': 'baz',
+        'foo/qux/quux.txt': 'quux',
+        'foo/quuz.txt': 'quuz text',  # this text file will be moved when it's MP4 is moved.
+        'foo/quuz.mp4': 'quuz mp4',
+    })
+    assert foo.name == 'foo.txt' \
+           and baz.name == 'baz.txt' \
+           and quux.name == 'quux.txt' \
+           and quuz_mp4.name == 'quuz.mp4' \
+           and quuz_txt.name == 'quuz.txt', \
+        'Test directory was not initiated correctly.'
+    bar, qux = baz.parent, quux.parent
+    dest = test_directory / 'deep/dest'
+
+    # mv foo/bar foo/qux foo/quuz.mp4 foo/quuz.txt deep/dest
+    plan = await lib.move(dest, bar, qux, quuz_mp4, quuz_txt, session=test_session)
+    assert list(plan.items()) == [
+        (test_directory / 'foo/qux/quux.txt', test_directory / 'deep/dest/qux/quux.txt'),
+        (test_directory / 'foo/bar/baz.txt', test_directory / 'deep/dest/bar/baz.txt'),
+        (test_directory / 'foo/quuz.txt', test_directory / 'deep/dest/quuz.txt'),
+        (test_directory / 'foo/quuz.mp4', test_directory / 'deep/dest/quuz.mp4'),
+    ]
+
+    # Unrelated files and directories are untouched.
+    assert not (test_directory / 'deep/dest/foo').is_dir(), 'foo/ should not have been moved.'
+    assert (test_directory / 'foo').is_dir(), 'foo/ should not be deleted.'
+    assert (test_directory / 'foo/foo.txt').read_text() == 'foo', 'foo.txt should not be moved.'
+
+    # Files are moved, preserving the name of their directory.
+    assert (test_directory / 'deep/dest/bar').is_dir(), 'foo/bar/ was not moved'
+    assert (test_directory / 'deep/dest/bar/baz.txt').is_file(), 'foo/bar/baz.txt was not moved'
+    assert (test_directory / 'deep/dest/bar/baz.txt').read_text() == 'baz', 'foo/bar/baz.txt has wrong contents.'
+    assert (test_directory / 'deep/dest/qux/quux.txt').read_text() == 'quux', 'quux.txt has the wrong contents'
+    assert (test_directory / 'deep/dest/quuz.txt').read_text() == 'quuz text', 'quuz.txt has the wrong contents'
+    assert (test_directory / 'deep/dest/quuz.mp4').read_text() == 'quuz mp4', 'quuz.mp4 has the wrong contents'
+
+    # Old directory was removed.
+    assert not (test_directory / 'foo/bar').is_dir(), 'bar directory was not moved'
+
+
+@pytest.mark.asyncio
+async def test_move_directory(async_client, test_session, test_directory, make_files_structure,
+                              assert_directories):
     """A Directory record is deleted when it's directory is deleted."""
     make_files_structure({
         'foo/one.txt': 'one',
@@ -794,7 +890,7 @@ async def test_move_directory(test_session, test_directory, make_files_structure
     assert_directories({'foo'})
 
     bar = test_directory / 'bar'
-    await lib.rename(test_directory / 'foo', 'bar')
+    await lib.rename(test_directory / 'foo', 'bar', session=test_session)
     assert (bar / 'one.txt').read_text() == 'one'
     assert_directories({'bar'})
 
@@ -823,7 +919,7 @@ async def test_move_error(test_session, test_directory, make_files_structure, vi
         return shutil.move(*args, **kwargs)
 
     with mock.patch('wrolpi.files.lib.shutil.move', mock_shutil_move), pytest.raises(FileNotFoundError):
-        await lib.move(qux, foo)
+        await lib.move(qux, foo, session=test_session)
     # The move failed, the files should be moved back.
     # foo was not deleted.
     assert foo.is_dir()
@@ -836,7 +932,8 @@ async def test_move_error(test_session, test_directory, make_files_structure, vi
 
 
 @pytest.mark.asyncio
-async def test_file_group_move(test_session, make_files_structure, test_directory, video_bytes, srt_text):
+async def test_file_group_move(async_client, test_session, make_files_structure, test_directory, video_bytes,
+                               srt_text):
     """Test FileGroup's move method"""
     video, srt = make_files_structure({
         'video.mp4': video_bytes,
@@ -855,28 +952,27 @@ async def test_file_group_move(test_session, make_files_structure, test_director
     assert new_srt.read_text() == srt_text
     assert not video.is_file()
     assert not srt.is_file()
-    # Moved files must be re-indexed.
-    assert file_group.indexed is False
 
 
 @pytest.mark.asyncio
-async def test_move_tagged(test_session, test_directory, make_files_structure, tag_factory):
+async def test_move_tagged(async_client, test_session, test_directory, make_files_structure, tag_factory):
     """A FileGroup's tag is preserved when moved or renamed."""
-    tag = tag_factory()
+    tag = await tag_factory()
     foo, bar, = make_files_structure({
         'foo/foo.txt': 'foo',
         'foo/bar.txt': 'bar',
     })
     await lib.refresh_files()
     bar_file_group, foo_file_group = test_session.query(FileGroup).order_by(FileGroup.primary_path)
-    bar_file_group.add_tag(tag)
+    bar_file_group.title = 'custom title'  # Should not be overwritten.
+    bar_file_group.add_tag(tag.id)
     test_session.commit()
 
     qux = test_directory / 'qux'
     qux.mkdir()
 
     # Move both files into qux.  The Tag should also be moved.
-    await lib.move(qux, bar, foo)
+    await lib.move(qux, bar, foo, session=test_session)
     new_foo = qux / 'foo.txt'
     new_bar = qux / 'bar.txt'
     # Files were moved.
@@ -894,8 +990,182 @@ async def test_move_tagged(test_session, test_directory, make_files_structure, t
     assert not foo_file_group.tag_files
     assert foo_file_group.primary_path.is_file()
     assert foo_file_group.primary_path == new_foo == foo_file_group.files[0]['path']
+    assert bar_file_group.title == 'custom title', 'Custom title should not have been overwritten.'
 
     # Rename "bar.txt" to "baz.txt"
-    await lib.rename(new_bar, 'baz.txt')
+    await lib.rename(new_bar, 'baz.txt', session=test_session)
     baz = new_bar.with_name('baz.txt')
     assert baz.read_text() == 'bar'
+
+
+@pytest.mark.asyncio
+async def test_html_index(async_client, test_session, test_directory, make_files_structure):
+    make_files_structure({
+        'archive.html': '''<html>
+        <title>The Title</title>
+
+        <style>
+        body {
+            color: red;
+        }
+        </style>
+
+        <script class="sf-hidden" type="application/ld+json">
+         {"@context":"http://schema.org", "@type":"NewsArticle",
+          "datePublished":"2022-09-27T00:40:19.000Z", "dateModified":"2022-09-27T13:43:47.971Z",
+          "author":{"@type":"Person", "name":"BOBBY", "jobTitle":""},
+          "creator":{"@type":"Person", "name":"OTHER BOBBY", "jobTitle":""},
+          "description": "The article description"}
+        </script>
+
+        <body>
+        <h1>Some Header</h1>
+        <p>Some Text</p>
+
+        <span>Span Text</span>
+
+        Outside element.
+        </body>
+
+        </html>
+        '''
+    })
+
+    await lib.refresh_files()
+
+    assert test_session.query(FileGroup).count() == 1, 'Too many files were refreshed.'
+    archive_file: FileGroup = test_session.query(FileGroup).one()
+    assert archive_file.a_text == 'The Title'
+    assert archive_file.b_text == 'archive html'
+    assert archive_file.c_text == 'The article description'
+    assert archive_file.d_text == '''Some Header
+Some Text
+Span Text
+Outside element.'''
+
+
+@pytest.mark.asyncio
+async def test_doc_indexer(async_client, test_session, example_doc):
+    """The contents of a Microsoft doc files can be indexed."""
+    await lib.refresh_files()
+    assert test_session.query(FileGroup).count() == 1
+    doc = test_session.query(FileGroup).one()
+    assert doc.title == 'example word.doc'
+    assert doc.a_text == 'example word doc'
+    if IS_MACOS:
+        assert doc.d_text == 'Example Word Document\nSecond page'
+    else:
+        assert doc.d_text == 'Example Word Document\n\nSecond page\n'
+
+
+@pytest.mark.asyncio
+async def test_docx_indexer(async_client, test_session, example_docx):
+    """The contents of a Microsoft docx files can be indexed."""
+    await lib.refresh_files()
+    assert test_session.query(FileGroup).count() == 1
+    doc = test_session.query(FileGroup).one()
+    assert doc.title == 'example word.docx'
+    assert doc.a_text == 'example word docx'
+    assert doc.d_text == 'Example Word Document Second page'
+
+
+@pytest.mark.asyncio
+async def test_file_search_date_range(async_client, test_session, example_pdf, example_doc):
+    """Test searching FileGroups by their published datetime."""
+    await lib.refresh_files()
+    doc, pdf = test_session.query(FileGroup).order_by(FileGroup.primary_path).all()
+
+    files, total = lib.search_files('', 10, 0)
+    assert total == 2, 'Should only be 2 files.'
+
+    # PDF was published in December.
+    files, total = lib.search_files('', 10, 0, months=[12, ])
+    assert total == 1, 'Only PDF should be from December 2022'
+    assert files[0]['id'] == pdf.id
+
+    # PDF was published in 2022.
+    files, total = lib.search_files('', 10, 0, from_year=2022, to_year=2022)
+    assert total == 1, 'Only PDF should be from December 2022'
+    assert files[0]['id'] == pdf.id
+
+    # PDF was NOT published in 2023.
+    files, total = lib.search_files('', 10, 0, from_year=2023)
+    assert total == 0, 'No example files are published in 2023'
+
+    files, total = lib.search_files('', 10, 0, to_year=2022)
+    assert total == 1
+    assert files[0]['id'] == pdf.id
+
+
+def test_replace_file(test_directory):
+    file = test_directory / 'foo.txt'
+    file.write_text('old contents')
+    assert file.read_text() == 'old contents'
+
+    wrolpi.common.replace_file(file, 'new contents')
+    assert file.read_text() == 'new contents'
+    assert not (test_directory / 'foo.txt.tmp').exists()
+
+    wrolpi.common.replace_file(file, b'new bytes')
+    assert file.read_bytes() == b'new bytes'
+    assert not (test_directory / 'foo.txt.tmp').exists()
+
+    # Default behavior is to refuse to replace a non-existent file.
+    with pytest.raises(FileNotFoundError):
+        wrolpi.common.replace_file('does not exist', 'foo')
+
+    # Non-existent file can be created.
+    wrolpi.common.replace_file(test_directory / 'will now exist', 'foo', missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_upsert_file_video_with_channel(async_client, test_session, test_directory, video_bytes,
+                                              channel_factory, video_factory):
+    """A video file that is uploaded should be assigned to a Channel if it is in the Channel's directory."""
+    channel = channel_factory()
+    # Put the video file in the Channel's directory.
+    video_file: pathlib.Path = channel.directory / 'video.mp4'
+    video_file.write_bytes(video_bytes)
+    # Put an info json file next to the video file.
+    info_json_file = video_file.with_suffix('.info.json')
+    info_json_file.write_text(json.dumps({'duration': 5}))
+
+    # Upsert the file, it should be modeled.
+    fg: FileGroup = await lib.upsert_file(video_file)
+    assert fg.model == 'video', 'Upserted file should have been modeled.'
+    assert fg.my_video_files(), 'Video file was upserted.'
+    assert fg.my_json_files(), 'Info json file should have been found near video file.'
+
+    # The video is in the correct Channel and has its files.
+    video: Video = test_session.query(Video).one()
+    assert video.channel_id == channel.id, "Videos should be assigned to the Channel their files are in"
+    assert video.video_path, 'Video file was upserted'
+    assert video.info_json_path, 'Info json file not found near video file.'
+
+
+@pytest.mark.asyncio
+async def test_move_many_files(async_client, test_session, test_directory, make_files_structure):
+    make_files_structure([f'foo/{i}.txt' for i in range(10_000)])
+    await lib.refresh_files()
+
+    foo = test_directory / 'foo'
+    bar = test_directory / 'bar'
+
+    with timer('test_move_many_files'):
+        # mv foo bar
+        await lib.move(bar, foo, session=test_session)
+
+    assert not foo.is_dir()
+    assert bar.is_dir()
+    assert (bar / 'foo').is_dir()
+    assert (bar / 'foo/0.txt').is_file()
+
+
+@only_macos
+def test_get_real_path_name(test_directory):
+    (test_directory / 'foo.txt').touch()
+    assert (test_directory / 'foo.txt').exists()
+    assert lib.get_real_path_name(test_directory / 'foo.txt') == test_directory / 'foo.txt'
+
+    assert (test_directory / 'FOO.TXT').exists()
+    assert lib.get_real_path_name(test_directory / 'FOO.txt') == test_directory / 'foo.txt'

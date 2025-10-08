@@ -2,7 +2,7 @@
 # https://live-team.pages.debian.net/live-manual/html/live-manual/index.en.html
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-BUILD_DIR=/tmp/wrolpi-build
+BUILD_DIR=/tmp/wrolpi-build-debian
 
 VERSION=$(cat "${SCRIPT_DIR}/../wrolpi/version.txt")
 
@@ -12,8 +12,8 @@ if [ $EUID != 0 ]; then
   exit $?
 fi
 
-if [ ! -f "${SCRIPT_DIR}/config/includes.chroot/opt/wrolpi-blobs/gis-map.dump.gz" ]; then
-  echo "config/includes.chroot/opt/wrolpi-blobs/gis-map.dump.gz does not exist!"
+if [ ! -f "${SCRIPT_DIR}/config/includes.chroot/opt/wrolpi-blobs/map-db-gis.dump" ]; then
+  echo "config/includes.chroot/opt/wrolpi-blobs/map-db-gis.dump does not exist!"
   exit 1
 fi
 

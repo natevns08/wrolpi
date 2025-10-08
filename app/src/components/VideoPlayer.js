@@ -1,14 +1,16 @@
 import React, {useContext} from 'react';
-import {deleteVideos, tagFileGroup, untagFileGroup} from "../api";
+import {deleteVideos, downloadVideoMetadata, tagFileGroup, untagFileGroup} from "../api";
 import {Link, useNavigate, useParams} from "react-router-dom";
 import _ from "lodash";
 import {
     APIButton,
     BackButton,
     encodeMediaPath,
+    getParentDirectory,
     humanFileSize,
     humanNumber,
-    isoDatetimeToString,
+    isoDatetimeToAgoPopup,
+    MultilineText,
     PageContainer,
     PreviewPath,
     useTitle
@@ -16,12 +18,12 @@ import {
 import Grid from "semantic-ui-react/dist/commonjs/collections/Grid";
 import Container from "semantic-ui-react/dist/commonjs/elements/Container";
 import {VideoPlaceholder} from "./Placeholder";
-import {useChannel} from "../hooks/customHooks";
+import {useChannel, useVideoCaptions, useVideoExtras} from "../hooks/customHooks";
 import {ThemeContext} from "../contexts/contexts";
 import {Button, darkTheme, Header, Icon, Segment, Tab, TabPane} from "./Theme";
 import {VideoCard} from "./Videos";
 import {TagsSelector} from "../Tags";
-import {Label} from "semantic-ui-react";
+import {Comment, CommentGroup, Label} from "semantic-ui-react";
 
 const MEDIA_PATH = '/media';
 
@@ -67,6 +69,109 @@ export function CaptionTrack({src, ...props}) {
     return <track kind="captions" label="English" src={src} srcLang="en" default {...props}/>
 }
 
+const NoComments = ({video}) => {
+    const videoUrl = video.url;
+
+    const handleRefresh = async () => {
+        const destination = getParentDirectory(video.primary_path);
+        await downloadVideoMetadata(videoUrl, destination);
+    };
+
+    if (videoUrl) {
+        return <React.Fragment>
+            <p>No comments have been been downloaded. Refresh the video?</p>
+
+            <APIButton
+                color='blue'
+                size='large'
+                onClick={handleRefresh}
+            >Refresh</APIButton>
+        </React.Fragment>
+    } else {
+        return <React.Fragment>
+            <p>No comment have been downloaded. WROLPi does not know the URL of this video, so it cannot download
+                the comments.</p>
+
+            <big>Try finding and downloading the video again.</big>
+        </React.Fragment>
+    }
+}
+
+const VideoComment = ({comment, children}) => {
+    const {t} = React.useContext(ThemeContext);
+
+    const {is_favorited, like_count, author, timestamp, text, author_is_uploader} = comment;
+
+    // Author comments and favorited comments are important.
+    let specialIcon = null;
+    if (author_is_uploader) {
+        specialIcon = <Icon name='star' color='green'/>;
+    } else if (is_favorited) {
+        specialIcon = <Icon name='heart' color='red'/>;
+    }
+
+    const dateElm = <div {...t}>{isoDatetimeToAgoPopup(timestamp * 1000)}</div>;
+    const likesElm = like_count && <div {...t}>
+        <Icon name='thumbs up'/>{humanNumber(comment['like_count'])}
+    </div>;
+
+    return <Comment>
+        <Comment.Content>
+            <Comment.Author as='a'>
+                <span {...t}>{specialIcon}{author}</span>
+            </Comment.Author>
+            <Comment.Metadata>
+                {dateElm}
+                {likesElm}
+            </Comment.Metadata>
+            <Comment.Text {...t}>
+                <MultilineText text={text} style={{marginLeft: '0.5em'}}/>
+            </Comment.Text>
+        </Comment.Content>
+        {children && !_.isEmpty(children) &&
+            <CommentGroup>
+                {children.map((i, key) => <VideoComment key={key} comment={i}/>)}
+            </CommentGroup>
+        }
+    </Comment>
+}
+
+
+const Comments = ({comments, video}) => {
+    if (!comments || _.isEmpty(comments)) {
+        return <NoComments video={video}/>
+    }
+
+    comments.sort((a, b) => {
+        // Treat undefined like_count as 0
+        const likeA = a.like_count ?? 0;
+        const likeB = b.like_count ?? 0;
+
+        // For descending order
+        return likeB - likeA;
+    });
+
+    const rootComments = comments.filter(i => i['parent'] === 'root');
+
+    // Comments are in an array, convert it to a dict, grouped by their parent.
+    const groupedByParent = {};
+    comments.forEach(obj => {
+        if (!groupedByParent[obj.parent]) {
+            groupedByParent[obj.parent] = [];
+        }
+        groupedByParent[obj.parent].push(obj);
+    })
+    // Sort replies to each parent by the time they were created.
+    comments.forEach(obj => {
+        const children = groupedByParent[obj.parent];
+        groupedByParent[obj.parent] = _.sortBy(children, ['timestamp']);
+    })
+
+    return <CommentGroup>
+        {rootComments.map((i, key) => <VideoComment key={key} comment={i} children={groupedByParent[i.id]}/>)}
+    </CommentGroup>
+}
+
 function VideoPage({videoFile, prevFile, nextFile, fetchVideo, ...props}) {
     const {theme} = useContext(ThemeContext);
 
@@ -87,6 +192,7 @@ function VideoPage({videoFile, prevFile, nextFile, fetchVideo, ...props}) {
     // Get the Video's channel, fallback to the URL's channel id.
     const {channelId} = useParams();
     const {channel} = useChannel(video && video.channel_id ? video.channel_id : channelId);
+    const {comments, captions} = useVideoExtras(videoFile?.video?.id);
 
     if (videoFile === null) {
         return <VideoPlaceholder/>;
@@ -99,6 +205,11 @@ function VideoPage({videoFile, prevFile, nextFile, fetchVideo, ...props}) {
         await deleteVideos([video_id])
         navigate(-1);
     }
+
+    const handleRefresh = async () => {
+        const destination = getParentDirectory(videoFile.primary_path);
+        await downloadVideoMetadata(videoFile.url, destination);
+    };
 
     let videoUrl = `${MEDIA_PATH}/${encodeMediaPath(video.video_path)}`;
     let downloadUrl = `/download/${encodeMediaPath(video.video_path)}`;
@@ -116,7 +227,7 @@ function VideoPage({videoFile, prevFile, nextFile, fetchVideo, ...props}) {
         description = formatVideoDescription(description, setVideoTime)
     }
 
-    let descriptionPane = {
+    const descriptionPane = {
         menuItem: 'Description', render: () => <TabPane>
             <pre className="wrap-text">
                 {description}
@@ -124,28 +235,9 @@ function VideoPage({videoFile, prevFile, nextFile, fetchVideo, ...props}) {
         </TabPane>
     };
 
-    let aboutPane = {
-        menuItem: 'About', render: () => <TabPane>
-            <h3>Size</h3>
-            <p>{videoFile.size ? humanFileSize(videoFile.size) : 'Unknown'}</p>
-
-            <h3>Source URL</h3>
-            <p>{videoFile.url ? <a href={videoFile.url}>{videoFile.url}</a> : 'N/A'}</p>
-
-            <h3>View Count</h3>
-            <p>{video.view_count ? humanNumber(video.view_count) : 'N/A'}</p>
-
-            <h3>Censored</h3>
-            <p>{video.censored ? 'Yes' : 'No'}</p>
-
-            <h3>Codec Names</h3>
-            <>{video.codec_names ? video.codec_names.map(i => <Label key={i}>{i}</Label>) : 'N/A'}</>
-        </TabPane>
-    }
-
-    let captionsPane = {
+    const captionsPane = {
         menuItem: 'Captions', render: () => <TabPane>
-            <pre>{video.caption || 'No captions available.'}</pre>
+            <pre>{captions || 'No captions available.'}</pre>
         </TabPane>
     };
 
@@ -181,8 +273,48 @@ function VideoPage({videoFile, prevFile, nextFile, fetchVideo, ...props}) {
         </TabPane>
     }
 
-    const tabPanes = [descriptionPane, aboutPane, filesPane, captionsPane];
+    const commentsPane = {
+        menuItem: 'Comments', render: () => <TabPane>
+            <Header as='h3'>Top Comments</Header>
+            <Comments comments={comments} video={videoFile}/>
+        </TabPane>,
+    };
+
+    const tabPanes = [commentsPane, descriptionPane, filesPane, captionsPane];
     const tabMenu = theme === darkTheme ? {inverted: true, attached: true} : {attached: true};
+
+    const aboutSegment = <Segment>
+        <Header as='h2'>About Video</Header>
+
+        <Grid columns={2}>
+            <Grid.Row>
+                <Grid.Column>
+                    <h3>Size</h3>
+                    <p>{videoFile.size ? humanFileSize(videoFile.size) : 'Unknown'}</p>
+                </Grid.Column>
+                <Grid.Column>
+                    <h3>View Count</h3>
+                    <p>{video.view_count ? humanNumber(video.view_count) : 'N/A'}</p>
+                </Grid.Column>
+            </Grid.Row>
+            <Grid.Row>
+                <Grid.Column>
+                    <h3>Codec Names</h3>
+                    <>{video.codec_names ? video.codec_names.map(i => <Label key={i}>{i}</Label>) : 'N/A'}</>
+                </Grid.Column>
+                <Grid.Column>
+                    <h3>Censored</h3>
+                    <p>{videoFile.censored ? 'Yes' : 'No'}</p>
+                </Grid.Column>
+            </Grid.Row>
+            <Grid.Row columns={1}>
+                <Grid.Column>
+                    <h3>Source URL</h3>
+                    <p>{videoFile.url ? <a href={videoFile.url}>{videoFile.url}</a> : 'N/A'}</p>
+                </Grid.Column>
+            </Grid.Row>
+        </Grid>
+    </Segment>;
 
     const localAddTag = async (name) => {
         await tagFileGroup(videoFile, name);
@@ -225,6 +357,7 @@ function VideoPage({videoFile, prevFile, nextFile, fetchVideo, ...props}) {
         </Container>
 
         <video controls
+               className='video-player'
                autoPlay={props.autoplay !== undefined ? props.autoplay : true}
                poster={posterUrl}
                id="player"
@@ -241,7 +374,7 @@ function VideoPage({videoFile, prevFile, nextFile, fetchVideo, ...props}) {
             <Segment>
 
                 <Header as='h2'>{title}</Header>
-                {videoFile.published_datetime && <h3>{isoDatetimeToString(videoFile.published_datetime)}</h3>}
+                {videoFile.published_datetime && <h3>{isoDatetimeToAgoPopup(videoFile.published_datetime)}</h3>}
                 <h3>
                     {channel && <Link to={`/videos/channel/${channel.id}/video`}>
                         {channel.name}
@@ -260,13 +393,20 @@ function VideoPage({videoFile, prevFile, nextFile, fetchVideo, ...props}) {
                         onClick={async () => await handleDeleteVideo(video.id)}
                         obeyWROLMode={true}
                     >Delete</APIButton>
+                    <APIButton
+                        color='blue'
+                        onClick={handleRefresh}
+                        obeyWROLMode={true}
+                        disabled={!videoFile.url}
+                    >Refresh</APIButton>
                 </p>
-                <br/>
             </Segment>
 
             <Segment>
                 <TagsSelector selectedTagNames={videoFile['tags']} onAdd={localAddTag} onRemove={localRemoveTag}/>
             </Segment>
+
+            {aboutSegment}
 
             <Tab menu={tabMenu} panes={tabPanes}/>
 

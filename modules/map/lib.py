@@ -1,6 +1,5 @@
-import asyncio
 import subprocess
-from multiprocessing import Manager
+from datetime import timedelta
 from pathlib import Path
 from typing import List
 
@@ -8,29 +7,26 @@ from sqlalchemy.orm import Session
 
 from modules.map.models import MapFile
 from wrolpi import flags
-from wrolpi.cmd import SUDO_BIN
-from wrolpi.common import get_media_directory, walk, logger
-from wrolpi.dates import now, timedelta_to_timestamp, seconds_to_timestamp
+from wrolpi.api_utils import api_app
+from wrolpi.cmd import SUDO_BIN, run_command
+from wrolpi.common import get_media_directory, walk, logger, get_wrolpi_config
+from wrolpi.dates import timedelta_to_timestamp, seconds_to_timestamp, now
 from wrolpi.db import optional_session, get_db_session
 from wrolpi.events import Events
-from wrolpi.vars import PROJECT_DIR
+from wrolpi.vars import PROJECT_DIR, IS_RPI5
 
 logger = logger.getChild(__name__)
 
-IMPORTING = Manager().dict(dict(
-    pending=None,
-))
-
 
 def get_map_directory() -> Path:
-    map_directory = get_media_directory() / 'map'
+    map_directory = get_media_directory() / get_wrolpi_config().map_destination
     if not map_directory.is_dir():
-        map_directory.mkdir()
+        map_directory.mkdir(parents=True)
     return map_directory
 
 
 def is_pbf_file(pbf: Path) -> bool:
-    """Uses file command to check type of a file.  Returns True if a file is an OpenStreetMap PBF file."""
+    """Uses file command to check type of file.  Returns True if a file is an OpenStreetMap PBF file."""
     cmd = ('/usr/bin/file', pbf)
     try:
         output = subprocess.check_output(cmd)
@@ -41,7 +37,7 @@ def is_pbf_file(pbf: Path) -> bool:
 
 
 def is_dump_file(path: Path) -> bool:
-    """Uses file command to check type of a file.  Returns True if a file is a Postgresql dump file."""
+    """Uses file command to check the type of file.  Returns True if a file is a Postgresql dump file."""
     cmd = ('/usr/bin/file', path)
     try:
         output = subprocess.check_output(cmd)
@@ -93,23 +89,27 @@ async def import_files(paths: List[str]):
         dumps = [i for i in paths if i.suffix == '.dump']
         pbfs = [i for i in paths if i.suffix == '.pbf']
 
-        total_elapsed = 0
-
+        start = now()
         any_success = False
         try:
             if pbfs:
+                with get_db_session(commit=True) as session:
+                    # Any previously imported PBFs are no longer imported.
+                    for pbf_file in session.query(MapFile):
+                        pbf_file.imported = False
+
                 success = False
                 try:
-                    IMPORTING.update(dict(
+                    api_app.shared_ctx.map_importing.update(dict(
                         pending=list(pbfs),
                     ))
-                    total_elapsed += await run_import_command(*pbfs)
+                    await run_import_command(*pbfs)
                     success = True
                     any_success = True
                 except Exception as e:
                     import_logger.warning('Failed to run import', exc_info=e)
                 finally:
-                    IMPORTING.update(dict(
+                    api_app.shared_ctx.map_importing.update(dict(
                         pending=None,
                     ))
 
@@ -119,8 +119,6 @@ async def import_files(paths: List[str]):
                         for pbf_path in pbfs:
                             pbf_file = get_or_create_map_file(pbf_path, session)
                             pbf_file.imported = True
-                        for pbf_file in session.query(MapFile):
-                            pbf_file.imported = pbf_file.path in pbfs
 
             for path in dumps:
                 # Import each dump individually.
@@ -137,16 +135,16 @@ async def import_files(paths: List[str]):
 
                 success = False
                 try:
-                    IMPORTING.update(dict(
+                    api_app.shared_ctx.map_importing.update(dict(
                         pending=str(path),
                     ))
-                    total_elapsed += await run_import_command(path)
+                    await run_import_command(path)
                     success = True
                     any_success = True
                 except Exception as e:
                     import_logger.warning('Failed to run import', exc_info=e)
                 finally:
-                    IMPORTING.update(dict(
+                    api_app.shared_ctx.map_importing.update(dict(
                         pending=None,
                     ))
 
@@ -155,18 +153,18 @@ async def import_files(paths: List[str]):
                         map_file = get_or_create_map_file(path, session)
                         map_file.imported = True
         finally:
+            elapsed = (now() - start).total_seconds()
             if any_success:
-                Events.send_map_import_complete(f'Map import completed; took {seconds_to_timestamp(total_elapsed)}')
+                Events.send_map_import_complete(f'Map import completed; took {seconds_to_timestamp(elapsed)}')
             else:
-                Events.send_map_import_failed(f'Map import failed!  See server logs.')
+                Events.send_map_import_failed(
+                    f'Map import failed; took {seconds_to_timestamp(elapsed)} See server logs.')
 
 
-async def run_import_command(*paths: Path) -> int:
+async def run_import_command(*paths: Path):
     """Run the map import script on the provided paths.
 
     Can only import a single *.dump file, or a list of *.osm.pbf files.  They cannot be mixed.
-
-    @return: The seconds elapsed during import.
     """
     paths = [i.absolute() for i in paths]
     dumps = [i for i in paths if i.suffix == '.dump']
@@ -190,26 +188,24 @@ async def run_import_command(*paths: Path) -> int:
                 import_logger.warning(f'Could not import non-pbf file: {path}')
                 raise ValueError('Invalid PBF file')
 
-    paths = ' '.join(str(i) for i in paths)
+    paths = [str(i) for i in paths]
     # Run with sudo so renderd can be restarted.
-    cmd = f'{SUDO_BIN} {PROJECT_DIR}/scripts/import_map.sh {paths}'
-    import_logger.warning(f'Running map import command: {cmd}')
-    start = now()
-    proc = await asyncio.create_subprocess_shell(cmd, stderr=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+    cmd = (SUDO_BIN, f'{PROJECT_DIR}/scripts/import_map.sh', *paths)
+    result = await run_command(
+        cmd,
+        timeout=0,  # No timeout, map importing could take days.
+    )
 
-    stdout, stderr = await proc.communicate()
-    elapsed = now() - start
-    success = 'Successful' if proc.returncode == 0 else 'Unsuccessful'
-    import_logger.info(f'{success} import of {repr(paths)} took {timedelta_to_timestamp(elapsed)}')
-    if proc.returncode != 0:
+    success = 'Successful' if result.return_code == 0 else 'Unsuccessful'
+    import_logger.info(
+        f'{success} import of {repr(paths)} took {timedelta_to_timestamp(timedelta(seconds=result.elapsed))}')
+    if result.return_code != 0:
         # Log all lines.  Truncate long lines.
-        for line in stdout.decode().splitlines():
+        for line in result.stdout.decode().splitlines():
             import_logger.debug(line[:500])
-        for line in stderr.decode().splitlines():
+        for line in result.stderr.decode().splitlines():
             import_logger.error(line[:500])
-        raise ValueError(f'Importing map file failed with return code {proc.returncode}')
-
-    return int(elapsed.total_seconds())
+        raise ValueError(f'Importing map file failed with return code {result.return_code}')
 
 
 @optional_session
@@ -224,16 +220,35 @@ def get_import_status(session: Session = None) -> List[MapFile]:
     return map_paths
 
 
-# Bps calculated using many tests on a well-cooled RPi4.
-RPI4_PBF_BYTES_PER_SECOND = 61879
+# Calculated using many tests on a well-cooled RPi4 (4GB).
+RPI4_PBF_BYTES_PER_SECOND = 175473
+RPI4_COEFFICIENTS = [3.25099914e-15, 8.88717664e-06, -3.59754030e+02]
+# Calculated using many tests on a well-cooled RPi5 (8GB).
+RPI5_PBF_BYTES_PER_SECOND = 136003
+RPI5_COEFFICIENTS = [1.66813827e-15, 2.35907825e-06, 5.37276181e+01]
 
 
-def seconds_to_import(size_in_bytes: int) -> int:
-    """Attempt to predict how long it will take an RPi4 to import a given PBF file."""
+def seconds_to_import_rpi4(size_in_bytes: int) -> int:
     if size_in_bytes > 1_000_000_000:
-        # Use exponential curve for large files.  These magic numbers are from testing many imports on an RPi 4.
-        a = 7.17509261732342e-14 * size_in_bytes ** 2
-        b = 6.6590760410412e-5 * size_in_bytes
-        c = 10283
-        return int(a - b + c)
+        # Use exponential curve for large files.
+        a, b, c = RPI4_COEFFICIENTS
+        return int(a * size_in_bytes ** 2 + b * size_in_bytes + c)
+    # Use simpler equation for small files.
     return max(int(size_in_bytes // RPI4_PBF_BYTES_PER_SECOND), 0)
+
+
+def seconds_to_import_rpi5(size_in_bytes: int) -> int:
+    if size_in_bytes > 1_000_000_000:
+        # Use exponential curve for large files.
+        a, b, c = RPI5_COEFFICIENTS
+        return int(a * size_in_bytes ** 2 + b * size_in_bytes + c)
+    return max(int(size_in_bytes // RPI5_PBF_BYTES_PER_SECOND), 0)
+
+
+def seconds_to_import(size_in_bytes: int, is_rpi_5: bool = IS_RPI5) -> int:
+    """Attempt to predict how long it will take an RPi4 to import a given PBF file."""
+    if is_rpi_5:
+        return seconds_to_import_rpi5(size_in_bytes)
+
+    # Default to RPi4, because it's the most conservative estimate.
+    return seconds_to_import_rpi4(size_in_bytes)

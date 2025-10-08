@@ -1,14 +1,12 @@
-import wrolpi
 from wrolpi.db import get_db_session
-from .api import bp
+from .api import inventory_bp
 from .inventory import logger, DEFAULT_CATEGORIES, DEFAULT_INVENTORIES
 from .models import Item, Inventory
 
 INVENTORY_INITIALIZED = False
 
 
-@wrolpi.before_startup
-def init(force=False):
+def init_inventory(force=False):
     """
     Initialize inventory categories, but only if none already exist.  Initializes the inventories, but only if none
     already exist.

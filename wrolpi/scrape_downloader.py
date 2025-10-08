@@ -1,11 +1,10 @@
 import pathlib
-from http import HTTPStatus
+from copy import copy
 from urllib.parse import urlparse
 
-from wrolpi.common import aiohttp_session, logger, get_html_soup
+from wrolpi.common import logger, get_html_soup, aiohttp_get
 from wrolpi.downloader import Downloader, Download, DownloadResult
 from wrolpi.errors import UnrecoverableDownloadError
-from wrolpi.vars import DEFAULT_HTTP_HEADERS
 
 logger = logger.getChild(__name__)
 
@@ -39,12 +38,9 @@ class ScrapeHTMLDownloader(Downloader):
         return '<ScrapeHTMLDownloader>'
 
     @staticmethod
-    async def fetch_http(url: str) -> str:
-        async with aiohttp_session(timeout=60 * 5) as session:
-            async with session.get(url, headers=DEFAULT_HTTP_HEADERS) as response:
-                logger.debug(f'Got status={response.status} from {url}')
-                if response.status == HTTPStatus.OK:
-                    return await response.text()
+    async def fetch_html(url: str) -> str:
+        async with aiohttp_get(url, timeout=60 * 5) as response:
+            return await response.text()
 
     async def do_download(self, download: Download) -> DownloadResult:
         if download.attempts > 3:
@@ -56,7 +52,7 @@ class ScrapeHTMLDownloader(Downloader):
         depth = download.settings.get('depth') or 1
         suffix = download.settings.get('suffix')
         max_pages = download.settings.get('max_pages') or 100
-        destination = download.settings.get('destination')
+        destination = download.destination
 
         if 0 > depth > 10:
             raise UnrecoverableDownloadError('Depth must be between 0 and 100')
@@ -66,7 +62,9 @@ class ScrapeHTMLDownloader(Downloader):
             raise UnrecoverableDownloadError('Destination must be defined')
         destination = pathlib.Path(destination)
         if not destination.is_dir():
-            raise UnrecoverableDownloadError(f'Destination does not exist: {destination}')
+            destination.mkdir(parents=True)
+
+        suffix = suffix.lower()
 
         page_count = 0
 
@@ -80,7 +78,7 @@ class ScrapeHTMLDownloader(Downloader):
                     break
 
                 # Get the HTML of the URL.
-                content = await self.fetch_http(url)
+                content = await self.fetch_html(url)
                 page_count += 1
                 if not content:
                     logger.error(f'Failed to download url: {url}')
@@ -101,10 +99,12 @@ class ScrapeHTMLDownloader(Downloader):
                         logger.debug(f'Not a real anchor: {a}')
                         continue
                     child_url = resolve_url(url, href)
-                    if child_url and child_url.endswith(suffix):
+                    if child_url and child_url.lower().endswith(suffix):
                         # Found a file that the User requested.
+                        logger.info(f'ScrapeHTMLDownloader will download {child_url}')
                         download_urls.append(child_url)
                     else:
+                        logger.debug(f'ScrapeHTMLDownloader scraping {child_url}')
                         urls.append(child_url)
 
         if not download_urls:
@@ -113,10 +113,12 @@ class ScrapeHTMLDownloader(Downloader):
                 error=f'No files with {suffix} found in {page_count} pages!'
             )
 
+        settings = copy(download.settings)
+        settings['destination'] = str(download.destination)  # Use str for json conversion.
         return DownloadResult(
             success=True,
             downloads=download_urls,
-            settings=download.settings,
+            settings=settings,
             error='Reached max page count.' if page_count >= max_pages else None,
             location=f'/files?folders={destination}'
         )

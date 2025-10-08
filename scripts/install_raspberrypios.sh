@@ -14,7 +14,7 @@ node -v
 npm -v
 
 # Install serve, and archiving tools.
-single-file --version || sudo npm i -g serve@12.0.1 single-file-cli@1.0.33 readability-extractor@0.0.6 carto@1.2.0
+single-file --version || sudo npm i -g serve@12.0.1 single-file-cli@2.0.73 readability-extractor@0.0.6 carto@1.2.0
 
 # Build React app in background job.
 cd /opt/wrolpi/app || exit 5
@@ -22,7 +22,7 @@ npm install || npm install || npm install || npm install # try install multiple 
 
 # Install python requirements in background job.
 python3 -m venv /opt/wrolpi/venv
-/opt/wrolpi/venv/bin/pip3 install -r /opt/wrolpi/requirements.txt
+/opt/wrolpi/venv/bin/pip3 install --upgrade -r /opt/wrolpi/requirements.txt
 
 # Create the WROLPi user
 grep wrolpi: /etc/passwd || useradd -md /home/wrolpi wrolpi -s "$(command -v bash)"
@@ -35,8 +35,8 @@ git config --global --add safe.directory /opt/openstreetmap-carto
 chown -R _renderd:_renderd /opt/openstreetmap-carto
 
 # Get map initialization dump.
-if [[ ! -f /opt/wrolpi-blobs/gis-map.dump.gz || ! -s /opt/wrolpi-blobs/gis-map.dump.gz ]]; then
-  wget https://wrolpi.nyc3.cdn.digitaloceanspaces.com/gis-map.dump.gz -O /opt/wrolpi-blobs/gis-map.dump.gz
+if [[ ! -f /opt/wrolpi-blobs/map-db-gis.dump || ! -s /opt/wrolpi-blobs/map-db-gis.dump ]]; then
+  wget https://wrolpi.nyc3.cdn.digitaloceanspaces.com/map-db-gis.dump -O /opt/wrolpi-blobs/map-db-gis.dump
 fi
 
 # Install WROLPi Help.
@@ -58,7 +58,7 @@ file permissions if necessary:
 Start the WROLPi services using:
  # sudo systemctl start wrolpi.target
 
-then navigate to:  http://wrolpi.local
+then navigate to:  https://$(hostname).local
 
 Or, join to the Wifi hotspot:
 SSID: WROLPi

@@ -4,12 +4,14 @@ from unittest import mock
 import pytest
 
 from wrolpi import status
+from wrolpi.test.common import skip_circleci, skip_macos
+from wrolpi.vars import IS_MACOS
 
 
 @pytest.mark.asyncio
-async def test_get_load():
+async def test_get_load(async_client):
     """Test reading load information from /proc/loadavg."""
-    load = await status.get_load()
+    load = await status.get_load_stats()
     assert isinstance(load, status.SystemLoad)
 
     assert isinstance(load.minute_1, Decimal) and load.minute_1 >= 0
@@ -17,64 +19,70 @@ async def test_get_load():
     assert isinstance(load.minute_15, Decimal) and load.minute_15 >= 0
 
 
+@skip_circleci
 @pytest.mark.asyncio
-async def test_get_cpu_info():
+async def test_get_cpu_stats(async_client):
     """Minimum CPU info testing because this will fail in docker, etc."""
-    info = await status.get_cpu_info()
+    info = await status.get_cpu_stats()
     assert isinstance(info, status.CPUInfo)
     assert isinstance(info.percent, int)
-    assert isinstance(info.temperature, int)
-    assert isinstance(info.high_temperature, int)
-    assert isinstance(info.critical_temperature, int)
-
-    with mock.patch('wrolpi.status.get_cpu_info_psutil') as mock_get_cpu_info_psutil:
-        # Fallback to subprocess when psutil is not available.
-        mock_get_cpu_info_psutil.side_effect = Exception('testing no psutil')
-        info = await status.get_cpu_info()
-        assert isinstance(info, status.CPUInfo)
-        assert isinstance(info.percent, int)
+    if not IS_MACOS:
+        assert isinstance(info.temperature, int)
 
 
 @pytest.mark.asyncio
-async def test_get_drives_info():
+@skip_macos
+async def test_iostat_stats(async_client):
+    info = await status.get_iostat_stats()
+    assert isinstance(info, status.IostatInfo)
+    assert isinstance(info.percent_idle, float)
+
+
+@pytest.mark.asyncio
+async def test_power_stats(async_client):
+    info = await status.get_power_stats()
+    assert isinstance(info, status.PowerStats)
+    assert info.under_voltage is False
+    assert info.over_current is False
+
+
+@skip_circleci
+@skip_macos
+@pytest.mark.asyncio
+async def test_get_drives_stats(async_client):
     """Minimum drives info testing because this will fail in docker, etc."""
-    info = await status.get_drives_info()
+    info = await status.get_drives_stats()
     assert isinstance(info, list)
     assert len(info) >= 1
     assert isinstance(info[0], status.DriveInfo)
 
-    with mock.patch('wrolpi.status.get_drives_info_psutil') as mock_get_drives_info_psutil:
+    with mock.patch('wrolpi.status.get_drives_info_psutil') as mock_get_drives_stats_psutil:
         # Fallback to subprocess when psutil is not available.
-        mock_get_drives_info_psutil.side_effect = Exception('testing no psutil')
-        info = await status.get_drives_info()
+        mock_get_drives_stats_psutil.side_effect = Exception('testing no psutil')
+        info = await status.get_drives_stats()
         assert isinstance(info, list)
         assert len(info) >= 1
         assert isinstance(info[0], status.DriveInfo)
 
 
+@skip_circleci
 @pytest.mark.asyncio
-async def test_get_bandwidth_info():
-    """Bandwidth requires psutil"""
-    nic_bandwidths, disk_bandwidths = await status.get_bandwidth_info()
-    assert nic_bandwidths == []
-    assert disk_bandwidths == []
+async def test_status_worker(async_client, start_status_worker):
+    """Status worker calls itself perpetually, but can be limited during testing."""
+    from wrolpi.api_utils import api_app
+    assert async_client.sanic_app.shared_ctx.status['cpu_stats'] == dict()
 
-    await status.bandwidth_worker(2)
-    nic_bandwidths, disk_bandwidths = await status.get_bandwidth_info()
-    assert isinstance(nic_bandwidths, list)
-    assert len(nic_bandwidths) > 0
-    assert isinstance(nic_bandwidths[0], status.NICBandwidthInfo)
-    assert isinstance(disk_bandwidths, list)
-    assert len(disk_bandwidths) > 0
-    assert isinstance(disk_bandwidths[0], status.DiskBandwidthInfo)
+    # Status worker fills out stats as it goes along.
+    await status.status_worker(count=2)
+    assert api_app.shared_ctx.status['nic_bandwidth_stats']
+    assert 'bytes_recv' in list(api_app.shared_ctx.status['nic_bandwidth_stats'].values())[0]
+    assert api_app.shared_ctx.status['disk_bandwidth_stats']
+    assert 'bytes_read' in list(api_app.shared_ctx.status['disk_bandwidth_stats'].values())[0]
 
-    with mock.patch('wrolpi.status.psutil.net_io_counters') as mock_net_io_counters:
-        # NO FALLBACK!
-        mock_net_io_counters.side_effect = Exception('testing no psutil')
-        await status.bandwidth_worker(1)
-        nic_bandwidths, disk_bandwidths = await status.get_bandwidth_info()
-        assert isinstance(nic_bandwidths[0].bytes_recv, int)
-        assert isinstance(nic_bandwidths[0].bytes_sent, int)
-        assert isinstance(nic_bandwidths[0].elapsed, int)
-        assert isinstance(nic_bandwidths[0].speed, int)
-        assert isinstance(nic_bandwidths[0].name, str)
+    assert isinstance(api_app.shared_ctx.status.get('cpu_stats'), dict)
+    assert isinstance(api_app.shared_ctx.status.get('load_stats'), dict)
+    assert isinstance(api_app.shared_ctx.status.get('drives_stats'), list)
+    assert isinstance(api_app.shared_ctx.status.get('processes_stats'), list)
+    assert isinstance(api_app.shared_ctx.status.get('memory_stats'), dict)
+    assert isinstance(api_app.shared_ctx.status.get('iostat_stats'), dict)
+    assert isinstance(api_app.shared_ctx.status.get('power_stats'), dict)

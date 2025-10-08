@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from wrolpi.errors import ValidationError
+
 
 @dataclass
 class FilesRequest:
@@ -26,6 +28,15 @@ class FilesSearchRequest:
     model: Optional[str] = None
     tag_names: List[str] = field(default_factory=list)
     headline: bool = False
+    months: Optional[List[int]] = None
+    from_year: Optional[int] = None
+    to_year: Optional[int] = None
+    any_tag: bool = False
+    order: Optional[str] = None
+
+    def __post_init__(self):
+        if self.any_tag and self.tag_names:
+            raise ValidationError('Cannot use both tag_names and any_tag.')
 
 
 @dataclass
@@ -40,7 +51,7 @@ class DirectoriesRequest:
 
 @dataclass
 class DirectoriesSearchRequest:
-    name: str
+    path: str
 
 
 @dataclass

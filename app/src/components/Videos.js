@@ -4,8 +4,6 @@ import {
     APIButton,
     CardLink,
     CardPoster,
-    defaultSearchOrder,
-    defaultVideoOrder,
     Duration,
     encodeMediaPath,
     ErrorMessage,
@@ -13,7 +11,8 @@ import {
     findPosterPath,
     humanFileSize,
     humanNumber,
-    isoDatetimeToString,
+    InfoHeader,
+    isoDatetimeToAgoPopup,
     mimetypeColor,
     PageContainer,
     PreviewLink,
@@ -31,6 +30,8 @@ import {
     CardDescription,
     CardHeader,
     Container,
+    Form,
+    FormDropdown,
     Image,
     PlaceholderHeader,
     PlaceholderLine,
@@ -39,21 +40,17 @@ import {
     TableCell
 } from "semantic-ui-react";
 import {ChannelEditPage, ChannelNewPage, ChannelsPage} from "./Channels";
-import {
-    useChannel,
-    useQuery,
-    useSearchOrder,
-    useSearchVideos,
-    useVideo,
-    useVideoStatistics
-} from "../hooks/customHooks";
+import {useChannel, useSearchOrder, useSearchVideos, useVideo, useVideoStatistics} from "../hooks/customHooks";
 import {FileRowTagIcon, FilesView} from "./Files";
 import Grid from "semantic-ui-react/dist/commonjs/collections/Grid";
 import Icon from "semantic-ui-react/dist/commonjs/elements/Icon";
-import {Button, Card, Header, Loader, Placeholder, Segment, Statistic, StatisticGroup} from "./Theme";
-import {deleteVideos} from "../api";
-import {Media, ThemeContext} from "../contexts/contexts";
+import {Button, Card, Header, Loader, Placeholder, Popup, Segment, Statistic, StatisticGroup} from "./Theme";
+import {deleteVideos, fetchBrowserProfiles, fetchVideoDownloaderConfig, postVideoFileFormat, updateVideoDownloaderConfig} from "../api";
+import {Media, QueryContext, ThemeContext} from "../contexts/contexts";
 import _ from "lodash";
+import {defaultFileOrder, defaultSearchOrder, HELP_VIEWER_URI} from "./Vars";
+import {InputForm, ToggleForm, useForm} from "../hooks/useForm";
+import {VideoResolutionSelectorForm} from "./Download";
 
 export function VideoWrapper() {
     const {videoId} = useParams();
@@ -69,10 +66,10 @@ export function VideoWrapper() {
 function VideosPage() {
 
     const {channelId} = useParams();
-    const {searchParams} = useQuery();
+    const {searchParams} = React.useContext(QueryContext);
     const [selectedVideos, setSelectedVideos] = useState([]);
 
-    let searchOrder = defaultVideoOrder;
+    let searchOrder = defaultFileOrder;
     if (searchParams.get('order')) {
         // Use whatever order the user specified.
         searchOrder = searchParams.get('order');
@@ -81,7 +78,7 @@ function VideosPage() {
         searchOrder = defaultSearchOrder;
     }
 
-    const {searchStr, setSearchStr, videos, activePage, setPage, totalPages, fetchVideos} =
+    const {searchStr, setSearchStr, videos, activePage, setPage, totalPages, fetchVideos, loading} =
         useSearchVideos(null, channelId, searchOrder);
 
     const {channel} = useChannel(channelId);
@@ -96,8 +93,10 @@ function VideosPage() {
         {value: 'published_datetime', text: 'Published Date', short: 'P.Date'},
         {value: 'length', text: 'Length'},
         {value: 'size', text: 'Size'},
+        {value: 'size_to_duration', text: 'Size to Duration', short: 'S/Duration'},
         {value: 'view_count', text: 'Views'},
         {value: 'viewed', text: 'Recently Viewed', short: 'R.Viewed'},
+        {value: 'download_datetime', text: 'Download Date', short: 'D.Date'},
     ]
 
     if (searchStr) {
@@ -171,20 +170,26 @@ function VideosPage() {
     </div>;
 
     const {body, paginator, selectButton, viewButton, limitDropdown, tagQuerySelector} = FilesView(
-        videos,
-        activePage,
-        totalPages,
-        selectElm,
-        selectedVideos,
-        onSelect,
-        setPage,
-        !!searchStr,
+        {
+            files: videos,
+            activePage: activePage,
+            totalPages: totalPages,
+            selectElem: selectElm,
+            selectedKeys: selectedVideos,
+            onSelect: onSelect,
+            setPage: setPage,
+            headlines: !!searchStr,
+            loading: loading,
+        },
     );
 
+    const [localSearchStr, setLocalSearchStr] = React.useState(searchStr || '');
     const searchInput = <SearchInput
-                                     searchStr={searchStr}
-                                     onSubmit={setSearchStr}
-                                     placeholder='Search Videos...'
+        searchStr={localSearchStr}
+        onChange={setLocalSearchStr}
+        onClear={() => setLocalSearchStr(null)}
+        onSubmit={setSearchStr}
+        placeholder='Search Videos...'
     />;
 
     return <>
@@ -220,6 +225,224 @@ function VideosPage() {
     </>
 }
 
+function VideoFileNameForm({form}) {
+    const [message, setMessage] = React.useState(null);
+
+    const onChange = async (value) => {
+        const response = await postVideoFileFormat(value);
+        const {error, preview} = await response.json();
+        if (error) {
+            setMessage({content: error, header: 'Invalid File Name', negative: true});
+        } else {
+            setMessage({content: preview, header: 'File Name Preview', positive: true});
+        }
+    }
+
+    return <InputForm
+        form={form}
+        name='file_name_format'
+        path='yt_dlp_options.file_name_format'
+        label='Video File Format'
+        onChange={onChange}
+        message={message}
+    />
+}
+
+function VideosSettings() {
+    useTitle('Videos Settings');
+
+    const emptyFormData = {
+        video_resolutions: ['1080p', '720p', '480p', 'maximum'],
+        yt_dlp_options: {
+            file_name_format: '%(uploader)s_%(upload_date)s_%(id)s_%(title)s.%(ext)s',
+            nooverwrites: true,
+            writeautomaticsub: true,
+            writesubtitles: true,
+            writethumbnail: true,
+        },
+        always_use_browser_profile: false,
+        yt_dlp_extra_args: '',
+        browser_profile: '',
+    };
+
+    const configSubmitter = async () => {
+        return await updateVideoDownloaderConfig(configForm.formData);
+    };
+
+    const configForm = useForm({
+        fetcher: fetchVideoDownloaderConfig,
+        submitter: configSubmitter,
+        emptyFormData,
+    });
+
+    const emptyProfilesOptions = [{key: null, text: 'No profiles found'}];
+    const loadingProfilesOptions = [{key: null, text: 'Loading profiles, please wait...'}];
+    const [browserProfilesOptions, setBrowserProfilesOptions] = useState(loadingProfilesOptions);
+
+    const localFetchBrowserProfiles = async () => {
+        let tempProfiles = [];
+        let localBrowserProfiles = await fetchBrowserProfiles();
+
+        const chromiumProfiles = localBrowserProfiles['chromium_profiles'];
+        for (const value of Object.values(chromiumProfiles)) {
+            tempProfiles.push({value: value, text: value});
+        }
+        const firefoxProfiles = localBrowserProfiles['firefox_profiles'];
+        for (const value of Object.values(firefoxProfiles)) {
+            tempProfiles.push({value: value, text: value});
+        }
+
+        if (_.isEmpty(tempProfiles)) {
+            tempProfiles = emptyProfilesOptions;
+        }
+        console.debug('VideosSettings: Got browser profiles:', tempProfiles);
+        setBrowserProfilesOptions(tempProfiles);
+    };
+
+    React.useEffect(() => {
+        localFetchBrowserProfiles();
+    }, []);
+
+    const alwaysUseBrowserProfileLabel = <InfoHeader
+        headerSize='h5'
+        headerContent='Always Use Browser Profile'
+        popupContent='Always download videos with the selected browser profile. This is risky, and therefore discouraged.'
+    />;
+
+    return <Segment>
+        <Header as='h3'>Video Downloader Config</Header>
+
+        <Form>
+            <Grid>
+                <Grid.Row columns={2}>
+                    <Grid.Column mobile={16} computer={8}>
+                        <VideoResolutionSelectorForm
+                            form={configForm}
+                            name='video_resolutions'
+                            path='video_resolutions'
+                        />
+                    </Grid.Column>
+                    <Grid.Column mobile={16} computer={8}>
+                        <VideoFileNameForm form={configForm}/>
+                    </Grid.Column>
+                </Grid.Row>
+                <Grid.Row columns={2}>
+                    <Grid.Column mobile={16} computer={8}>
+                        <ToggleForm
+                            form={configForm}
+                            label='Do not overwrite existing files'
+                            name='nooverwrites'
+                            path='yt_dlp_options.nooverwrites'
+                            icon='file video'
+                        />
+                    </Grid.Column>
+                    <Grid.Column mobile={16} computer={8}>
+                        <ToggleForm
+                            form={configForm}
+                            label='Download automatic subtitles'
+                            name='writeautomaticsub'
+                            path='yt_dlp_options.writeautomaticsub'
+                            icon='closed captioning'
+                        />
+                    </Grid.Column>
+                </Grid.Row>
+                <Grid.Row>
+                    <Grid.Column mobile={16} computer={8}>
+                        <ToggleForm
+                            form={configForm}
+                            label='Download subtitles'
+                            name='writesubtitles'
+                            path='yt_dlp_options.writesubtitles'
+                            icon='closed captioning outline'
+                        />
+                    </Grid.Column>
+                    <Grid.Column mobile={16} computer={8}>
+                        <ToggleForm
+                            form={configForm}
+                            label='Download thumbnail'
+                            name='writethumbnail'
+                            path='yt_dlp_options.writethumbnail'
+                            icon='image'
+                        />
+                    </Grid.Column>
+                </Grid.Row>
+                <Grid.Row>
+                    <Grid.Column mobile={16} computer={8}>
+                        <InputForm
+                            form={configForm}
+                            name='yt_dlp_extra_args'
+                            path='yt_dlp_extra_args'
+                            label='Extra yt-dlp Arguments'
+                            placeholder='--prefer-free-formats'
+                            icon='terminal'
+                        />
+                    </Grid.Column>
+                    <Grid.Column mobile={16} computer={8}>
+                        <VideoBrowserCookiesSelector form={configForm} options={browserProfilesOptions}/>
+                    </Grid.Column>
+                </Grid.Row>
+                <Grid.Row>
+                    <Grid.Column mobile={16} computer={8}/>
+                    <Grid.Column mobile={16} computer={8}>
+                        <ToggleForm
+                            form={configForm}
+                            label={alwaysUseBrowserProfileLabel}
+                            name='always_use_browser_profile'
+                            path='always_use_browser_profile'
+                            disabled={!configForm.formData.browser_profile}
+                        />
+                    </Grid.Column>
+                </Grid.Row>
+
+                <Grid.Row columns={1}>
+                    <Grid.Column textAlign='right'>
+                        <APIButton
+                            disabled={configForm.disabled || !configForm.ready}
+                            type='submit'
+                            style={{marginTop: '0.5em'}}
+                            onClick={configForm.onSubmit}
+                            id='video_settings_save_button'
+                        >Save</APIButton>
+                    </Grid.Column>
+                </Grid.Row>
+            </Grid>
+        </Form>
+    </Segment>
+}
+
+
+export function VideoBrowserCookiesSelector({
+                                                form,
+                                                options,
+                                                name = 'browser_profile',
+                                                path = 'browser_profile',
+                                            }) {
+    const [inputProps, inputAttrs] = form.getSelectionProps({name, path});
+
+    const popupContent = <div>
+        Select a browser profile to use for cookies. This is useful for sites that require login to download videos.
+        <br/>
+        <br/>
+        <p><a href={HELP_VIEWER_URI + '/modules/videos/#how-to-use-browser-profiles'}>Help page</a></p>
+    </div>;
+
+    return <>
+        <InfoHeader
+            headerSize='h5'
+            headerContent='Browser Profile'
+            popupContent={popupContent}
+        />
+        <FormDropdown
+            selection
+            placeholder='Select Browser Profile'
+            options={options}
+            name={name}
+            id='browser_profile_dropdown'
+            {...inputProps}
+        />
+    </>
+}
+
 function VideosStatistics() {
     useTitle('Video Statistics');
 
@@ -242,6 +465,12 @@ function VideosStatistics() {
         {key: 'month', label: 'Downloads Past Month'},
         {key: 'year', label: 'Downloads Past Year'},
         {key: 'sum_duration', label: 'Total Duration'},
+        {key: 'censored_videos', label: 'Censored Videos'},
+    ];
+    const commentsNames = [
+        {key: 'have_comments', label: 'Have Comments'},
+        {key: 'missing_comments', label: 'Missing Comments'},
+        {key: 'failed_comments', label: 'Failed Comments'},
     ];
     const historicalNames = [
         {key: 'average_count', label: 'Average Monthly Downloads'},
@@ -249,6 +478,7 @@ function VideosStatistics() {
     ];
     const channelNames = [
         {key: 'channels', label: 'Channels'},
+        {key: 'tagged_channels', label: 'Tagged Channels'},
     ];
 
     const buildSegment = (title, names, stats) => {
@@ -268,6 +498,7 @@ function VideosStatistics() {
 
     return <>
         {buildSegment('Videos', videoNames, videos)}
+        {buildSegment('Video Comments', commentsNames, videos)}
         {buildSegment('Historical Video', historicalNames, historical)}
         {buildSegment('Channels', channelNames, channels)}
     </>
@@ -277,6 +508,7 @@ export function VideosRoute(props) {
     const links = [
         {text: 'Videos', to: '/videos', key: 'videos', end: true},
         {text: 'Channels', to: '/videos/channel', key: 'channel'},
+        {text: 'Settings', to: '/videos/settings', key: 'settings'},
         {text: 'Statistics', to: '/videos/statistics', key: 'statistics'},
     ];
 
@@ -285,10 +517,12 @@ export function VideosRoute(props) {
         <Routes>
             <Route path='/' exact element={<VideosPage/>}/>
             <Route path='channel' exact element={<ChannelsPage/>}/>
+            <Route path='settings' exact element={<VideosSettings/>}/>
             <Route path='statistics' exact element={<VideosStatistics/>}/>
             <Route path='channel/new' exact element={<ChannelNewPage/>}/>
             <Route path='channel/:channelId/edit' exact element={<ChannelEditPage/>}/>
             <Route path='channel/:channelId/video' exact element={<VideosPage/>}/>
+            <Route path='/video/:videoSlug' exact element={<VideosPage/>}/>
         </Routes>
     </PageContainer>
 }
@@ -300,7 +534,6 @@ export function VideoCard({file}) {
     // Default to video FilePreview for lone video files.
     let video_url;
 
-    const published_datetime = isoDatetimeToString(file.published_datetime);
     // A video may not have a channel.
     const channel = video.channel ? video.channel : null;
     let channel_url = null;
@@ -310,13 +543,16 @@ export function VideoCard({file}) {
         video_url = `/videos/channel/${channel.id}/video/${video.id}`;
     } else if (file.files.length > 1) {
         // No Channel, but the video has multiple files (subtitles, etc.).  Use the full VideoPage.
-        video_url = `/videos/video/${video.id}`
+        video_url = `/videos/video/${video.id}`;
+    }
+    if (file.slug) {
+        video_url = `/videos/video/${file.slug}`;
     }
 
     let poster = <CardPoster to={video_url} file={file}/>;
 
-    let header = <span {...s}
-                       className='card-title-ellipsis'>{file.title || file.name || video.stem || video.name}</span>;
+    const title = file.title || file.name || video.stem || video.name;
+    let header = <span {...s} className='card-title-ellipsis'>{title}</span>;
     if (video_url) {
         // Link to Channel-Video page or Video page.
         header = <Link to={video_url} className="no-link-underscore card-link">{header}</Link>;
@@ -334,7 +570,9 @@ export function VideoCard({file}) {
         <CardContent {...s}>
             <CardHeader>
                 <Container textAlign='left'>
-                    {header}
+                    <Popup on='hover'
+                           trigger={header}
+                           content={title}/>
                 </Container>
             </CardHeader>
             <CardDescription>
@@ -342,7 +580,7 @@ export function VideoCard({file}) {
                     {channel && <Link to={channel_url} className="no-link-underscore card-link">
                         <b {...s}>{channel.name}</b>
                     </Link>}
-                    <p {...s}>{published_datetime}</p>
+                    <p {...s}>{isoDatetimeToAgoPopup(file.published_datetime, false)}</p>
                 </Container>
             </CardDescription>
         </CardContent>
@@ -370,7 +608,7 @@ export function VideoRowCells({file}) {
         poster = <FileIcon file={file} size='large'/>;
     }
 
-    let dataCell = file.published_datetime ? isoDatetimeToString(file.published_datetime) : '';
+    let dataCell = file.published_datetime ? isoDatetimeToAgoPopup(file.published_datetime) : '';
     if (sort === 'length') {
         dataCell = secondsToFullDuration(file.length || 0);
     } else if (sort === 'size') {
@@ -378,7 +616,7 @@ export function VideoRowCells({file}) {
     } else if (sort === 'view_count') {
         dataCell = humanNumber(video.view_count || 0);
     } else if (sort === 'viewed') {
-        dataCell = isoDatetimeToString(file.viewed);
+        dataCell = isoDatetimeToAgoPopup(file.viewed);
     }
 
     // Fragment for SelectableRow

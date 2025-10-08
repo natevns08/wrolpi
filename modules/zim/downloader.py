@@ -2,26 +2,49 @@ from http import HTTPStatus
 from typing import List
 
 from modules.zim import lib
-from wrolpi.common import logger, aiohttp_get, get_download_info, download_file, background_task, get_html_soup
+from wrolpi.common import logger, aiohttp_get, get_html_soup
 from wrolpi.downloader import Downloader, Download, DownloadResult
 
 __all__ = ['KiwixCatalogDownloader', 'KiwixZimDownloader', 'kiwix_zim_downloader', 'kiwix_catalog_downloader']
 
-from wrolpi.files.lib import refresh_files
-from wrolpi.vars import PYTEST
+from wrolpi.files.lib import upsert_file
+from wrolpi.vars import DOWNLOAD_USER_AGENT
 
 logger = logger.getChild(__name__)
 
+# Headers to use when issuing Kiwix HTTP requests.
+headers = {
+    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'accept-language': 'en-US,en;q=0.9',
+    'dnt': '1',
+    'priority': 'u=0, i',
+    'sec-ch-ua': '"Chromium";v="129", "Not=A?Brand";v="8"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'document',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-site': 'none',
+    'sec-fetch-user': '?1',
+    'sec-gpc': '1',
+    'upgrade-insecure-requests': '1',
+    'user-agent': DOWNLOAD_USER_AGENT,
+}
+
 
 async def fetch_hrefs(url: str) -> List[str]:
-    content, status = await aiohttp_get(url, timeout=20)
-    if status != HTTPStatus.OK:
-        raise RuntimeError(f'Failed to fetch file catalog')
+    try:
+        async with aiohttp_get(url, headers=headers, timeout=20) as response:
+            status = response.status
+            content = await response.content.read()
+        if status != HTTPStatus.OK:
+            raise RuntimeError(f'Failed to fetch Zim file catalog: {url}')
+    except TimeoutError:
+        raise TimeoutError(f'Timeout while fetching Zim file catalog: {url}')
 
     soup = get_html_soup(content)
     downloads = list()
-    for a_ in soup.find_all('a'):
-        downloads.append(a_['href'])
+    for a in soup.find_all('a'):
+        downloads.append(a['href'])
     return downloads
 
 
@@ -66,43 +89,24 @@ class KiwixZimDownloader(Downloader):
     listable = False
 
     async def do_download(self, download: Download) -> DownloadResult:
-        url = download.url
-
-        download_info = await get_download_info(url)
-
         zim_directory = lib.get_zim_directory()
         zim_directory.mkdir(parents=True, exist_ok=True)
-        output_path = zim_directory / f'{download_info.name}'
 
-        if output_path.is_file():
-            output_size = output_path.stat().st_size
-            if download_info.size and download_info.size == output_size:
-                # File is already downloaded.
-                return DownloadResult(success=True)
-
-        logger.info(f'Downloading Zim {url} to {output_path} of size {download_info.size}')
-        await download_file(url, output_path=output_path, info=download_info)
+        output_path = await self.download_file(download, download.url, zim_directory)
 
         # Notify the maintainer if outdated Zim files are lying around.
         lib.flag_outdated_zim_files()
 
-        output_size = output_path.stat().st_size
-        if download_info.size and output_size != download_info.size:
-            return DownloadResult(
-                success=False,
-                error=f'Download size does not match: {output_size} != {download_info.size}')
-
-        return_code = await lib.check_zim(output_path)
-        if return_code == 127:
+        try:
+            return_code = await lib.check_zim(output_path)
+            if return_code > 0:
+                # zimcheck ran, but the file is invalid.
+                return DownloadResult(success=False, error=f'Zim file is invalid')
+        except FileNotFoundError:
             logger.warning(f'Not validating {output_path} because zimcheck is not installed')
-        elif return_code > 0:
-            return DownloadResult(success=False, error=f'Zim file is invalid')
 
         # Add the new Zim to the FileGroups, model it.
-        if PYTEST:
-            await refresh_files([output_path, ])
-        else:
-            background_task(refresh_files([output_path, ]))
+        await upsert_file(output_path)
 
         # Restart Kiwix serve, so it finds the new zim file.
         return_code = await lib.restart_kiwix()

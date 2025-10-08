@@ -1,7 +1,8 @@
 import React, {useEffect} from 'react';
 import {useRecurringTimeout} from "./hooks/customHooks";
-import {getEvents} from "./api";
+import {ApiDownError, getEvents} from "./api";
 import {toast} from "react-semantic-toasts-2";
+import {StatusContext} from "./contexts/contexts";
 
 const apiEventName = 'apiEvent';
 
@@ -75,6 +76,35 @@ function handleEvents(events) {
             eventToast('Successful tag', message, 'success');
         }
 
+        if (event === 'file_move_completed') {
+            eventToast('Successful Move', message, 'success');
+        }
+
+        if (event === 'file_move_failed') {
+            eventToast('Move Failed', message, 'error');
+        }
+
+        if (event === 'config_import_failed') {
+            eventToast('Config Import Failed', message, 'error');
+        }
+
+        if (event === 'config_save_failed') {
+            eventToast('Config Save Failed', message, 'error');
+        }
+
+        if (event === 'upload_archive') {
+            eventToast(
+                'Archive Uploaded',
+                message,
+                'success',
+                5000,
+                () => window.open(url, '_self'));
+        }
+
+        if (event === 'upload_archive_failed') {
+            eventToast('Archive Upload Failed!', message, 'error', 5000);
+        }
+
         if (subject) {
             newestEvents[subject] = dt;
         }
@@ -92,13 +122,23 @@ export function useEventsInterval() {
     }
 
     const fetchEvents = async () => {
+        if (window.apiDown) { // apiDown is set in useStatus
+            return;
+        }
         try {
             const response = await getEvents(now.current);
             setNow(response['now']);
             setEvents(response['events']);
         } catch (e) {
             setEvents(null);
-            console.error(e);
+            if (e instanceof ApiDownError) {
+                // API is down, do not log this error.
+                return;
+            }
+            // Ignore SyntaxError because they happen when the API is down.
+            if (!(e instanceof SyntaxError)) {
+                console.error(e);
+            }
         }
     }
 

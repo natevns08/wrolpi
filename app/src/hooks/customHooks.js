@@ -1,5 +1,7 @@
 import React, {useContext, useEffect, useRef, useState} from "react";
 import {
+    ApiDownError,
+    createChannel,
     fetchDecoded,
     fetchDomains,
     fetchFilesProgress,
@@ -7,7 +9,7 @@ import {
     getArchive,
     getChannel,
     getChannels,
-    getDirectories,
+    getConfigs,
     getDownloads,
     getFiles,
     getInventory,
@@ -15,23 +17,30 @@ import {
     getSettings,
     getStatistics,
     getStatus,
-    getThrottleStatus,
     getVideo,
+    getVideoCaptions,
+    getVideoComments,
     getVideosStatistics,
+    postDumpConfig,
+    postImportConfig,
+    saveSettings,
     searchArchives,
+    searchChannels,
     searchDirectories,
     searchVideos,
     searchZim,
-    searchZims,
     setHotspot,
     setThrottle,
+    updateChannel,
 } from "../api";
-import {createSearchParams, useSearchParams} from "react-router-dom";
+import {createSearchParams, useLocation, useSearchParams} from "react-router-dom";
 import {enumerate, filterToMimetypes, humanFileSize, secondsToFullDuration} from "../components/Common";
-import {StatusContext} from "../contexts/contexts";
+import {QueryContext, SettingsContext, StatusContext} from "../contexts/contexts";
 import {toast} from "react-semantic-toasts-2";
 import {useSearch} from "../components/Search";
 import _ from "lodash";
+import {TagsSelector} from "../Tags";
+import {useForm} from "./useForm";
 
 const calculatePage = (offset, limit) => {
     return offset && limit ? Math.round((offset / limit) + 1) : 1;
@@ -63,7 +72,7 @@ export const useRecurringTimeout = (callback, delay) => {
     }, [delay])
 }
 
-export const useLatestRequest = (delay = 300) => {
+export const useLatestRequest = (delay = 300, defaultLoading = false) => {
     // A hook which ignores older requests and will only set `data` to the latest response's data.
     // usage: sendRequest(async () => await yourAPICall(...args));
 
@@ -72,7 +81,7 @@ export const useLatestRequest = (delay = 300) => {
     const latestRequestRef = React.useRef(0);
     const debounceTimerRef = React.useRef(null);
     // Loading while awaiting.
-    const [loading, setLoading] = React.useState(false);
+    const [loading, setLoading] = React.useState(defaultLoading);
 
     const sendRequest = React.useCallback((fetchFunction) => {
         if (debounceTimerRef.current) {
@@ -103,50 +112,77 @@ export const useLatestRequest = (delay = 300) => {
     return {data, sendRequest, loading};
 };
 
+const getSearchParamCopy = (searchParams) => {
+    let copy = {};
+    if (searchParams) {
+        Array.from(searchParams.keys()).forEach(key => {
+            const value = searchParams.getAll(key)
+            copy[key] = value.length === 1 ? value[0] : value;
+        })
+    }
+    copy = removeEmptyValues(copy);
+    return copy;
+}
+
+const removeEmptyValues = (obj) => {
+    Object.entries(obj).forEach(([k, v]) => {
+        // Clear any empty values.
+        if (v === null || v === undefined || (Array.isArray(v) && v.length === 0)) {
+            delete obj[k];
+        }
+    });
+    return obj
+}
+
 
 export const useQuery = () => {
+    const location = useLocation();
     const [searchParams, setSearchParams] = useSearchParams();
 
-    const setQuery = (obj) => {
-        setSearchParams(createSearchParams(obj), {replace: true});
+    const updateQuery = (newParams, replace = false) => {
+        // Update the old state with the new values.
+        let newSearchParams = replace ?
+            newParams
+            : {...getSearchParamCopy(searchParams), ...newParams};
+        newSearchParams = removeEmptyValues(newSearchParams);
+        console.debug('useQuery.updateQuery', newSearchParams);
+        setSearchParams(newSearchParams);
+    };
+
+    const getLocationStr = (newSearchParams, pathname) => {
+        // Get the current location, but with new params appended.
+        newSearchParams = removeEmptyValues({...getSearchParamCopy(searchParams), ...newSearchParams});
+        const newQuery = createSearchParams(newSearchParams);
+        return `${pathname || location.pathname}?${newQuery.toString()}`
     }
 
-    const updateQuery = (obj) => {
-        const newQuery = {};
-        for (const entry of searchParams.entries()) {
-            newQuery[entry[0]] = entry[1];
-        }
-        Object.entries(obj).forEach(([key, value]) => {
-            if (value === undefined || value === null || value === '') {
-                delete newQuery[key];
-            } else {
-                newQuery[key] = value;
-            }
-        })
-        setQuery(newQuery);
-    }
+    return {searchParams, updateQuery, getLocationStr}
+}
 
-    return {searchParams, setSearchParams, setQuery, updateQuery}
+
+export const QueryProvider = (props) => {
+    return <QueryContext.Provider value={useQuery()}>
+        {props.children}
+    </QueryContext.Provider>
 }
 
 export const useOneQuery = (name) => {
-    const {searchParams, updateQuery} = useQuery();
+    const {searchParams, updateQuery} = React.useContext(QueryContext);
     const value = searchParams.get(name);
 
-    const setValue = (newValue) => {
-        console.debug(`useOneQuery setValue=${newValue}`);
-        updateQuery({[name]: newValue});
+    const setValue = (newValue, replace = false) => {
+        updateQuery({[name]: newValue}, replace);
     }
 
     return [value, setValue]
 }
 
 export const useAllQuery = (name) => {
-    const {searchParams, updateQuery} = useQuery();
+    const {searchParams, updateQuery} = React.useContext(QueryContext);
     const value = searchParams.getAll(name);
 
-    const setValue = (newValue) => {
-        updateQuery({[name]: newValue});
+    const setValue = (newValue, replace = false) => {
+        updateQuery({[name]: newValue}, replace);
     }
 
     return [value, setValue]
@@ -182,7 +218,7 @@ export const useArchive = (archiveId) => {
 
     const fetchArchive = async () => {
         try {
-            const [file_group, history] = await getArchive(archiveId);
+            const {file_group, history} = await getArchive(archiveId);
             setArchiveFileGroup(file_group);
             setHistory(history);
         } catch (e) {
@@ -199,7 +235,7 @@ export const useArchive = (archiveId) => {
 }
 
 export const usePages = (defaultLimit = 24, totalPages = 0) => {
-    const {searchParams, updateQuery} = useQuery();
+    const {searchParams, updateQuery} = React.useContext(QueryContext);
     const offset = searchParams.get('o') || 0;
     const limit = parseInt(searchParams.get('l') || defaultLimit || 24);
     const [activePage, setActivePage] = useState(calculatePage(offset, limit));
@@ -219,7 +255,7 @@ export const usePages = (defaultLimit = 24, totalPages = 0) => {
 
     const setTotal = (total) => {
         const newTotalPages = calculateTotalPages(total, limit);
-        console.log('newTotalPages', newTotalPages);
+        console.debug('newTotalPages', newTotalPages);
         setTotalPages(newTotalPages);
     }
 
@@ -232,7 +268,7 @@ export const usePages = (defaultLimit = 24, totalPages = 0) => {
 export const useSearchArchives = (defaultLimit) => {
     const {domain} = useSearchDomain();
     const {offset, limit, setLimit, activePage, setPage} = usePages(defaultLimit);
-    const {searchParams, updateQuery} = useQuery();
+    const {searchParams, updateQuery} = React.useContext(QueryContext);
     const searchStr = searchParams.get('q') || '';
     const order = searchParams.get('order');
     const activeTags = searchParams.getAll('tag');
@@ -291,27 +327,32 @@ export const useSearchArchives = (defaultLimit) => {
 }
 
 export const useSearchVideos = (defaultLimit, channelId, order_by) => {
-    const {searchParams, updateQuery} = useQuery();
+    const {searchParams, updateQuery} = React.useContext(QueryContext);
     const {offset, limit, setLimit, activePage, setPage} = usePages(defaultLimit);
     const searchStr = searchParams.get('q') || '';
     const order = searchParams.get('order') || order_by;
     const activeTags = searchParams.getAll('tag');
     const {view} = useSearchView();
     const headline = view === 'headline';
+    const anyTag = searchParams.get('anyTag') === 'true';
 
     const [videos, setVideos] = useState(null);
     const [totalPages, setTotalPages] = useState(0);
+    const [loading, setLoading] = useState(false);
 
     const localSearchVideos = async () => {
         setVideos(null);
+        setLoading(true);
         setTotalPages(0);
         try {
-            let [videos_, total] = await searchVideos(offset, limit, channelId, searchStr, order, activeTags, headline);
+            let [videos_, total] = await searchVideos(offset, limit, channelId, searchStr, order, activeTags, headline, anyTag);
             setVideos(videos_);
             setTotalPages(calculateTotalPages(total, limit));
         } catch (e) {
             console.error(e);
             setVideos(undefined);// Could not get Videos, display error.
+        } finally {
+            setLoading(false);
         }
     }
 
@@ -342,6 +383,7 @@ export const useSearchVideos = (defaultLimit, channelId, order_by) => {
         setOrderBy,
         fetchVideos: localSearchVideos,
         activeTags,
+        loading,
     }
 }
 
@@ -383,53 +425,99 @@ export const useVideo = (videoId) => {
     return {videoFile, prevFile, nextFile, fetchVideo};
 }
 
-export const useChannel = (channel_id) => {
-    const emptyChannel = {
-        name: '',
-        directory: '',
-        mkdir: false,
-        url: '',
-        download_frequency: '',
-        match_regex: '',
-    };
-    const [fetched, setFetched] = useState(false);
-    const [channel, setChannel] = useState(emptyChannel);
-    const [original, setOriginal] = useState({});
+export const useVideoExtras = (videoId) => {
+    // Fetches extra data to display on a Video's page.
+    const [comments, setComments] = useState(null);
+    const [captions, setCaptions] = useState(null);
 
-    const localGetChannel = async () => {
-        if (channel_id) {
-            try {
-                const c = await getChannel(channel_id);
-                // Prevent controlled to uncontrolled.
-                c['url'] = c['url'] || '';
-                c['download_frequency'] = c['download_frequency'] || '';
-                c['match_regex'] = c['match_regex'] || '';
-                setChannel(c);
-                setOriginal(c);
-                setFetched(true);
-            } catch (e) {
-                console.error(e);
-                toast({
-                    type: 'error',
-                    title: 'Unexpected server response',
-                    description: 'Could not get Channel',
-                    time: 5000,
-                });
-            }
-        } else {
-            setChannel(emptyChannel);
+    const fetchComments = async () => {
+        try {
+            const result = await getVideoComments(videoId);
+            setComments(result.comments);
+        } catch (e) {
+            console.error(e);
+        }
+    }
+
+    const fetchCaptions = async () => {
+        try {
+            const result = await getVideoCaptions(videoId);
+            setCaptions(result.captions);
+        } catch (e) {
+            console.error(e);
         }
     }
 
     useEffect(() => {
-        localGetChannel();
-    }, [channel_id])
+        if (videoId) {
+            fetchComments();
+            fetchCaptions();
+        } else {
+            setComments(null);
+            setCaptions(null);
+        }
+    }, [videoId]);
 
-    const changeValue = (name, value) => {
-        setChannel({...channel, [name]: value});
+    return {comments, captions}
+}
+
+export const useChannel = (channel_id) => {
+    const emptyChannel = {
+        name: '',
+        directory: '',
+        url: '',
+        tag_name: null,
+        download_missing_data: null,
+    };
+
+    const fetchChannel = async () => {
+        if (!channel_id) {
+            console.debug('Not fetching channel because no channel_id is provided');
+            return;
+        }
+        const c = await getChannel(channel_id);
+        // Prevent controlled to uncontrolled.
+        c['url'] = c['url'] || '';
+        c['download_frequency'] = c['download_frequency'] || '';
+        c['match_regex'] = c['match_regex'] || '';
+        c['download_missing_data'] = c['download_missing_data'] ?? true;
+        return c;
     }
 
-    return {channel, changeValue, original, fetched, fetchChannel: localGetChannel};
+    const submitChannel = async () => {
+        const body = {
+            name: form.formData.name,
+            directory: form.formData.directory,
+            url: form.formData.url,
+            download_missing_data: form.formData.download_missing_data,
+        };
+
+        if (channel_id) {
+            // Can create a Channel with a Tag.
+            body.tag_name = form.formData.tag_name;
+            return await createChannel(body);
+        } else {
+            return await updateChannel(channel_id, body);
+        }
+    }
+
+    const form = useForm({
+        fetcher: fetchChannel,
+        emptyFormData: emptyChannel,
+        clearOnSuccess: false,
+        submitter: submitChannel
+    });
+
+    React.useEffect(() => {
+        // Channel may be gotten from Video data, fetch the Channel again.
+        form.fetcher();
+    }, [channel_id]);
+
+    return {
+        channel: form.formData,
+        form,
+        fetchChannel,
+    };
 }
 
 export const useChannels = () => {
@@ -453,18 +541,52 @@ export const useChannels = () => {
     return {channels, fetchChannels}
 }
 
+export const useSearchRecentFiles = () => {
+    const [searchFiles, setSearchFiles] = useState(null);
+    const [loading, setLoading] = useState(false);
+
+    const localSearchFiles = async () => {
+        setLoading(true);
+        try {
+            let [file_groups, total] = await filesSearch(
+                null, 12, null, null, null, [], false,
+                null, null, null, false, 'viewed');
+            setSearchFiles(file_groups);
+        } catch (e) {
+            console.error(e);
+            toast({
+                type: 'error',
+                title: 'Unexpected server response',
+                description: 'Could not get recent files',
+                time: 5000,
+            });
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    React.useEffect(() => {
+        localSearchFiles();
+    }, []);
+
+    return {searchFiles, loading, fetchFiles: localSearchFiles};
+}
+
 export const useSearchFiles = (defaultLimit = 48, emptySearch = false, model) => {
     const {
-        activeTags,
+        activeTags, anyTag,
         pages,
         searchStr,
         filter,
         model: model_,
-        setSearchStr
+        setSearchStr,
+        months,
+        dateRange,
     } = useSearch(defaultLimit, emptySearch, model);
     const {view} = useSearchView();
 
     const [searchFiles, setSearchFiles] = useState(null);
+    const [loading, setLoading] = useState(false);
     const headline = view === 'headline';
 
     const localSearchFiles = async () => {
@@ -473,9 +595,18 @@ export const useSearchFiles = (defaultLimit = 48, emptySearch = false, model) =>
         }
         const mimetypes = filterToMimetypes(filter);
         setSearchFiles(null);
+        let fromDate;
+        let toDate;
+        if (dateRange) {
+            fromDate = dateRange[0];
+            toDate = dateRange[1];
+        }
+        setLoading(true);
+        console.log('localSearchFiles', fromDate, toDate, months);
         try {
             let [file_groups, total] = await filesSearch(
-                pages.offset, pages.limit, searchStr, mimetypes, model || model_, activeTags, headline);
+                pages.offset, pages.limit, searchStr, mimetypes, model || model_, activeTags, headline,
+                months, fromDate, toDate, anyTag);
             setSearchFiles(file_groups);
             pages.setTotal(total);
         } catch (e) {
@@ -487,6 +618,8 @@ export const useSearchFiles = (defaultLimit = 48, emptySearch = false, model) =>
                 description: 'Could not get files',
                 time: 5000,
             });
+        } finally {
+            setLoading(false);
         }
     }
 
@@ -497,11 +630,23 @@ export const useSearchFiles = (defaultLimit = 48, emptySearch = false, model) =>
 
     useEffect(() => {
         if (searchStr || (activeTags && activeTags.length > 0)) {
+            setLoading(true);
             debouncedLocalSearchFiles();
         }
         // Handle when this is unmounted.
         return () => debouncedLocalSearchFiles.cancel();
-    }, [searchStr, pages.effect, filter, model, model_, JSON.stringify(activeTags), headline]);
+    }, [
+        searchStr,
+        pages.effect,
+        filter,
+        model,
+        model_,
+        JSON.stringify(activeTags),
+        headline,
+        JSON.stringify(months),
+        JSON.stringify(dateRange),
+        anyTag,
+    ]);
 
     return {
         searchFiles,
@@ -509,7 +654,8 @@ export const useSearchFiles = (defaultLimit = 48, emptySearch = false, model) =>
         filter,
         setSearchStr,
         pages,
-        activeTags
+        activeTags,
+        loading,
     };
 }
 
@@ -564,17 +710,23 @@ export const useFilesProgressInterval = () => {
 
 export const useHotspot = () => {
     const [on, setOn] = useState(null);
+    const [inUse, setInUse] = useState(false);
     const {status} = useContext(StatusContext);
     // Hotspot is unsupported on Docker.
-    const {dockerized} = status;
+    const {dockerized, hotspot_ssid} = status;
 
     useEffect(() => {
         if (status && status['hotspot_status']) {
             const {hotspot_status} = status;
             if (hotspot_status === 'connected') {
                 setOn(true);
+                setInUse(false);
+            } else if (hotspot_status === 'in_use') {
+                setInUse(true);
+                setOn(false);
             } else if (hotspot_status === 'disconnected' || hotspot_status === 'unavailable') {
                 setOn(false);
+                setInUse(false);
             } else {
                 setOn(null);
             }
@@ -586,7 +738,7 @@ export const useHotspot = () => {
         await setHotspot(on);
     }
 
-    return {on, setOn, setHotspot: localSetHotspot, dockerized};
+    return {on, inUse, hotspotSsid: hotspot_ssid, setOn, setHotspot: localSetHotspot, dockerized};
 }
 
 export const useDownloads = () => {
@@ -614,16 +766,53 @@ export const useDownloads = () => {
     return {onceDownloads, recurringDownloads, pendingOnceDownloads, fetchDownloads}
 }
 
-export const useThrottle = () => {
-    const [on, setOn] = useState(null);
+export const useConfigs = () => {
+    const [configs, setConfigs] = useState(null);
+    const [loading, setLoading] = useState(false);
 
-    const fetchThrottleStatus = async () => {
-        let status;
+    const fetchConfigs = async () => {
+        setLoading(true);
+        console.log('fetching configs...');
         try {
-            status = await getThrottleStatus();
+            const data = await getConfigs();
+            setConfigs(data['configs']);
+            console.debug('fetching configs successful');
+        } catch (e) {
+            // Ignore SyntaxError because they happen when the API is down.
+            if (!(e instanceof SyntaxError)) {
+                console.error(e);
+            }
+            setConfigs(undefined);
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    const importConfig = async (fileName) => {
+        try {
+            await postImportConfig(fileName);
         } catch (e) {
             console.error(e);
         }
+    }
+
+    const saveConfig = async (fileName) => {
+        try {
+            await postDumpConfig(fileName);
+        } catch (e) {
+            console.error(e);
+        }
+    }
+
+    return {configs, loading, fetchConfigs, importConfig, saveConfig}
+}
+
+export const useThrottle = () => {
+    const [on, setOn] = useState(null);
+    const {settings, fetchSettings} = React.useContext(SettingsContext);
+
+    useEffect(() => {
+        const status = settings['throttle_status'];
         if (status === 'powersave') {
             setOn(true);
         } else if (status === 'ondemand') {
@@ -631,53 +820,15 @@ export const useThrottle = () => {
         } else {
             setOn(null);
         }
-    }
-
-    useEffect(() => {
-        fetchThrottleStatus();
-    }, []);
+    }, [JSON.stringify(settings)]);
 
     const localSetThrottle = async (on) => {
         setOn(null);
         await setThrottle(on);
-        await fetchThrottleStatus();
+        await fetchSettings();
     }
 
     return {on, setOn, setThrottle: localSetThrottle};
-}
-
-export const useDirectories = (defaultDirectory) => {
-    const [directories, setDirectories] = useState();
-    const [directory, setDirectory] = useState(defaultDirectory);
-    const [exists, setExists] = useState();
-    const [isDir, setIsDir] = useState();
-    const [isFile, setIsFile] = useState();
-
-    const fetchDirectories = async () => {
-        if (defaultDirectory && directory === '') {
-            setDirectory(defaultDirectory);
-        }
-        try {
-            const {directories, is_dir, exists_, is_file} = await getDirectories(directory);
-            setDirectories(directories);
-            setIsDir(is_dir);
-            setExists(exists_);
-            setIsFile(is_file);
-        } catch (e) {
-            toast({
-                type: 'error',
-                title: 'Unexpected server response',
-                description: 'Could not get directories',
-                time: 5000,
-            });
-        }
-    }
-
-    useEffect(() => {
-        fetchDirectories();
-    }, [directory, defaultDirectory]);
-
-    return {directory, directories, setDirectory, exists, isDir, isFile};
 }
 
 export const useSearchDirectories = (value) => {
@@ -685,15 +836,17 @@ export const useSearchDirectories = (value) => {
     const [directories, setDirectories] = useState(null);
     const [channelDirectories, setChannelDirectories] = useState(null);
     const [domainDirectories, setDomainDirectories] = useState(null);
+    const [isDir, setIsDir] = useState(false);
     const [loading, setLoading] = useState(false);
 
     const localSearchDirectories = async () => {
         setLoading(true);
         try {
-            const {directories: dirs, channel_directories, domain_directories} = await searchDirectories(directoryName);
-            setDirectories(dirs);
-            setChannelDirectories(channel_directories);
-            setDomainDirectories(domain_directories);
+            const result = await searchDirectories(directoryName);
+            setDirectories(result.directories);
+            setChannelDirectories(result.channel_directories);
+            setDomainDirectories(result.domain_directories);
+            setIsDir(result.is_dir);
         } finally {
             setLoading(false);
         }
@@ -703,30 +856,37 @@ export const useSearchDirectories = (value) => {
         localSearchDirectories();
     }, [directoryName]);
 
+    useEffect(() => {
+        // Directory value was changed above.
+        setDirectoryName(value);
+    }, [value]);
+
     return {
         directoryName,
         setDirectoryName,
         directories,
         loading,
         channelDirectories,
-        domainDirectories
+        domainDirectories,
+        isDir,
     }
 }
 
 export const useSettings = () => {
     const [settings, setSettings] = useState({});
+    const [pending, setPending] = useState(false);
 
     const fetchSettings = async () => {
+        if (window.apiDown) {
+            return;
+        }
+        setPending(true);
         try {
             setSettings(await getSettings())
         } catch (e) {
             setSettings({});
-            toast({
-                type: 'error',
-                title: 'Unexpected server response',
-                description: 'Could not get directories',
-                time: 5000,
-            });
+        } finally {
+            setPending(false);
         }
     }
 
@@ -734,21 +894,21 @@ export const useSettings = () => {
         fetchSettings();
     }, []);
 
-    return {settings, fetchSettings};
-}
-
-export const useMediaDirectory = () => {
-    const {settings} = useSettings();
-
-    return settings['media_directory'];
+    return {settings, pending, fetchSettings, saveSettings};
 }
 
 export const useSettingsInterval = () => {
-    const {settings, fetchSettings} = useSettings();
+    const {settings, pending, fetchSettings, saveSettings} = useSettings();
 
-    useRecurringTimeout(fetchSettings(), 1000 * 3);
+    useRecurringTimeout(fetchSettings, 1000 * 10);
 
-    return {settings, fetchSettings};
+    return {settings, pending, fetchSettings, saveSettings};
+}
+
+export const useMediaDirectory = () => {
+    const {settings} = React.useContext(SettingsContext);
+
+    return settings['media_directory'];
 }
 
 export const useStatus = () => {
@@ -756,12 +916,26 @@ export const useStatus = () => {
 
     const fetchStatus = async () => {
         try {
-            const s = await getStatus();
-            setStatus(s);
+            setStatus(await getStatus());
+            window.apiDown = false;
         } catch (e) {
-            console.error(e);
+            if (e instanceof ApiDownError) {
+                // API is down, do not log this error.
+                window.apiDown = true;
+                setStatus({});
+                return;
+            }
+            // Ignore SyntaxError because they happen when the API is down.
+            if (!(e instanceof SyntaxError)) {
+                console.error(e);
+            }
         }
     }
+
+    useEffect(() => {
+        // Used to tell other hooks to stop fetching intervals.
+        window.apiDown = false;
+    }, []);
 
     return {status, fetchStatus}
 }
@@ -775,50 +949,44 @@ export const useStatusInterval = () => {
 }
 
 export const StatusProvider = (props) => {
-    const value = useStatusInterval();
+    const statusValue = useStatusInterval();
+    const settingsValue = useSettingsInterval();
 
-    const statusValue = React.useMemo(() => value, [value]);
+    const statusMemoValue = React.useMemo(() => statusValue, [statusValue]);
+    const settingsMemoValue = React.useMemo(() => settingsValue, [settingsValue]);
 
-    return <StatusContext.Provider value={statusValue}>
-        {props.children}
+    return <StatusContext.Provider value={statusMemoValue}>
+        <SettingsContext.Provider value={settingsMemoValue}>
+            {props.children}
+        </SettingsContext.Provider>
     </StatusContext.Provider>
 }
 
 export const useStatusFlag = (flag) => {
     const {status} = useContext(StatusContext);
-    return status && status['flags'] && status['flags'].indexOf(flag) >= 0;
+    return status?.flags?.[flag] || false;
 }
 
 export const useCPUTemperature = () => {
     const {status} = React.useContext(StatusContext);
-    let temperature = 0;
-    let highTemperature = 75;
-    let criticalTemperature = 85;
-
-    if (status && status['cpu_info']) {
-        temperature = status['cpu_info']['temperature'];
-        highTemperature = status['cpu_info']['high_temperature'];
-        criticalTemperature = status['cpu_info']['critical_temperature'];
-    }
-
+    const temperature = status?.cpu_stats?.temperature || 0;
+    const highTemperature = status?.cpu_stats?.high_temperature || 75;
+    const criticalTemperature = status?.cpu_stats?.critical_temperature || 85;
     return {temperature, highTemperature, criticalTemperature}
 }
 
 export const useLoad = () => {
     const {status} = React.useContext(StatusContext);
-    let minute_1;
-    let minute_5;
-    let minute_15;
+    let minute_1 = status?.load_stats?.minute_1;
+    let minute_5 = status?.load_stats?.minute_5;
+    let minute_15 = status?.load_stats?.minute_15;
     let mediumLoad = false;
     let highLoad = false;
     let cores;
 
-    if (status && status['load']) {
-        minute_1 = status['load']['minute_1'];
-        minute_5 = status['load']['minute_5'];
-        minute_15 = status['load']['minute_15'];
-
-        cores = status['cpu_info']['cores'];
+    if (status && status.cpu_stats) {
+        // Medium load when 1/2 cores are busy, High load when 3/4+ cores are busy.
+        cores = status.cpu_stats.cores;
         const quarter = cores / 4;
         if (cores && minute_1 >= (quarter * 3)) {
             highLoad = true;
@@ -830,6 +998,37 @@ export const useLoad = () => {
     return {minute_1, minute_5, minute_15, mediumLoad, highLoad, cores};
 }
 
+export const useIOStats = () => {
+    const {status} = React.useContext(StatusContext);
+    const percentIdle = status?.iostat_stats?.percent_idle;
+    const percentIOWait = status?.iostat_stats?.percent_iowait;
+    const percentNice = status?.iostat_stats?.percent_nice;
+    const percentSteal = status?.iostat_stats?.percent_steal;
+    const percentSystem = status?.iostat_stats?.percent_system;
+    const percentUser = status?.iostat_stats?.percent_user;
+
+    return {percentIdle, percentIOWait, percentNice, percentSteal, percentSystem, percentUser};
+}
+
+export const useMemoryStats = () => {
+    const {status} = React.useContext(StatusContext);
+    const total = status?.memory_stats?.total;
+    const used = status?.memory_stats?.used;
+    const free = status?.memory_stats?.free;
+    const cached = status?.memory_stats?.cached;
+    let percent;
+    if (total && used) {
+        percent = Math.round((used / total) * 100);
+    }
+    return {total, used, free, cached, percent}
+}
+
+export const usePowerStats = () => {
+    const {status} = React.useContext(StatusContext);
+    const underVoltage = status?.power_stats?.under_voltage;
+    const overCurrent = status?.power_stats?.over_current;
+    return {underVoltage, overCurrent};
+}
 
 export const useVideoStatistics = () => {
     const [statistics, setStatistics] = useState(null);
@@ -924,90 +1123,111 @@ export const useSearchOrder = () => {
     return {sort, setSort}
 }
 
+export const useSearchDate = () => {
+    // Filters files using
+    //      ?month=1&month=2&month=3
+    // and
+    //      ?fromDate=2023&toDate=2024
+    const {searchParams, updateQuery} = React.useContext(QueryContext);
+    const months = searchParams.getAll('month');
+    let fromDate = searchParams.get('fromDate');
+    let toDate = searchParams.get('toDate');
+    fromDate = fromDate ? parseInt(fromDate) : null;
+    toDate = toDate ? parseInt(toDate) : null;
+
+    const clearDate = () => {
+        console.log('clearDate');
+        updateQuery({fromDate: null, toDate: null, month: null, 'o': 0});
+    }
+
+    const setDates = (newFromDate, newToDate, newMonths) => {
+        console.log('setDates', newFromDate, newToDate, newMonths);
+        updateQuery({fromDate: newFromDate, toDate: newToDate, month: newMonths, 'o': 0});
+    }
+
+    const anySearch = (months && months.length > 0) || (fromDate !== null || toDate !== null);
+    const isEmpty = !anySearch;
+
+    return {dateRange: [fromDate, toDate], setDates, months, clearDate, isEmpty}
+}
+
 export const useUploadFile = () => {
     const [files, setFiles] = useState([]);
     const [progresses, setProgresses] = useState({});
     const [destination, setDestination] = useState('');
+    const [tagNames, setTagNames] = React.useState([]);
+    const [overwrite, setOverwrite] = React.useState(false);
+    const [totalSize, setTotalSize] = useState(0);
+    const [uploadedSize, setUploadedSize] = useState(0);
+    const [overallProgress, setOverallProgress] = useState(0);
+    const [inProgress, setInProgress] = useState(false);
 
     const handleProgress = (name, chunk, totalChunks, status, type) => {
         const percent = Math.round((100 * chunk) / totalChunks);
         const newProgress = {[name]: {percent, status, type}};
-        setProgresses(prevState => ({...prevState, ...newProgress}));
+
+        setProgresses(prevState => {
+            const updatedProgresses = {...prevState, ...newProgress};
+
+            // Calculate total uploaded size based on all files' progress
+            let totalUploaded = 0;
+            files.forEach(file => {
+                const fileProgress = updatedProgresses[file.name];
+                if (fileProgress) {
+                    const chunkSize = 10 * 1024 * 1024; // 10MB - same as in doUpload
+                    const fileSize = file.size;
+                    const totalFileChunks = Math.ceil(fileSize / chunkSize);
+
+                    // For completed files, count the full size
+                    if (fileProgress.status === 'complete' || fileProgress.status === 'conflicting') {
+                        totalUploaded += fileSize;
+                    }
+                    // For files in progress, count the completed chunks
+                    else if (fileProgress.percent > 0) {
+                        const completedChunks = Math.floor((fileProgress.percent / 100) * totalFileChunks);
+                        const completedSize = Math.min(completedChunks * chunkSize, fileSize);
+                        totalUploaded += completedSize;
+                    }
+                }
+            });
+
+            setUploadedSize(totalUploaded);
+
+            if (totalSize > 0) {
+                const newOverallProgress = Math.round((totalUploaded / totalSize) * 100);
+                setOverallProgress(newOverallProgress);
+            }
+
+            return updatedProgresses;
+        });
     }
 
     const handleFilesChange = (newFiles) => {
         let newProgresses = {};
-        newFiles.map(i => {
-            newProgresses = {...newProgresses, [i['name']]: {percent: 0, status: 'pending'}};
+        let newTotalSize = 0;
+
+        newFiles.forEach(file => {
+            newProgresses = {...newProgresses, [file.name]: {percent: 0, status: 'pending'}};
+            newTotalSize += file.size;
         });
+
         setProgresses(newProgresses);
         setFiles(newFiles);
+        setTotalSize(newTotalSize);
+        setUploadedSize(0);
+        setOverallProgress(0);
     }
-
-    const uploadChunk = async (file, chunkNum, chunkSize, totalChunks, tries, maxTries) => {
-        if (tries > maxTries) {
-            console.error(`Exceeded max tries ${maxTries}`);
-        }
-
-        const start = chunkNum * chunkSize;
-        const end = Math.min(start + chunkSize, file.size);
-        // The bytes that we will send.
-        const chunk = file.slice(start, end);
-
-        const formData = new FormData();
-        formData.append('chunkNumber', chunkNum.toString());
-        formData.append('filename', file.path);
-        formData.append('totalChunks', totalChunks.toString());
-        formData.append('destination', destination);
-        // Send the size that we're actually sending.
-        formData.append('chunkSize', chunk.size.toString());
-        formData.append('chunk', chunk);
-
-        console.debug(`file upload: tries=${tries} chunkNum=${chunkNum} totalChunks=${totalChunks} chunkSize=${chunk.size} destination=${destination}`);
-
-        const xhr = new XMLHttpRequest();
-        xhr.open('POST', '/api/files/upload', true);
-        xhr.onreadystatechange = async () => {
-            if (xhr.readyState === 4) {
-                if (xhr.status === 200 || xhr.status === 416) {
-                    const data = JSON.parse(xhr.responseText);
-                    handleProgress(file.name, chunkNum, totalChunks, 'pending', file.type);
-                    const expectedChunk = data['expected_chunk'];
-                    if (xhr.status === 416) {
-                        console.log(`Server requested a different chunk ${chunkNum}`);
-                        await uploadChunk(file, expectedChunk, chunkSize, totalChunks, tries + 1, maxTries);
-                    } else {
-                        console.debug(`Uploading of chunk ${chunkNum} succeeded, got request for chunk ${chunkNum}`);
-                        // Success, reset tries.
-                        await uploadChunk(file, expectedChunk, chunkSize, totalChunks, 0, maxTries);
-                    }
-                } else if (xhr.status === 201) {
-                    handleProgress(file.name, totalChunks, totalChunks, 'complete', file.type);
-                    console.log(`Uploading of ${file.path} completed.`);
-                } else if (xhr.status === 400) {
-                    handleProgress(file.name, totalChunks, totalChunks, 'conflicting', file.type);
-                    const data = JSON.parse(xhr.responseText);
-                    if (data['code'] === 'FILE_UPLOAD_FAILED') {
-                        console.error('File already exists. Giving up.');
-                    }
-                } else {
-                    handleProgress(file.name, totalChunks, totalChunks, 'failed', file.type);
-                    console.error(`Failed to upload chunk ${chunkNum}. Giving up.`);
-                }
-            }
-        }
-        await xhr.send(formData);
-    };
 
     const doUpload = async () => {
         if (!files || files.length === 0 || !destination) {
             return;
         }
 
+        setInProgress(true);
+
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
-            console.log(`Starting file upload`);
-            console.log(file);
+            console.log(`Uploading file:`, file.path);
 
             const chunkNum = 0;
             const chunkSize = 10 * 1024 * 1024; // 10MB
@@ -1015,79 +1235,123 @@ export const useUploadFile = () => {
             const tries = 0;
             const maxTries = 20;
 
-            // Start recursive function to upload the file.
-            await uploadChunk(file, chunkNum, chunkSize, totalChunks, tries, maxTries);
+            // Start recursive function to upload the file and wait for it to complete
+            // before moving to the next file
+            try {
+                await new Promise((resolve, reject) => {
+                    const uploadNextChunk = async (currentChunkNum, currentTries) => {
+                        if (currentTries > maxTries) {
+                            console.error(`Exceeded max tries ${maxTries}`);
+                            reject(new Error(`Exceeded max tries ${maxTries}`));
+                            return;
+                        }
+
+                        const start = currentChunkNum * chunkSize;
+                        const end = Math.min(start + chunkSize, file.size);
+                        const chunk = file.slice(start, end);
+
+                        const formData = new FormData();
+                        formData.append('chunkNumber', currentChunkNum.toString());
+                        formData.append('filename', file.path);
+                        formData.append('totalChunks', totalChunks.toString());
+                        formData.append('destination', destination);
+                        formData.append('mkdir', 'true');
+                        if (overwrite) {
+                            formData.append('overwrite', 'true');
+                        }
+                        formData.append('chunkSize', chunk.size.toString());
+                        formData.append('chunk', chunk);
+                        for (let j = 0; j < tagNames.length; j++) {
+                            formData.append('tagNames', tagNames[j]);
+                        }
+
+                        console.debug(`file upload: tries=${currentTries} chunkNum=${currentChunkNum} totalChunks=${totalChunks} chunkSize=${chunk.size} destination=${destination} tagNames=${tagNames}`);
+
+                        // Create a new XMLHttpRequest for each chunk to avoid InvalidStateError
+                        const chunkXhr = new XMLHttpRequest();
+                        chunkXhr.open('POST', '/api/files/upload', true);
+
+                        chunkXhr.onreadystatechange = async () => {
+                            if (chunkXhr.readyState === 4) {
+                                if (chunkXhr.status === 200 || chunkXhr.status === 416) {
+                                    const data = JSON.parse(chunkXhr.responseText);
+                                    handleProgress(file.name, currentChunkNum, totalChunks, 'pending', file.type);
+                                    const expectedChunk = data['expected_chunk'];
+                                    if (chunkXhr.status === 416) {
+                                        console.warn(`Server requested a different chunk ${currentChunkNum}`);
+                                        uploadNextChunk(expectedChunk, currentTries + 1);
+                                    } else {
+                                        console.debug(`Uploading of chunk ${currentChunkNum} succeeded, got request for chunk ${expectedChunk}`);
+                                        // Success, reset tries.
+                                        uploadNextChunk(expectedChunk, 0);
+                                    }
+                                } else if (chunkXhr.status === 201) {
+                                    handleProgress(file.name, totalChunks, totalChunks, 'complete', file.type);
+                                    console.info(`Uploading of ${file.path} completed.`);
+                                    resolve(); // File upload completed successfully
+                                } else if (chunkXhr.status === 400) {
+                                    handleProgress(file.name, totalChunks, totalChunks, 'conflicting', file.type);
+                                    const data = JSON.parse(chunkXhr.responseText);
+                                    if (data['code'] === 'FILE_UPLOAD_FAILED') {
+                                        console.error('File already exists. Giving up.');
+                                        reject(new Error('File already exists'));
+                                    }
+                                } else {
+                                    handleProgress(file.name, totalChunks, totalChunks, 'failed', file.type);
+                                    console.error(`Failed to upload chunk ${currentChunkNum}. Giving up.`);
+                                    reject(new Error(`Failed to upload chunk ${currentChunkNum}`));
+                                }
+                            }
+                        };
+
+                        chunkXhr.send(formData);
+                    };
+
+                    // Start uploading the first chunk
+                    uploadNextChunk(chunkNum, tries);
+                });
+            } catch (error) {
+                console.error(`Error uploading file ${file.path}:`, error);
+                // Continue with the next file even if this one failed
+            }
         }
 
         // Clear form after upload.
         setFiles([]);
+        setInProgress(false);
     }
 
     const doClear = () => {
         setFiles([]);
         setProgresses({});
+        setTotalSize(0);
+        setUploadedSize(0);
+        setOverallProgress(0);
+        setInProgress(false);
     }
 
     useEffect(() => {
         doUpload()
     }, [JSON.stringify(files)]);
 
-    return {files, setFiles: handleFilesChange, progresses, destination, setDestination, doClear, doUpload}
-}
-
-export const useSearchZims = (defaultLimit) => {
-    const {offset, limit, setLimit, activePage, setPage} = usePages(defaultLimit);
-    const {searchParams, updateQuery} = useQuery();
-    const searchStr = searchParams.get('q') || '';
-
-    const [zims, setZims] = useState(null);
-    const [totalPages, setTotalPages] = useState(0);
-
-    const localSearchZims = async () => {
-        setZims(null);
-        try {
-            let [zims_,] = await searchZims(offset, limit, searchStr);
-            setZims(zims_);
-        } catch (e) {
-            console.error(e);
-            toast({
-                type: 'error',
-                title: 'Unexpected server response',
-                description: 'Could not get archives',
-                time: 5000,
-            });
-            setZims([]);
-        }
-    }
-
-    useEffect(() => {
-        localSearchZims();
-    }, [searchStr, limit, activePage, setZims]);
-
-    const setSearchStr = (value) => {
-        updateQuery({q: value, o: 0, order: undefined});
-    }
-
-    const setOrderBy = (value) => {
-        setPage(1);
-        updateQuery({order: value});
-    }
+    const tagsSelector = <TagsSelector selectedTagNames={tagNames} onChange={(i,) => setTagNames(i)}/>;
 
     return {
-        zims,
-        limit,
-        setLimit,
-        offset,
-        setOrderBy,
-        totalPages,
-        activePage,
-        setPage,
-        searchStr,
-        setSearchStr,
-        fetchArchives: localSearchZims,
+        destination, setDestination,
+        doClear,
+        doUpload,
+        files,
+        progresses,
+        setFiles: handleFilesChange,
+        tagNames,
+        tagsSelector,
+        overwrite, setOverwrite,
+        overallProgress,
+        totalSize,
+        uploadedSize,
+        inProgress,
     }
 }
-
 
 export const useSearchZim = (searchStr, zimId, active, activeTags, defaultLimit = 10) => {
     const [zim, setZim] = useState(null);
@@ -1170,4 +1434,36 @@ export const useWROLMode = () => {
 export const useDockerized = () => {
     const {status} = React.useContext(StatusContext);
     return status && status['dockerized'] === true;
+}
+
+export const useCalcQuery = () => {
+    const [calc, setCalc] = useOneQuery('calc');
+    return [calc, setCalc]
+}
+
+export const useSearchChannels = (defaultTagNames) => {
+    const [tagNames, setTagNames] = useState(defaultTagNames || []);
+    const [channels, setChannels] = useState([]);
+    const [loading, setLoading] = useState(false);
+
+    const localSearchChannels = async () => {
+        setLoading(true);
+        try {
+            const {channels: newChannels} = await searchChannels(tagNames);
+            setChannels(newChannels);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    useEffect(() => {
+        localSearchChannels();
+    }, [tagNames]);
+
+    return {
+        tagNames,
+        setTagNames,
+        channels,
+        loading,
+    }
 }

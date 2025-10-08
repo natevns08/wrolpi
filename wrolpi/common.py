@@ -1,35 +1,37 @@
 import asyncio
 import atexit
 import contextlib
-import ctypes
+import functools
 import inspect
 import json
 import logging
+import logging.config
 import multiprocessing
 import os
 import pathlib
 import re
+import shutil
+import socket
 import string
 import sys
 import tempfile
 from asyncio import Task
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict, field, fields
 from datetime import datetime, date
 from decimal import Decimal
 from functools import wraps
-from http import HTTPStatus
 from itertools import islice, filterfalse, tee
-from multiprocessing import Lock, Manager
+from multiprocessing.managers import DictProxy
 from pathlib import Path
-from types import GeneratorType
+from types import GeneratorType, MappingProxyType
 from typing import Union, Callable, Tuple, Dict, List, Iterable, Optional, Generator, Any, Set
 from urllib.parse import urlparse, urlunsplit
 
 import aiohttp
 import bs4
 import yaml
-from aiohttp import ClientResponse
+from aiohttp import ClientResponse, ClientSession
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from sqlalchemy import types
@@ -37,28 +39,158 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session
 
-from wrolpi.dates import now, from_timestamp, seconds_to_timestamp
-from wrolpi.errors import WROLModeEnabled, NativeOnly, UnrecoverableDownloadError, LogLevelError
+from wrolpi.dates import now, from_timestamp
+from wrolpi.errors import WROLModeEnabled, NativeOnly, LogLevelError, InvalidConfig, \
+    ValidationError
 from wrolpi.vars import PYTEST, DOCKERIZED, CONFIG_DIR, MEDIA_DIRECTORY, DEFAULT_HTTP_HEADERS
 
-LOG_LEVEL = multiprocessing.Value(ctypes.c_int, 20)
 
-logger = logging.getLogger()
-ch = logging.StreamHandler()
-formatter = logging.Formatter('[%(asctime)s] [%(process)d] [%(name)s:%(lineno)d] [%(levelname)s] %(message)s')
-ch.setFormatter(formatter)
-logger.addHandler(ch)
+def add_logging_level(level_name: str, level_int: int, methodName=None):
+    """
+    Comprehensively adds a new logging level to the `logging` module and the
+    currently configured logging class.
+
+    `levelName` becomes an attribute of the `logging` module with the value
+    `levelNum`. `methodName` becomes a convenience method for both `logging`
+    itself and the class returned by `logging.getLoggerClass()` (usually just
+    `logging.Logger`). If `methodName` is not specified, `levelName.lower()` is
+    used.
+
+    To avoid accidental clobberings of existing attributes, this method will
+    raise an `AttributeError` if the level name is already an attribute of the
+    `logging` module or if the method name is already present
+
+    Example
+    -------
+    >>> add_logging_level('TRACE', logging.DEBUG - 5)
+    >>> logging.getLogger(__name__).setLevel("TRACE")
+    >>> logging.getLogger(__name__).trace('that worked')
+    >>> logging.trace('so did this')
+    >>> logging.TRACE
+    5
+
+    This function is taken directly from: https://stackoverflow.com/questions/2183233/how-to-add-a-custom-loglevel-to-pythons-logging-facility/35804945#35804945
+    """
+    if not methodName:
+        methodName = level_name.lower()
+
+    if hasattr(logging, level_name):
+        raise AttributeError('{} already defined in logging module'.format(level_name))
+    if hasattr(logging, methodName):
+        raise AttributeError('{} already defined in logging module'.format(methodName))
+    if hasattr(logging.getLoggerClass(), methodName):
+        raise AttributeError('{} already defined in logger class'.format(methodName))
+
+    # This method was inspired by the answers to Stack Overflow post
+    # http://stackoverflow.com/q/2183233/2988730, especially
+    # http://stackoverflow.com/a/13638084/2988730
+    def logForLevel(self, message, *args, **kwargs):
+        if self.isEnabledFor(level_int):
+            kwargs.setdefault('stacklevel', 3)
+            self._log(level_int, message, args, **kwargs)
+
+    def logToRoot(message, *args, **kwargs):
+        kwargs.setdefault('stacklevel', 3)
+        logging.log(level_int, message, *args, **kwargs)
+
+    logging.addLevelName(level_int, level_name)
+    setattr(logging, level_name, level_int)
+    setattr(logging.getLoggerClass(), methodName, logForLevel)
+    setattr(logging, methodName, logToRoot)
+
+
+LOGGING_CONFIG = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'loggers': {
+        'sanic.root': {
+            'level': 'INFO',
+            'handlers': ['console'],
+        },
+        'sanic.error': {
+            'level': 'INFO',
+            'handlers': ['error_console'],
+            'qualname': 'sanic.error',
+        },
+        'sanic.access': {
+            'level': 'INFO',
+            'handlers': ['access_console'],
+            'qualname': 'sanic.access',
+        },
+        'sanic.server': {
+            'level': 'INFO',
+            'handlers': ['console'],
+            'qualname': 'sanic.server',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'generic',
+            'stream': sys.stdout,
+            'filters': ['empty_message_filter'],
+        },
+        'error_console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'generic',
+            'stream': sys.stderr,
+        },
+        'access_console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'access',
+            'stream': sys.stdout,
+            'filters': ['empty_message_filter'],
+        },
+    },
+    'formatters': {
+        'generic': {
+            'format': '[%(asctime)s] [%(process)d] [%(name)s:%(lineno)d] [%(levelname)s] %(message)s',
+            'class': 'logging.Formatter',
+        },
+        'access': {
+            'format': '[%(asctime)s] [%(process)d] [%(name)s:%(lineno)d] [%(levelname)s]: '
+                      + '%(request)s %(message)s %(status)s %(byte)s',
+            'class': 'logging.Formatter',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': logging.DEBUG
+    },
+    'filters': {
+        'empty_message_filter': {
+            '()': 'wrolpi.logging_extra.EmptyMessageFilter',
+        }
+    }
+}
+
+
+# Used so IDE will suggest `logger.trace`
+class TraceLogger(logging.Logger):
+    def trace(self, msg, *args, **kwargs):
+        return self.log(TRACE_LEVEL, msg, *args, **kwargs)
+
+
+# Apply logging config.
+logger: TraceLogger = logging.getLogger()  # noqa Not really a TraceLogger, but I wanted IDE suggestions.
+logging.config.dictConfig(LOGGING_CONFIG)
+
+# Add extra verbose debug level (-vvv)
+TRACE_LEVEL = logging.DEBUG - 5
+if not hasattr(logging, 'TRACE'):
+    add_logging_level('TRACE', TRACE_LEVEL)
 
 logger_ = logger.getChild(__name__)
 
 
-def set_log_level(level, warn_level: bool = True):
+def set_log_level(level: int, warn_level: bool = True):
     """Set the level of the root logger so all children that have been created (or will be created) share the same
     level.
 
     @warning: Child processes will not share this level.  See set_global_log_level
     """
     logger.setLevel(level)
+    logger_.setLevel(level)
 
     # Always warn about the log level, so we know what should have been logged.
     effective_level = logger.getEffectiveLevel()
@@ -66,10 +198,14 @@ def set_log_level(level, warn_level: bool = True):
     if warn_level:
         logger.warning(f'Logging level: {level_name}')
 
-    # Enable debug logging in SQLAlchemy when logging is NOTSET.
+    # Change log level for all handlers.
+    for handler in logger.handlers:
+        handler.setLevel(level)
+
+    # Enable debug logging in SQLAlchemy when logging is TRACE.
     sa_logger = logging.getLogger('sqlalchemy.engine')
-    sa_level = logging.DEBUG if level == logging.NOTSET else logging.WARNING
-    sa_logger.setLevel(sa_level)
+    sa_level = logging.DEBUG if level == TRACE_LEVEL else logging.WARNING
+    sa_logger.setLevel(logging.NOTSET)
 
     # Hide sanic access logs when not at least "INFO".
     sanic_access = logging.getLogger('sanic.access')
@@ -79,10 +215,11 @@ def set_log_level(level, warn_level: bool = True):
 
 def set_global_log_level(log_level: int):
     """Set the global (shared between processes) log level."""
-    if not isinstance(log_level, int) or 0 > log_level or log_level > 40:
+    if not isinstance(log_level, int) or not 0 <= log_level <= 40:
         raise LogLevelError()
-    with LOG_LEVEL.get_lock():
-        LOG_LEVEL.value = log_level
+    from wrolpi.api_utils import api_app
+    with api_app.shared_ctx.log_level.get_lock():
+        api_app.shared_ctx.log_level.value = log_level
 
 
 @contextlib.contextmanager
@@ -97,9 +234,9 @@ __all__ = [
     'Base',
     'ConfigFile',
     'DownloadFileInfo',
-    'DownloadFileInfoLink',
-    'LOG_LEVEL',
+    'LOGGING_CONFIG',
     'ModelHelper',
+    'TRACE_LEVEL',
     'WROLPI_CONFIG',
     'aiohttp_get',
     'aiohttp_head',
@@ -108,6 +245,8 @@ __all__ = [
     'apply_modelers',
     'apply_refresh_cleanup',
     'background_task',
+    'can_connect_to_server',
+    'cancel_background_tasks',
     'cancel_refresh_tasks',
     'cancelable_wrapper',
     'chain',
@@ -116,23 +255,29 @@ __all__ = [
     'chunks',
     'chunks_by_stem',
     'compile_tsvector',
+    'create_empty_config_files',
     'cum_timer',
     'date_range',
     'disable_wrol_mode',
-    'download_file',
     'enable_wrol_mode',
     'escape_file_name',
     'extract_domain',
     'extract_headlines',
     'extract_html_text',
+    'format_html_string',
+    'format_json_file',
     'get_absolute_media_path',
-    'get_config',
+    'get_all_configs',
     'get_download_info',
     'get_files_and_directories',
+    'get_global_statistics',
     'get_html_soup',
     'get_media_directory',
     'get_relative_to_media_directory',
+    'get_title_from_html',
     'get_warn_once',
+    'get_wrolpi_config',
+    'html_screenshot',
     'insert_parameter',
     'iterify',
     'limit_concurrent',
@@ -145,22 +290,26 @@ __all__ = [
     'register_modeler',
     'register_refresh_cleanup',
     'remove_whitespace',
+    'replace_file',
+    'resolve_generators',
     'run_after',
+    'set_global_log_level',
     'set_log_level',
     'set_test_config',
     'set_test_media_directory',
     'slow_logger',
     'split_lines_by_length',
     'timer',
+    'trim_file_name',
     'truncate_generator_bytes',
     'truncate_object_bytes',
     'tsvector',
+    'unique_by_predicate',
+    'url_strip_host',
     'walk',
     'wrol_mode_check',
     'wrol_mode_enabled',
     'zig_zag',
-    'html_screenshot',
-    'format_html_string',
 ]
 
 # Base is used for all SQLAlchemy models.
@@ -182,10 +331,6 @@ class ModelHelper:
         raise NotImplementedError('This model has not defined this method.')
 
     @staticmethod
-    def find_by_paths(paths, session) -> List:
-        raise NotImplementedError('This model has not defined this method.')
-
-    @staticmethod
     def get_by_id(id_: int, session: Session = None) -> Optional[Base]:
         """Attempts to get a model instance by its id.  Returns None if no instance can be found."""
         raise NotImplementedError('This model has not defined this method.')
@@ -195,9 +340,21 @@ class ModelHelper:
         """Get a model instance by its id, raise an error if no instance is found."""
         raise NotImplementedError('This model has not defined this method.')
 
-    def flush(self):
-        """A convenience function which flushes this record using its DB Session."""
-        Session.object_session(self).flush([self])
+    @staticmethod
+    def can_model(file_group) -> bool:
+        raise NotImplementedError('This model has not defined this method.')
+
+    @staticmethod
+    def do_model(file_group, session: Session):
+        raise NotImplementedError('This model has not defined this method.')
+
+    def flush(self, session: Session = None):
+        """A convenience method which flushes this record using its DB Session."""
+        session = session or Session.object_session(self)
+        if session:
+            session.flush([self])
+        else:
+            raise RuntimeError(f'{self} is not in a session!')
 
 
 class tsvector(types.TypeDecorator):
@@ -212,73 +369,228 @@ def compile_tsvector(element, compiler, **kw):
 URL_CHARS = string.ascii_lowercase + string.digits
 
 
+def find_file(directory: pathlib.Path, name: str, depth=1) -> Optional[pathlib.Path]:
+    """Recursively searches a directory for a
+    file with the provided name."""
+    if depth == 0:
+        return
+
+    for path in sorted(directory.iterdir()):
+        if path.is_file() and path.name == name:
+            return path
+        if path.is_dir() and (result := find_file(path, name, depth - 1)):
+            return result
+
+
+TEST_MEDIA_DIRECTORY = None
+
+
+def set_test_media_directory(path):
+    global TEST_MEDIA_DIRECTORY
+    if isinstance(path, pathlib.Path):
+        TEST_MEDIA_DIRECTORY = path
+    elif path:
+        TEST_MEDIA_DIRECTORY = pathlib.Path(path)
+    else:
+        TEST_MEDIA_DIRECTORY = None
+
+
+def is_tempfile(path: pathlib.Path | str) -> bool:
+    path = str(path)
+    if path.startswith('/tmp'):
+        return True
+    elif path.startswith('/var/folders/'):
+        return True
+    elif path.startswith('/private/var/folders/'):
+        return True
+    return False
+
+
+def get_media_directory() -> Path:
+    """Get the media directory.
+
+    This will typically be /media/wrolpi, or something else from the .env.
+
+    During testing, this function returns TEST_MEDIA_DIRECTORY.
+    """
+    global TEST_MEDIA_DIRECTORY
+
+    if PYTEST and not TEST_MEDIA_DIRECTORY:
+        raise RuntimeError('No test media directory set during testing!!')
+
+    if isinstance(TEST_MEDIA_DIRECTORY, pathlib.Path):
+        if not is_tempfile(TEST_MEDIA_DIRECTORY):
+            raise RuntimeError(f'Refusing to run test outside tmp directory: {TEST_MEDIA_DIRECTORY}')
+        return TEST_MEDIA_DIRECTORY.resolve()
+
+    return MEDIA_DIRECTORY
+
+
 class ConfigFile:
     """
-    This class keeps track of the contents of a config file.  You can update the config (and it's file) by
-    calling .update().
+    This is used to keep the DB and config files in sync.  Importing the config reads the config from file, then
+    applies it to this config instance, AND the database.  Dumping the config copies data from the database and saves it
+    to the config file.  Updating this config is automatically saved to the config file.
+
+    Configs cannot be saved until they are imported without error.
     """
-    file_name: str = None
+    background_dump: callable = None
+    background_save: callable = None
     default_config: dict = None
+    file_name: str = None
+    validator: dataclass = None
     width: int = None
 
     def __init__(self):
-        self.file_lock = Lock()
         self.width = self.width or 90
 
-        if PYTEST:
-            # Do not load a global config on import while testing.  A global instance will never be used for testing.
-            self._config = self.default_config.copy()
-            return
-        self.initialize()
+        # Do not load a global config on import while testing.  A global instance should never be used for testing.
+        self._config = deepcopy({k: v for k, v in self.default_config.items()})
+
+        if self._config['version'] != 0:
+            raise RuntimeError('Configs should start at version 0')
+
+        from wrolpi.switches import register_switch_handler
+
+        @register_switch_handler(f'background_save_{self.file_name}')
+        def background_save(overwrite: bool = False):
+            self.save(overwrite=overwrite)
+
+        self.background_save = background_save
+
+        @register_switch_handler(f'background_dump_{self.file_name}')
+        def background_dump(file: pathlib.Path = None):
+            self.dump_config(file)
+
+        self.background_dump = background_dump
 
     def __repr__(self):
         return f'<{self.__class__.__name__} file={self.get_file()}>'
 
-    def initialize(self):
+    def config_status(self) -> dict:
+        d = dict(
+            file_name=self.file_name,
+            rel_path=get_relative_to_media_directory(self.get_file()),
+            successful_import=self.successful_import,
+            valid=self.is_valid(),
+        )
+        return d
+
+    def __json__(self) -> dict:
+        return dict(self._config)
+
+    def initialize(self, multiprocessing_dict: Optional[DictProxy] = None):
         """Initializes this config dict using the default config and the config file."""
-        config_file = self.get_file()
-        self._config = Manager().dict()
+        # Use the provided multiprocessing.Manager().dict() when live, or, dict() for testing.
+        self._config = multiprocessing_dict if multiprocessing_dict is not None else dict()
         # Use the default settings to initialize the config.
         self._config.update(deepcopy(self.default_config))
-        if config_file.is_file():
-            # Use the config file to get the values the user set.
-            with config_file.open('rt') as fh:
-                self._config.update(yaml.load(fh, Loader=yaml.Loader))
 
-    def save(self):
+        file = self.get_file()
+        if file.is_file():
+            if not self.is_valid(file):
+                raise InvalidConfig(f'Config file is invalid: {str(self.get_relative_file())}')
+            config_data = self.read_config_file(file)
+            config_data = {k: v for k, v in config_data.items() if k in self.default_config}
+            self._config.update(asdict(self.validator(**config_data)))
+        return self
+
+    @property
+    def successful_import(self) -> bool:
+        from wrolpi.api_utils import api_app
+        return bool(api_app.shared_ctx.configs_imported.get(self.file_name))
+
+    @successful_import.setter
+    def successful_import(self, value: bool):
+        from wrolpi.api_utils import api_app
+        api_app.shared_ctx.configs_imported[self.file_name] = value
+
+    def read_config_file(self, file: pathlib.Path = None) -> dict:
+        file = file or self.get_file()
+        with file.open('rt') as fh:
+            config_data = yaml.load(fh, Loader=yaml.Loader)
+            if not isinstance(config_data, dict):
+                raise InvalidConfig(f'Config file is invalid: {file}')
+            return config_data
+
+    def _get_backup_filename(self):
+        """Returns the path for the backup file for today."""
+        # TODO what if the RPi clock is not working?  Change this so the "version" of the config is used each day.
+        path = get_media_directory() / f'config/backup/{self.file_name}'
+        date_str = now().strftime('%Y%m%d')
+        name = f'{path.stem}-{date_str}{path.suffix}'
+        path = path.with_name(name)
+        return path
+
+    def save(self, file: pathlib.Path = None, send_events: bool = False, overwrite: bool = False):
         """
         Write this config to its file.
 
-        Use the existing config file as a template; if any values are missing in the new config, use the values from the
-        config file.
+        @param file: The destination of the config file (defaults to `self.get_file()`).
+        @param send_events: Send failure Events to UI.
+        @param overwrite: Will overwrite the config file even if it was not imported successfully.
         """
-        config_file = self.get_file()
+        from wrolpi.api_utils import api_app
+        from wrolpi.events import Events
+
+        file = file or self.get_file()
+        if self.file_name not in file.name:
+            raise RuntimeError(f'Refusing to save config to file which does not match {self.__class__.__name__}')
+
+        rel_path = get_relative_to_media_directory(file)
+
+        if file.exists() and overwrite is False:
+            if not self.successful_import:
+                Events.send_config_save_failed(f'Failed to save config: {rel_path}')
+                raise RuntimeError(f'Refusing to save config because it was never successfully imported! {rel_path}')
+            version = self.read_config_file(file).get('version')
+            if version and version > self.version:
+                raise RuntimeError(f'Refusing to overwrite newer config ({rel_path}): {version} > {self.version}')
+
         # Don't overwrite a real config while testing.
-        if PYTEST and not str(config_file).startswith('/tmp'):
-            raise ValueError(f'Refusing to save config file while testing: {config_file}')
+        if PYTEST and not is_tempfile(file):
+            raise ValueError(f'Refusing to save config file while testing: {rel_path}')
 
-        # Only one process can write to the file.
-        acquired = self.file_lock.acquire(block=True, timeout=5.0)
+        logger_.debug(f'Save config called for {rel_path}')
 
-        try:
-            # Config directory may not exist.
-            if not config_file.parent.is_dir():
-                config_file.parent.mkdir()
+        # Only one process can write to a config.
+        with api_app.shared_ctx.config_save_lock:
+            try:
+                # Config directory may not exist.
+                if not file.parent.is_dir():
+                    file.parent.mkdir()
 
-            # Read the existing config, replace all values, then save.
-            if config_file.is_file():
-                with config_file.open('rt') as fh:
-                    config = yaml.load(fh, Loader=yaml.Loader)
-            else:
-                # Config file does not yet exist.
-                config = dict()
+                # Backup the existing config file.
+                if file.is_file():
+                    backup_file = self._get_backup_filename()
+                    if not backup_file.parent.exists():
+                        backup_file.parent.mkdir(parents=True)
+                    shutil.copy(file, backup_file)
+                    logger_.debug(f'Copied backup config: {rel_path} -> {backup_file}')
 
-            config.update({k: v for k, v in self._config.items() if v is not None})
-            with config_file.open('wt') as fh:
-                yaml.dump(config, fh, width=self.width)
-        finally:
-            if acquired:
-                self.file_lock.release()
+                # Write the config in-memory to the file.  Track version changes to avoid overriding newer config.
+                self._config['version'] = (self._config['version'] or 0) + 1
+                config = deepcopy(self._config)
+                self.write_config_data(config, file)
+
+                # Set successful_import in case this was the first time the config was written.
+                self.successful_import = True
+
+                logger_.info(f'Saved config: {rel_path}')
+            except Exception as e:
+                # Configs are vital, raise a big error when this fails.
+                message = f'Failed to save config: {rel_path}'
+                logger_.critical(message, exc_info=e)
+                if send_events:
+                    Events.send_config_save_failed(message)
+                raise e
+
+    def write_config_data(self, config: dict, config_file: pathlib.Path):
+        with config_file.open('wt') as fh:
+            yaml.dump(config, fh, width=self.width, sort_keys=True)
+            # Wait for data to be written before releasing lock.
+            fh.flush()
+            os.fsync(fh.fileno())
 
     def get_file(self) -> Path:
         if not self.file_name:
@@ -289,11 +601,45 @@ class ConfigFile:
 
         return CONFIG_DIR / self.file_name
 
-    def update(self, config: dict):
+    def get_relative_file(self):
+        return get_relative_to_media_directory(self.get_file())
+
+    def import_config(self, file: pathlib.Path = None, send_events=False):
+        """Read config file data, apply it to the in-memory config and database."""
+        file = file or self.get_file()
+        file_str = str(get_relative_to_media_directory(file))
+        # Caller will set to successful if it works.
+        self.successful_import = False
+        if file.is_file():
+            if not self.is_valid(file):
+                raise InvalidConfig(f'Config is invalid: {file_str}')
+
+            data = self.read_config_file(file)
+            new_data, extra_data = partition(lambda i: i[0] in self.default_config, data.items())
+            new_data, extra_data = dict(new_data), dict(extra_data)
+            if extra_data:
+                logger_.warning(f'Ignoring extra config data ({file_str}): {extra_data}')
+            self._config.update(new_data)
+            # Import call above this will set successful_import.
+            # self.successful_import = True
+        else:
+            logger_.error(f'Failed to import {file_str} because it does not exist.')
+
+    def dump_config(self, file: pathlib.Path = None, send_events=False, overwrite=False):
+        """Dump database data, copy it to this the in-memory config, then write it to the config file."""
+        # Copy the data as-is by default.  Other classes will overwrite this and dump the database before saving.
+        self.save(file, send_events, overwrite)
+
+    def update(self, config: dict, overwrite: bool = False):
         """Update any values of this config.  Save the config to its file."""
-        config = {k: v for k, v in config.items() if k in self._config}
-        self._config.update(config)
-        self.save()
+        from wrolpi.api_utils import api_app
+        if not self.validate(config):
+            raise ValidationError(f'Invalid config: {config}')
+
+        with api_app.shared_ctx.config_update_lock:
+            config = {k: v for k, v in config.items() if k in self._config}
+            self._config.update(config)
+        self.background_save.activate_switch(context={'overwrite': overwrite})
 
     def dict(self) -> dict:
         """Get a deepcopy of this config."""
@@ -302,10 +648,104 @@ class ConfigFile:
 
         return deepcopy(self._config)
 
+    def validate(self, config: dict) -> bool:
+        allowed_fields = {i.name for i in fields(self.validator)}
+        try:
+            # Remove keys no longer in the config.
+            config_items = config.items()
+            extra_items = {k: v for k, v in config_items if k not in allowed_fields}
+            if extra_items:
+                logger.error(f'Invalid config items: {extra_items}')
+            config = {k: v for k, v in config_items if k in allowed_fields}
+            self.validator(**config)
+            return True
+        except Exception as e:
+            logger.debug(f'Failed to validate config', exc_info=e)
+            return False
+
+    def is_valid(self, file: pathlib.Path = None) -> bool | None:
+        if not self.validator:
+            raise NotImplementedError(f'Cannot validate {self.file_name} without validator!')
+
+        file = file or self.get_file()
+        if not file.is_file() or file.stat().st_size == 0:
+            return None
+
+        try:
+            config_data = self.read_config_file(file)
+        except InvalidConfig:
+            return False
+
+        return self.validate(config_data)
+
+    # `version` is used to prevent overwriting of newer configs.  Cannot not be modified directly.
+
+    @property
+    def version(self) -> int:
+        return self._config['version']
+
+
+@dataclass
+class WROLPiConfigValidator:
+    archive_destination: str = None
+    download_on_startup: bool = None
+    download_timeout: int = None
+    hotspot_device: str = None
+    hotspot_on_startup: bool = None
+    hotspot_password: str = None
+    hotspot_ssid: str = None
+    ignore_outdated_zims: bool = None
+    map_destination: str = None
+    nav_color: str = None
+    throttle_on_startup: bool = None
+    version: int = None
+    videos_destination: str = None
+    wrol_mode: bool = None
+    zims_destination: str = None
+    ignored_directories: list[str] = field(default_factory=list)
+
+
+def get_all_configs() -> Dict[str, ConfigFile]:
+    all_configs = dict()
+
+    if wrolpi_config := get_wrolpi_config():
+        all_configs[wrolpi_config.file_name] = wrolpi_config
+
+    from wrolpi.tags import get_tags_config
+    if tags_config := get_tags_config():
+        all_configs[tags_config.file_name] = tags_config
+
+    from modules.videos.lib import get_channels_config
+    if channels_config := get_channels_config():
+        all_configs[channels_config.file_name] = channels_config
+
+    from modules.inventory.common import get_inventories_config
+    if inventories_config := get_inventories_config():
+        all_configs[inventories_config.file_name] = inventories_config
+
+    from modules.videos.lib import get_videos_downloader_config
+    if videos_downloader_config := get_videos_downloader_config():
+        all_configs[videos_downloader_config.file_name] = videos_downloader_config
+
+    from wrolpi.downloader import get_download_manager_config
+    if download_manager_config := get_download_manager_config():
+        all_configs[download_manager_config.file_name] = download_manager_config
+
+    return all_configs
+
+
+def get_config_by_file_name(file_name: str) -> ConfigFile:
+    configs = get_all_configs()
+    if file_name not in configs:
+        raise InvalidConfig(f'No config with {file_name} exists')
+
+    return configs[file_name]
+
 
 class WROLPiConfig(ConfigFile):
     file_name = 'wrolpi.yaml'
     default_config = dict(
+        archive_destination='archive/%(domain)s',
         download_on_startup=True,
         download_timeout=0,
         hotspot_device='wlan0',
@@ -313,9 +753,58 @@ class WROLPiConfig(ConfigFile):
         hotspot_password='wrolpi hotspot',
         hotspot_ssid='WROLPi',
         ignore_outdated_zims=False,
+        ignored_directories=['config', 'tags'],
+        map_destination='map',
+        nav_color='violet',
         throttle_on_startup=False,
+        version=0,
+        videos_destination='videos/%(channel_tag)s/%(channel_name)s',
         wrol_mode=False,
+        zims_destination='zims',
     )
+    validator = WROLPiConfigValidator
+
+    def get_file(self) -> Path:
+        """WROLPiConfig must be discovered so that other config files can be found."""
+        if not self.file_name:
+            raise NotImplementedError(f'You must define a file name for this {self.__class__.__name__} config.')
+
+        if PYTEST:
+            return get_media_directory() / f'config/{self.file_name}'
+
+        # Use the usual "/media/wrolpi/config/wrolpi.yaml" if it exists.
+        default_config_path = CONFIG_DIR / self.file_name
+        if default_config_path.is_file():
+            return default_config_path
+
+        # Search the media directory for the special "wrolpi.yaml" file.  Assume the first one found is the config.
+        # Use a depth of 3; multiple drives may exist and the config directory may be down in a second drive.
+        if config_path := find_file(get_media_directory(), self.file_name, 3):
+            return config_path
+
+        # Not testing, and can't find file deep in media directory.  Use the default.
+        return default_config_path
+
+    def import_config(self, file: pathlib.Path = None, send_events=False):
+        try:
+            # WROLPiConfig does not sync to database.
+            super().import_config(file)
+
+            # Destinations cannot be empty.
+            self._config['archive_destination'] = self.archive_destination or self.default_config['archive_destination']
+            self._config['map_destination'] = self.map_destination or self.default_config['map_destination']
+            self._config['videos_destination'] = self.videos_destination or self.default_config['videos_destination']
+            self._config['zims_destination'] = self.zims_destination or self.default_config['zims_destination']
+
+            self.successful_import = True
+        except Exception as e:
+            self.successful_import = False
+            message = f'Failed to import {self.file_name}'
+            logger.error(message, exc_info=e)
+            if send_events:
+                from wrolpi.events import Events
+                Events.send_config_import_failed(message)
+            raise
 
     @property
     def download_on_startup(self) -> bool:
@@ -389,12 +878,60 @@ class WROLPiConfig(ConfigFile):
     def wrol_mode(self, value: bool):
         self.update({'wrol_mode': value})
 
+    @property
+    def ignored_directories(self) -> List[str]:
+        return self._config['ignored_directories']
+
+    @ignored_directories.setter
+    def ignored_directories(self, value: List[str]):
+        self.update({'ignored_directories': value})
+
+    @property
+    def videos_destination(self) -> str:
+        return self._config['videos_destination']
+
+    @videos_destination.setter
+    def videos_destination(self, value: str):
+        self.update({'videos_destination': value})
+
+    @property
+    def archive_destination(self) -> str:
+        return self._config['archive_destination']
+
+    @archive_destination.setter
+    def archive_destination(self, value: str):
+        self.update({'archive_destination': value})
+
+    @property
+    def map_destination(self) -> str:
+        return self._config['map_destination']
+
+    @map_destination.setter
+    def map_destination(self, value: str):
+        self.update({'map_destination': value})
+
+    @property
+    def zims_destination(self) -> str:
+        return self._config['zims_destination']
+
+    @zims_destination.setter
+    def zims_destination(self, value: str):
+        self.update({'zims_destination': value})
+
+    @property
+    def nav_color(self) -> str:
+        return self._config['nav_color']
+
+    @nav_color.setter
+    def nav_color(self, value: str):
+        self.update({'nav_color': value})
+
 
 WROLPI_CONFIG: WROLPiConfig = WROLPiConfig()
 TEST_WROLPI_CONFIG: WROLPiConfig = None
 
 
-def get_config() -> WROLPiConfig:
+def get_wrolpi_config() -> WROLPiConfig:
     """Read the global WROLPi yaml config file."""
     global TEST_WROLPI_CONFIG
     if isinstance(TEST_WROLPI_CONFIG, WROLPiConfig):
@@ -411,7 +948,7 @@ def set_test_config(enable: bool):
 
 def wrol_mode_enabled() -> bool:
     """Return True if WROL Mode is enabled."""
-    return get_config().wrol_mode
+    return get_wrolpi_config().wrol_mode
 
 
 def wrol_mode_check(func):
@@ -429,36 +966,28 @@ def wrol_mode_check(func):
     return check
 
 
-def enable_wrol_mode(download_manager=None):
+def enable_wrol_mode():
     """
     Modify config to enable WROL Mode.
 
     Stop downloads and Download Manager.
     """
     logger_.warning('ENABLING WROL MODE')
-    get_config().wrol_mode = True
-    if not download_manager:
-        from wrolpi.downloader import download_manager
-        download_manager.stop()
-    else:
-        # Testing.
-        download_manager.stop()
+    get_wrolpi_config().wrol_mode = True
+    from wrolpi.downloader import download_manager
+    download_manager.stop()
 
 
-def disable_wrol_mode(download_manager=None):
+async def disable_wrol_mode():
     """
     Modify config to disable WROL Mode.
 
     Start downloads and Download Manager.
     """
     logger_.warning('DISABLING WROL MODE')
-    get_config().wrol_mode = False
-    if not download_manager:
-        from wrolpi.downloader import download_manager
-        download_manager.enable()
-    else:
-        # Testing.
-        download_manager.enable()
+    get_wrolpi_config().wrol_mode = False
+    from wrolpi.downloader import download_manager
+    await download_manager.enable()
 
 
 def insert_parameter(func: Callable, parameter_name: str, item, args: Tuple, kwargs: Dict) -> Tuple[Tuple, Dict]:
@@ -514,6 +1043,8 @@ def run_after(after: callable, *args, **kwargs) -> callable:
         synchronous_after = after
 
         async def after(*a, **kw):
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f'run_after synchronous_after called for {after}')
             return synchronous_after(*a, **kw)
 
     def wrapper(func: callable):
@@ -524,6 +1055,8 @@ def run_after(after: callable, *args, **kwargs) -> callable:
             @wraps(func)
             async def wrapped(*a, **kw):
                 results = await func(*a, **kw)
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f'run_after async called for {func}')
                 coro = after(*args, **kwargs)
                 asyncio.ensure_future(coro)
                 return results
@@ -531,6 +1064,8 @@ def run_after(after: callable, *args, **kwargs) -> callable:
             @wraps(func)
             def wrapped(*a, **kw):
                 results = func(*a, **kw)
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f'run_after sync called for {func}')
                 coro = after(*args, **kwargs)
                 asyncio.ensure_future(coro)
                 return results
@@ -538,37 +1073,6 @@ def run_after(after: callable, *args, **kwargs) -> callable:
         return wrapped
 
     return wrapper
-
-
-TEST_MEDIA_DIRECTORY = None
-
-
-def set_test_media_directory(path):
-    global TEST_MEDIA_DIRECTORY
-    if isinstance(path, pathlib.Path):
-        TEST_MEDIA_DIRECTORY = path
-    elif path:
-        TEST_MEDIA_DIRECTORY = pathlib.Path(path)
-    else:
-        TEST_MEDIA_DIRECTORY = None
-
-
-def get_media_directory() -> Path:
-    """Get the media directory.
-
-    This will typically be /opt/wrolpi, or something else from the .env.
-
-    During testing, this function returns TEST_MEDIA_DIRECTORY.
-    """
-    global TEST_MEDIA_DIRECTORY
-
-    if PYTEST and not TEST_MEDIA_DIRECTORY:
-        raise ValueError('No test media directory set during testing!!')
-
-    if isinstance(TEST_MEDIA_DIRECTORY, pathlib.Path):
-        return TEST_MEDIA_DIRECTORY
-
-    return MEDIA_DIRECTORY
 
 
 MEDIA_DIRECTORY_PERMISSIONS = 0o40755
@@ -605,7 +1109,7 @@ def check_media_directory():
     return result
 
 
-def get_absolute_media_path(path: str) -> Path:
+def get_absolute_media_path(path: str | Path) -> Path:
     """
     Get the absolute path of file/directory within the config media directory.
 
@@ -637,6 +1141,22 @@ def get_relative_to_media_directory(path: Union[str, Path]) -> Path:
     return absolute.relative_to(get_media_directory())
 
 
+def get_paths_in_parent_directory(paths: List[Union[str, Path]], parent_directory: pathlib.Path) -> List[Path]:
+    """Return only those of the provided paths that are children of the provided parent directory."""
+    paths = [i if isinstance(i, Path) else Path(i) for i in paths]
+    parent_directory = parent_directory.resolve()
+    new_paths = []
+    for path in paths:
+        if parent_directory in path.resolve().parents and path != parent_directory:
+            new_paths.append(path)
+    return new_paths
+
+
+def get_paths_in_media_directory(paths: List[Union[str, Path]]) -> List[Path]:
+    """Return only those of the provided paths that are children of the media directory."""
+    return get_paths_in_parent_directory(paths, get_media_directory())
+
+
 def minimize_dict(d: dict, keys: Iterable) -> Optional[dict]:
     """Return a new dictionary that contains only the keys provided."""
     if d is None:
@@ -651,7 +1171,7 @@ def make_media_directory(path: Union[str, Path]):
     path.mkdir(parents=True)
 
 
-def extract_domain(url):
+def extract_domain(url: str) -> str:
     """
     Extract the domain from a URL.  Remove leading www.
 
@@ -710,10 +1230,11 @@ def chdir(directory: Union[pathlib.Path, str, None] = None, with_home: bool = Fa
     This also changes the $HOME environment variable to match.
     """
     home_exists = 'HOME' in os.environ
-    home = os.environ.get('HOME')
+    original_home = os.environ.get('HOME')
     cwd = os.getcwd()
     if directory is None:
         with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
             try:
                 os.chdir(d)
                 if with_home:
@@ -722,7 +1243,7 @@ def chdir(directory: Union[pathlib.Path, str, None] = None, with_home: bool = Fa
             finally:
                 os.chdir(cwd)
                 if home_exists:
-                    os.environ['HOME'] = home
+                    os.environ['HOME'] = original_home
                 else:
                     del os.environ['HOME']
             return
@@ -735,7 +1256,7 @@ def chdir(directory: Union[pathlib.Path, str, None] = None, with_home: bool = Fa
     finally:
         os.chdir(cwd)
         if home_exists:
-            os.environ['HOME'] = home
+            os.environ['HOME'] = original_home
         else:
             del os.environ['HOME']
     return
@@ -801,15 +1322,49 @@ def get_files_and_directories(directory: Path):
 
 
 # These characters are invalid in Windows or Linux.
-INVALID_FILE_CHARS = re.compile(r'[/<>:\|"\\\?\*%!\n\r]')
+INVALID_FILE_CHARS = re.compile(r'[/<>:|"\\?*%!\n\r]')
+
 SPACE_FILE_CHARS = re.compile(r'(  +)|(\t+)')
 
 
 def escape_file_name(name: str) -> str:
     """Remove any invalid characters in a file name."""
+    # Replace forward-slash (linux directories) with unicode Big Solidus (U+29F8)
+    name = name.replace('/', '⧸')
+    # Replace commonly used pipe with dash.
+    name = name.replace(' | ', ' - ')
+    # Replace multiple spaces or tabs with a single space.
     name = SPACE_FILE_CHARS.sub(' ', name)
     name = INVALID_FILE_CHARS.sub('', name)
     return name.strip()
+
+
+# Maximum length is probably 255, but we need more length for large suffixes like `.readability.json`, and temporary
+# downloading suffixes from yt-dlp.
+MAXIMUM_FILE_LENGTH = 140
+
+
+def trim_file_name(path: str | pathlib.Path) -> str | pathlib.Path:
+    """Shorten the file name only if it is longer than the file system supports.  Trim from the end of the name until
+     the name is short enough (preserving any suffix)."""
+    name_type = pathlib.Path if isinstance(path, pathlib.Path) else str
+    parent = path.parent if isinstance(path, pathlib.Path) else '/'.join(i for i in path.split('/')[:-1])
+    path = path.name if isinstance(path, pathlib.Path) else path
+
+    if len(path) < MAXIMUM_FILE_LENGTH:
+        return name_type(path)
+
+    # Don't trim the filename to exactly 256 characters.
+    # This is because a FileGroup will have varying filename lengths.
+    from wrolpi.files.lib import split_path_stem_and_suffix
+    stem, suffix = split_path_stem_and_suffix(path)
+    excess = MAXIMUM_FILE_LENGTH - len(suffix)
+    new_name = stem[:excess].strip() + suffix
+    if parent:
+        if name_type == pathlib.Path:
+            return parent / new_name
+        return f'{parent}/{new_name}'
+    return name_type(new_name)
 
 
 def native_only(func: callable):
@@ -845,7 +1400,7 @@ def recursive_map(obj: Any, func: callable):
 
 
 @contextlib.asynccontextmanager
-async def aiohttp_session(timeout: int = None):
+async def aiohttp_session(timeout: int = None) -> ClientSession:
     """Convenience function because aiohttp timeout cannot be None."""
     if timeout:
         timeout = aiohttp.ClientTimeout(total=timeout) if timeout else None
@@ -856,64 +1411,31 @@ async def aiohttp_session(timeout: int = None):
             yield session
 
 
-async def aiohttp_post(url: str, json_, timeout: int = None) -> Tuple[Dict, int]:
-    """Perform an async aiohttp POST request.  Return the json contents."""
+@contextlib.asynccontextmanager
+async def aiohttp_post(url: str, json_, timeout: int = None, headers: dict = None) -> ClientResponse:
+    """Perform an async aiohttp POST request.  Yield the response in a session."""
+    headers = headers or DEFAULT_HTTP_HEADERS
     async with aiohttp_session(timeout) as session:
-        async with session.post(url, json=json_) as response:
-            return await response.json(), response.status
+        async with session.post(url, json=json_, headers=headers) as response:
+            yield response
 
 
-async def aiohttp_get(url: str, timeout: int = None, headers: dict = None) -> Tuple[bytes, int]:
-    """Perform an async aiohttp GET request.  Return the contents."""
+@contextlib.asynccontextmanager
+async def aiohttp_get(url: str, timeout: int = None, headers: dict = None) -> ClientResponse:
+    """Perform an async aiohttp GET request.  Yield the response in a session."""
+    headers = headers or DEFAULT_HTTP_HEADERS
     async with aiohttp_session(timeout) as session:
         async with session.get(url, headers=headers) as response:
-            return await response.content.read(), response.status
+            yield response
 
 
-async def aiohttp_head(url: str, timeout: int = None) -> Tuple[ClientResponse, int]:
-    """Perform an async aiohttp HEAD request.  Return the contents."""
+@contextlib.asynccontextmanager
+async def aiohttp_head(url: str, timeout: int = None, headers: dict = None) -> ClientResponse:
+    """Perform an async aiohttp HEAD request.  Yield the response in a session."""
+    headers = headers or DEFAULT_HTTP_HEADERS
     async with aiohttp_session(timeout) as session:
-        async with session.head(url) as response:
-            return response, response.status
-
-
-async def speed_test(url: str) -> int:
-    """Request the last megabyte of the provided url, return the content length divided by the time elapsed (speed)."""
-    response, status = await aiohttp_head(url)
-    content_length = response.headers['Content-Length']
-    start_bytes = int(content_length) - 10485760
-    range_ = f'bytes={start_bytes}-{content_length}'
-    start_time = datetime.now()
-    content, status = await aiohttp_get(url, headers={'Range': range_})
-    elapsed = int((datetime.now() - start_time).total_seconds())
-    return len(content) // elapsed
-
-
-async def get_fastest_mirror(urls: List[str]) -> str:
-    """Perform a speed test on each URL, return the fastest."""
-    fastest_url = urls[0]
-    fastest_speed = 0
-    for url in urls:
-        try:
-            speed = await speed_test(url)
-        except Exception as e:
-            logger.error(f'Speedtest of {url} failed', exc_info=e)
-            continue
-
-        if speed > fastest_speed:
-            fastest_url = url
-
-    return fastest_url
-
-
-@dataclass
-class DownloadFileInfoLink:
-    """Represents an HTTP "Link" Header."""
-    url: str
-    rel: str
-    type: str
-    priority: int
-    geo: str
+        async with session.head(url, headers=headers) as response:
+            yield response
 
 
 @dataclass
@@ -925,7 +1447,6 @@ class DownloadFileInfo:
     accept_ranges: str = None
     status: int = None
     location: str = None
-    links: List[DownloadFileInfoLink] = None
 
 
 FILENAME_MATCHER = re.compile(r'.*filename="(.*)"')
@@ -933,41 +1454,18 @@ FILENAME_MATCHER = re.compile(r'.*filename="(.*)"')
 
 async def get_download_info(url: str, timeout: int = 60) -> DownloadFileInfo:
     """Gets information (name, size, etc.) about a downloadable file at the provided URL."""
-    response, status = await aiohttp_head(url, timeout)
-    logger_.debug(f'{response.headers=}')
-    try:
-        links = response.headers.getall('Link')
-    except KeyError:
-        links = None
+    async with aiohttp_head(url, timeout) as response:
+        download_logger.debug(f'{response.headers=}')
 
-    new_links = list()
-    if links:
-        # Convert "Link" header strings to DownloadFileInfoLink.
-        for idx, link in enumerate(links):
-            url, *props = link.split(';')
-            url = url[1:-1]
-            properties = dict()
-            for prop in props:
-                name, value = prop.strip().split('=')
-                properties[name] = value
-            new_links.append(DownloadFileInfoLink(
-                url,
-                properties.get('rel').strip() if 'rel' in properties else None,
-                properties.get('type').strip() if 'type' in properties else None,
-                int(properties.get('pri').strip()) if 'pri' in properties else None,
-                properties.get('geo').strip() if 'geo' in properties else None,
-            ))
+        info = DownloadFileInfo(
+            type=response.headers.get('Content-Type'),
+            size=int(response.headers['Content-Length']) if 'Content-Length' in response.headers else None,
+            accept_ranges=response.headers.get('Accept-Ranges'),
+            status=response.status,
+            location=response.headers.get('Location'),
+        )
 
-    info = DownloadFileInfo(
-        type=response.headers.get('Content-Type'),
-        size=int(response.headers['Content-Length']) if 'Content-Length' in response.headers else None,
-        accept_ranges=response.headers.get('Accept-Ranges'),
-        status=response.status,
-        location=response.headers.get('Location'),
-        links=new_links,
-    )
-
-    disposition = response.headers.get('Content-Disposition')
+        disposition = response.headers.get('Content-Disposition')
 
     if disposition and 'filename' in disposition:
         if (match := FILENAME_MATCHER.match(disposition)) and (groups := match.groups()):
@@ -983,81 +1481,7 @@ async def get_download_info(url: str, timeout: int = 60) -> DownloadFileInfo:
     return info
 
 
-download_logger = logger_.getChild('download')
-
-
-async def download_file(url: str, output_path: pathlib.Path = None, info: DownloadFileInfo = None,
-                        timeout: int = 7 * 24 * 60 * 60):
-    """Uses aiohttp to download an HTTP file.  Performs a speed test when mirrors are found, downloads from the fastest
-    mirror.
-
-    Attempts to resume the file if `output_path` already exists.
-
-    @warning: Timeout default is a week because of large downloads.
-    """
-    info = info or await get_download_info(url, timeout)
-
-    if output_path.is_file() and info.size == output_path.stat().st_size:
-        download_logger.warning(f'Already downloaded {repr(str(url))} to {repr(str(output_path))}')
-        return
-
-    if info.links and (mirror_urls := [i.url for i in info.links if i.rel == 'duplicate']):
-        # Mirrors are available, find the fastest.
-        download_logger.info(f'Performing download speed test on mirrors: {mirror_urls}')
-        url = await get_fastest_mirror(mirror_urls)
-        info = await get_download_info(url, timeout)
-
-    logger_.debug(f'Final DownloadInfo fetched {info}')
-    total_size = info.size
-
-    download_logger.info(f'Starting download of {url} with {total_size} total bytes')
-    if info.accept_ranges == 'bytes' or not output_path.is_file():
-        with output_path.open('ab') as fh:
-            headers = DEFAULT_HTTP_HEADERS.copy()
-            # Check the position of append, if it is 0 then we do not need to resume.
-            position = fh.tell()
-            if position:
-                headers['Range'] = f'bytes={position}-'
-
-            async with aiohttp_session(timeout=timeout) as session:
-                async with session.get(url, headers=headers) as response:
-                    response: ClientResponse
-                    if response.status == HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE:
-                        download_logger.warning(f'Server responded with 416, file is probably already downloaded')
-                        return
-
-                    if position and response.status != HTTPStatus.PARTIAL_CONTENT:
-                        raise UnrecoverableDownloadError(
-                            f'Tried to resume {repr(str(url))} but got status {response.status}')
-
-                    # May or may not be using Range.  Append each chunk to the output file.
-                    last_report = datetime.now()
-                    bytes_received = 0
-                    async for data in response.content.iter_any():
-                        fh.write(data)
-
-                        bytes_received += len(data)
-                        if (elapsed := (datetime.now() - last_report).total_seconds()) > 10:
-                            # Report download speed every 10 seconds.
-                            bytes_per_second = int(bytes_received // elapsed)
-                            download_logger.debug(f'{bytes_received=} {elapsed=} {bytes_per_second=}')
-                            size = fh.tell()
-                            bytes_remaining = total_size - size
-                            seconds_remaining = bytes_remaining // bytes_per_second
-                            percent = int((size / total_size) * 100)
-                            download_logger.info(
-                                f'Downloading {url} at'
-                                f' rate={human_bandwidth(bytes_per_second)}'
-                                f' estimate={seconds_to_timestamp(seconds_remaining)}')
-                            download_logger.debug(f'Downloading {url} {total_size=} {size=} {percent=}')
-                            last_report = datetime.now()
-                            bytes_received = 0
-
-                        # Sleep to catch cancel.
-                        await asyncio.sleep(0)
-    elif output_path.is_file():
-        # TODO support downloading files that cannot be resumed.
-        raise UnrecoverableDownloadError(f'Cannot resume download {url}')
+download_logger = logger.getChild('download')
 
 
 def human_bandwidth(bps: int) -> str:
@@ -1126,7 +1550,7 @@ def chunks(it: Iterable, size: int):
     return iter(lambda: tuple(islice(it, size)), ())
 
 
-def chunks_by_stem(it: List[Union[pathlib.Path, str]], size: int) -> Generator[List[pathlib.Path], None, None]:
+def chunks_by_stem(it: List[Union[pathlib.Path, str, int]], size: int) -> Generator[List[pathlib.Path], None, None]:
     """
     Attempt to split a list of paths near the defined size.  Keep groups of files together when they share
     matching names.
@@ -1171,13 +1595,23 @@ def chunks_by_stem(it: List[Union[pathlib.Path, str]], size: int) -> Generator[L
 
 
 @contextlib.contextmanager
-def timer(name):
-    """Prints out the time elapsed during the call of some block."""
+def timer(name, level: str = 'debug', logger__: logging.Logger = None):
+    """Prints out the time elapsed during the call of some block.
+
+    Example:
+        with timer('sleepy'):
+            time.sleep(10)
+
+    """
+    level = level.lower()
+    logger__ = logger__ or logger_
     before = datetime.now()
     try:
         yield
     finally:
-        logger_.warning(f'{name} elapsed {(datetime.now() - before).total_seconds()} seconds')
+        elapsed = (datetime.now() - before).total_seconds()
+        msg = f'{name} elapsed {elapsed} seconds'
+        getattr(logger__, level)(msg)
 
 
 @contextlib.contextmanager
@@ -1258,7 +1692,7 @@ def limit_concurrent(limit: int, throw: bool = False):
     return wrapper
 
 
-def truncate_object_bytes(obj: Union[List[str], str, None], maximum_bytes: int) -> Union[List[str], str]:
+def truncate_object_bytes(obj: Union[List[str], str, None, Generator], maximum_bytes: int) -> Union[List[str], str]:
     """
     Shorten an object.  This is useful when inserting something into a tsvector.
 
@@ -1323,16 +1757,29 @@ async def cancel_background_tasks():
             await asyncio.gather(*BACKGROUND_TASKS)
 
 
+async def await_background_tasks():
+    """Awaits all background tasks, used only for testing."""
+    if not PYTEST:
+        raise RuntimeError('await_background_tasks should only be used for testing')
+
+    for background_task in BACKGROUND_TASKS.copy():
+        await background_task
+
+
 def get_warn_once(message: str, logger__: logging.Logger, level=logging.ERROR):
     """Create a function that will report an error only once.
 
     This is used when a function will be called many times, but the error is not important."""
-    event = multiprocessing.Event()
 
     def warn_once(exception: Exception):
-        if not event.is_set():
+        if PYTEST:
+            # No need to fill pytest logs with these warnings.
+            return
+
+        from wrolpi.api_utils import api_app
+        if not api_app.shared_ctx.warn_once.get(message):
             logger__.log(level, message, exc_info=exception)
-            event.set()
+            api_app.shared_ctx.warn_once.update({message: True})
 
     return warn_once
 
@@ -1474,23 +1921,91 @@ def extract_headlines(entries: List[str], search_str: str) -> List[Tuple[str, fl
     source = json.dumps([{'content': i} for i in entries])
     with get_db_curs() as curs:
         stmt = '''
-        WITH vectored AS (
-            -- Convert the "source" json to a recordset.
-            with source as (select * from json_to_recordset(%s::json) AS (content TEXT))
-            select
-                to_tsvector('english'::regconfig, source.content) AS vector,
-                source.content
-            from source
-        )
-        SELECT
-            ts_headline(vectored.content, websearch_to_tsquery(%s), 'MaxFragments=10, MaxWords=8, MinWords=7'),
-            ts_rank(vectored.vector, websearch_to_tsquery(%s))
-        FROM vectored
-        '''
+               WITH vectored AS (
+                   -- Convert the "source" json to a recordset.
+                   with source as (select * from json_to_recordset(%s::json) AS (content TEXT))
+                   select to_tsvector('english'::regconfig, source.content) AS vector,
+                          source.content
+                   from source)
+               SELECT ts_headline(vectored.content, websearch_to_tsquery(%s),
+                                  'MaxFragments=10, MaxWords=8, MinWords=7'),
+                      ts_rank(vectored.vector, websearch_to_tsquery(%s))
+               FROM vectored \
+               '''
         curs.execute(stmt, [source, search_str, search_str])
         headlines = [tuple(i) for i in curs.fetchall()]
 
     return headlines
+
+
+async def search_other_estimates(tag_names: List[str]) -> dict:
+    """Estimate other things that are Tagged."""
+    from wrolpi.db import get_db_curs
+
+    if not tag_names:
+        return dict(
+            channel_count=0,
+        )
+
+    with get_db_curs() as curs:
+        stmt = '''
+               SELECT COUNT(c.id)
+               FROM channel c
+                        LEFT OUTER JOIN public.tag t on t.id = c.tag_id
+               WHERE t.name = %(tag_name)s \
+               '''
+        # TODO handle multiple tags
+        params = dict(tag_name=tag_names[0])
+        curs.execute(stmt, params)
+
+        channel_count = curs.fetchone()[0]
+
+    others = dict(
+        channel_count=channel_count,
+    )
+    return others
+
+
+def replace_file(file: pathlib.Path | str, contents: str | bytes, missing_ok: bool = False):
+    """Rename `file` to a temporary path, write contents to `file`, then, delete temporary file only if successful.
+    The original file will be restored if any of these steps fail."""
+    file = pathlib.Path(file)
+
+    if missing_ok is False and not file.is_file():
+        raise FileNotFoundError(f'Cannot replace non-existent file: {str(file)}')
+
+    temporary_path = pathlib.Path(str(file) + '.tmp')
+    if temporary_path.exists():
+        raise RuntimeError(f'Cannot replace file, temporary path already exists!  {str(temporary_path)}')
+
+    if not contents:
+        raise RuntimeError('Refusing to replace file with empty contents')
+
+    try:
+        if file.exists():
+            file.rename(temporary_path)
+        mode = 'wb' if isinstance(contents, bytes) else 'wt'
+        with file.open(mode) as fp:
+            fp.write(contents)
+            os.fsync(fp.fileno())
+        if file.exists() and temporary_path.exists():
+            # New contents have been written, delete the old file.
+            temporary_path.unlink()
+    except Exception as e:
+        logger.error(f'Failed to replace file: {str(file)}', exc_info=e)
+        if temporary_path.exists():
+            # Move original file back.
+            if file.exists():
+                file.unlink()
+            temporary_path.rename(file)
+        elif file.exists():
+            logger.error(f'Replacing file, but original file still exists: {str(file)}')
+        else:
+            logger.critical('Neither original, nor temporary file exist.  I am so sorry.')
+        raise
+    finally:
+        if file.is_file() and file.stat().st_size > 0 and temporary_path.is_file():
+            temporary_path.unlink()
 
 
 def format_json_file(file: pathlib.Path, indent: int = 2):
@@ -1500,20 +2015,12 @@ def format_json_file(file: pathlib.Path, indent: int = 2):
     if not file or not file.is_file():
         raise RuntimeError(f'File does not exist: {file}')
 
-    with file.open('rt') as fh:
-        content = json.load(fh)
-
-    copy = file.with_suffix('.json2')
-    try:
-        with copy.open('wt') as fh:
-            json.dump(content, fh, indent=indent)
-        copy.rename(file)
-    finally:
-        if copy.is_file():
-            copy.unlink()
+    content = json.loads(file.read_text())
+    content = json.dumps(content, indent=indent, sort_keys=True)
+    replace_file(file, content)
 
 
-def format_html_string(html: str) -> str:
+def format_html_string(html: str | bytes) -> str:
     if not html.strip():
         raise RuntimeError('Refusing to format empty HTMl string.')
 
@@ -1527,18 +2034,10 @@ def format_html_file(file: pathlib.Path):
         raise RuntimeError(f'File does not exist: {file}')
 
     pretty = format_html_string(file.read_text())
-
-    copy = file.with_suffix('.html2')
-    try:
-        with copy.open('wt') as fh:
-            fh.write(pretty)
-        copy.rename(file)
-    finally:
-        if copy.is_file():
-            copy.unlink()
+    replace_file(file, pretty)
 
 
-def html_screenshot(html: bytes) -> bytes:
+def html_screenshot(html: bytes | str) -> bytes:
     """Return a PNG screenshot of the provided HTML."""
     # Set Chromium to headless.  Use a wide window size so that screenshot will be the "desktop" version of the page.
     options = webdriver.ChromeOptions()
@@ -1547,7 +2046,7 @@ def html_screenshot(html: bytes) -> bytes:
     options.add_argument('window-size=1280x720')
 
     with tempfile.NamedTemporaryFile('wb', suffix='.html') as fh:
-        fh.write(html)
+        fh.write(html.encode() if isinstance(html, str) else html)
         fh.flush()
 
         with webdriver.Chrome(chrome_options=options) as driver:
@@ -1581,3 +2080,135 @@ def chain(iterable: Union[List, Tuple], length: int) -> List:
     if not yielded:
         # Not enough items to iterate.  Yield the original iterable.
         yield iterable
+
+
+def get_title_from_html(html: str, url: str = None) -> str:
+    """
+    Try and get the title from the
+    """
+    soup = get_html_soup(html)
+    try:
+        return soup.title.string.strip()
+    except Exception:  # noqa
+        logger_.debug(f'Unable to extract title {url}')
+
+
+@wrol_mode_check
+def can_connect_to_server(hostname: str, port: int = 80) -> bool:
+    """Return True only if `hostname` responds."""
+    # Thanks https://stackoverflow.com/questions/20913411/test-if-an-internet-connection-is-present-in-python
+    try:
+        # connect to the host -- tells us if the host is actually
+        # reachable
+        conn = socket.create_connection((hostname, port))
+        conn.close()
+        return True
+    except Exception as e:
+        logger_.debug('can_connect_to_server encountered error', exc_info=e)
+    return False
+
+
+def is_valid_hex_color(hex_color: str) -> bool:
+    # Regular expression to match valid HTML hex color codes
+    hex_color_regex = re.compile(r'^#([A-F0-9]{6}|[A-F0-9]{3})$', re.IGNORECASE)
+    return bool(hex_color_regex.match(hex_color))
+
+
+def is_hardlinked(path: pathlib.Path) -> bool:
+    """Returns True only if `path` has more than one link."""
+    return path.stat().st_nlink > 1
+
+
+def unique_by_predicate(
+        iterable: list | tuple | set | Generator,
+        predicate: callable = None,
+) -> list | tuple | set:
+    """Finds the first unique items in the provided iterable based on the predicate function.  Order is preserved.
+
+    `predicate` defaults to the items themselves.
+
+    >>> unique_by_predicate([['apple', 'banana', 'pear', 'kiwi', 'plum', 'peach']], lambda i: len(i))
+    # [ 'apple', 'banana', 'pear' ]
+    >>> unique_by_predicate([Path('foo.txt'), Path('foo.mp4'), Path('bar.txt')], lambda i: i.stem)
+    # [ Path('foo.txt'), Path('bar.txt') ]
+    >>> unique_by_predicate([1, 1, 2, 3, 3, 3, 3, 4], None)
+    # [ 1, 2, 3, 4 ]
+    """
+    predicate = predicate or (lambda i: i)  # Return an iterable based off the object itself by default.
+    seen = set()
+    unique_items = [i for i in iterable if not ((key := predicate(i)) in seen or seen.add(key))]
+    if isinstance(iterable, Generator):
+        # Return a list when provided iterable is a Generator.
+        return unique_items
+    # Return the same type as the provided iterable
+    return iterable.__class__(unique_items)
+
+
+def cached_multiprocessing_result(func: callable):
+    """Simple multiprocessing results cacher which uses the args/kwargs of the wrapped function as the caching key.
+
+    @warning: Asumes the wrapped function is async.
+    """
+
+    @functools.wraps(func)
+    async def wrapped(*args, **kwargs):
+        from wrolpi.api_utils import api_app
+        key = (func.__name__, *args, *tuple(kwargs.items()))
+        if result := api_app.shared_ctx.cache.get(key):
+            return result
+
+        result = await func(*args, **kwargs)
+        api_app.shared_ctx.cache[key] = result
+        return result
+
+    return wrapped
+
+
+def create_empty_config_files() -> list[str]:
+    """Creates config files only if they do not exist and will not conflict with the DB."""
+    from modules.inventory.common import get_inventories_config
+    from modules.videos.lib import get_channels_config, get_videos_downloader_config
+    from wrolpi.downloader import get_download_manager_config
+    from wrolpi.tags import get_tags_config
+    from wrolpi.db import get_db_session
+
+    created = []  # The names of the configs that are created.
+
+    if not get_wrolpi_config().get_file().is_file():
+        get_wrolpi_config().save(overwrite=True)
+        created.append(get_wrolpi_config().get_file().name)
+
+    with get_db_session() as session:
+        if not get_channels_config().get_file().is_file():
+            from modules.videos.models import Channel
+            if session.query(Channel).count() == 0:
+                # No Channels will be deleted, create the empty Channels config file.
+                get_channels_config().save(overwrite=True)
+                created.append(get_channels_config().get_file().name)
+
+        if not get_tags_config().get_file().is_file():
+            from wrolpi.tags import Tag
+            if session.query(Tag).count() == 0:
+                # No Tags will be deleted, create the empty Tags config file.
+                get_tags_config().save(overwrite=True)
+                created.append(get_tags_config().get_file().name)
+
+        if not get_download_manager_config().get_file().is_file():
+            from wrolpi.downloader import Download
+            if session.query(Download).count() == 0:
+                # No Downloads will be deleted, create the empty Download Manager config file.
+                get_download_manager_config().save(overwrite=True)
+                created.append(get_download_manager_config().get_file().name)
+
+        if not get_videos_downloader_config().get_file().is_file():
+            get_videos_downloader_config().save(overwrite=True)
+            created.append(get_videos_downloader_config().get_file().name)
+
+        if not get_inventories_config().get_file().is_file():
+            from modules.inventory.models import Inventory
+            if session.query(Inventory).count() == 0:
+                # No Inventories will be deleted, create the empty Inventory config file.
+                get_inventories_config().save(overwrite=True)
+                created.append(get_inventories_config().get_file().name)
+
+    return created

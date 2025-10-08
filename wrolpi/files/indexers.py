@@ -1,9 +1,14 @@
 import pathlib
+import subprocess
 from abc import ABC
 from collections import defaultdict
 from typing import List, Type, Tuple
 from zipfile import ZipFile
 
+import docx
+
+from wrolpi import cmd
+from wrolpi.cmd import CATDOC_PATH, TEXTUTIL_PATH
 from wrolpi.vars import PYTEST, FILE_MAX_TEXT_SIZE
 
 try:
@@ -11,7 +16,7 @@ try:
 except ImportError:
     PdfReader = None
 
-from wrolpi.common import logger, split_lines_by_length, truncate_object_bytes
+from wrolpi.common import logger, split_lines_by_length, truncate_object_bytes, extract_html_text, get_title_from_html
 
 logger = logger.getChild(__name__)
 
@@ -115,3 +120,65 @@ class TextIndexer(Indexer, ABC):
         contents = truncate_object_bytes(contents, FILE_MAX_TEXT_SIZE)
         words = split_lines_by_length(contents)
         return words
+
+
+@register_indexer('text/html')
+class HTMLIndexer(Indexer, ABC):
+    """Extracts words from an HTML document.  Ignores code (HTML/Javascript/etc)."""
+
+    @classmethod
+    def create_index(cls, path: pathlib.Path):
+        from modules.archive.lib import parse_article_html_metadata
+
+        a = cls.get_title(path)
+
+        contents = path.read_text()
+        metadata = parse_article_html_metadata(contents)
+        text = extract_html_text(contents)
+        words = split_lines_by_length(text)
+
+        title = metadata.title or get_title_from_html(contents)
+
+        return title, a, metadata.description, words
+
+
+@register_indexer('application/msword')
+class DocIndexer(Indexer, ABC):
+    """Extracts words from old Doc files."""
+
+    @classmethod
+    def create_index(cls, path: pathlib.Path):
+        a = cls.get_title(path)
+
+        if CATDOC_PATH:
+            # Use catdoc on Linux
+            cmd = (CATDOC_PATH, str(path.absolute()))
+            proc = subprocess.run(cmd, capture_output=True)
+            text = proc.stdout.decode()
+        elif TEXTUTIL_PATH:
+            # Use textutil on macOS.
+            cmd = (TEXTUTIL_PATH, '-stdout', '-cat', 'txt', str(path.absolute()))
+            proc = subprocess.run(cmd, capture_output=True)
+            text = proc.stdout.decode()
+        text = truncate_object_bytes(text, FILE_MAX_TEXT_SIZE)
+        words = split_lines_by_length(text)
+
+        return a, None, None, words
+
+
+@register_indexer('application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+class DocxIndexer(Indexer, ABC):
+    """Extracts words from Docx files."""
+
+    @classmethod
+    def create_index(cls, path: pathlib.Path):
+        a = cls.get_title(path)
+
+        doc = docx.Document(str(path))
+        text = ' '.join(truncate_object_bytes(
+            (i.text for i in doc.paragraphs),
+            FILE_MAX_TEXT_SIZE)
+        )
+        words = split_lines_by_length(text)
+
+        return a, None, None, words

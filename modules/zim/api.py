@@ -1,24 +1,25 @@
 import urllib.parse
 from http import HTTPStatus
 
-from sanic import Request, response
+from sanic import Request, response, Blueprint
 from sanic_ext import validate
 from sanic_ext.extensions.openapi import openapi
 
 from wrolpi import lang
+from wrolpi.api_utils import json_response
 from wrolpi.common import logger
 from wrolpi.db import get_db_session
 from wrolpi.downloader import download_manager
 from wrolpi.events import Events
-from wrolpi.root_api import get_blueprint, json_response
 from . import lib, schema
+from .models import Zims
 
-bp = get_blueprint('Zim', '/api/zim')
+zim_bp = Blueprint('Zim', '/api/zim')
 
 logger = logger.getChild(__name__)
 
 
-@bp.get('/')
+@zim_bp.get('/')
 @openapi.definition(
     summary='List all known Zim files',
     response=schema.GetZimsResponse,
@@ -32,7 +33,7 @@ async def get_zims(_: Request):
     return json_response(resp)
 
 
-@bp.delete('/<zim_ids:[0-9,]+>')
+@zim_bp.delete('/<zim_ids:[0-9,]+>')
 @openapi.definition(
     summary='Delete all Zim files',
 )
@@ -42,7 +43,19 @@ async def delete_zims(_: Request, zim_ids: str):
     return response.empty()
 
 
-@bp.post('/search/<zim_id:[0-9]+>')
+@zim_bp.post('/<zim_id:[0-9]+>/auto_search')
+@openapi.definition(
+    summary='Change if a Zim file will be searched by default.',
+    body=schema.ZimAutoSearchRequest,
+)
+@validate(schema.ZimAutoSearchRequest)
+async def post_set_zim_auto_search(_: Request, zim_id: int, body: schema.ZimAutoSearchRequest):
+    zim_id = int(zim_id)
+    lib.set_zim_auto_search(zim_id, body.auto_search)
+    return response.empty()
+
+
+@zim_bp.post('/search/<zim_id:[0-9]+>')
 @openapi.definition(
     summary='Search all entries of a Zim',
     body=schema.ZimSearchRequest,
@@ -55,7 +68,7 @@ async def search_zim(_: Request, zim_id: int, body: schema.ZimSearchRequest):
     return json_response({'zim': headlines})
 
 
-@bp.get('/<zim_id:[0-9]+>/entry/<zim_path:[ -~/]*>')
+@zim_bp.get('/<zim_id:[0-9]+>/entry/<zim_path:[ -~/]*>')
 @openapi.definition(
     summary='Read the entry at `zim_path` from the Zim file',
 )
@@ -73,7 +86,7 @@ async def get_zim_entry(_: Request, zim_id: int, zim_path: str):
     return resp
 
 
-@bp.post('/tag')
+@zim_bp.post('/tag')
 @openapi.definition(
     summary='Tag a Zim entry',
     body=schema.TagZimEntry,
@@ -84,7 +97,7 @@ async def post_zim_tag(_: Request, body: schema.TagZimEntry):
     return response.empty(HTTPStatus.CREATED)
 
 
-@bp.post('/untag')
+@zim_bp.post('/untag')
 @openapi.definition(
     summary='Untag a Zim entry',
     body=schema.TagZimEntry,
@@ -95,7 +108,7 @@ async def post_zim_untag(_: Request, body: schema.TagZimEntry):
     return response.empty(HTTPStatus.NO_CONTENT)
 
 
-@bp.get('/subscribe')
+@zim_bp.get('/subscribe')
 @openapi.definition(
     summary='Retrieve Zim subscriptions',
     response=schema.ZimSubscriptions,
@@ -112,7 +125,7 @@ async def get_zim_subscriptions(_: Request):
     return json_response(resp)
 
 
-@bp.post('/subscribe')
+@zim_bp.post('/subscribe')
 @openapi.definition(
     summary='Subscribe to a particular Kiwix Zim',
     body=schema.ZimSubscribeRequest,
@@ -120,14 +133,14 @@ async def get_zim_subscriptions(_: Request):
 @validate(schema.ZimSubscribeRequest)
 async def post_zim_subscribe(_: Request, body: schema.ZimSubscribeRequest):
     await lib.subscribe(body.name, body.language)
-    if download_manager.disabled.is_set() or download_manager.stopped.is_set():
+    if download_manager.disabled or download_manager.stopped:
         # Downloads are disabled, warn the user.
         Events.send_downloads_disabled('Download created. But, downloads are disabled.')
     Events.send_created(f'Zim subscription created')
     return response.empty(HTTPStatus.CREATED)
 
 
-@bp.delete('/subscribe/<subscription_id:[0-9]+>')
+@zim_bp.delete('/subscribe/<subscription_id:[0-9]+>')
 @openapi.definition(
     summary='Unsubscribe to a particular Kiwix Zim',
 )
@@ -137,7 +150,7 @@ async def delete_zim_subscription(_: Request, subscription_id: int):
     return response.empty(HTTPStatus.NO_CONTENT)
 
 
-@bp.get('/outdated')
+@zim_bp.get('/outdated')
 @openapi.definition(
     summary='Returns the outdated and current Zim files',
     response=schema.OutdatedZims,
@@ -148,7 +161,7 @@ async def get_outdated_zims(_: Request):
     return json_response(d)
 
 
-@bp.delete('/outdated')
+@zim_bp.delete('/outdated')
 @openapi.definition(
     summary='Remove all outdated Zims, if any.'
 )
@@ -158,3 +171,36 @@ async def delete_outdated_zims(_: Request):
         lib.flag_outdated_zim_files()
         Events.send_deleted(f'Deleted {deleted_count} outdated Zims')
     return response.empty(HTTPStatus.NO_CONTENT)
+
+
+@zim_bp.post('/search_estimates')
+@validate(json=schema.SearchEstimateRequest)
+async def post_search_estimates(_: Request, body: schema.SearchEstimateRequest):
+    """Get an estimated count of FileGroups/Zims which may or may not have been tagged."""
+
+    if not body.search_str and not body.tag_names:
+        return response.empty(HTTPStatus.BAD_REQUEST)
+
+    if body.tag_names:
+        # Get actual count of entries tagged with the tag names.
+        zims_estimates = list()
+        for zim, count in Zims.entries_with_tags(body.tag_names).items():
+            d = dict(
+                estimate=count,
+                **zim.__json__(),
+            )
+            zims_estimates.append(d)
+    else:
+        # Get estimates using libzim.
+        zims_estimates = list()
+        for zim, estimate in Zims.estimate(body.search_str).items():
+            d = dict(
+                estimate=estimate,
+                **zim.__json__(),
+            )
+            zims_estimates.append(d)
+
+    ret = dict(
+        zims_estimates=zims_estimates
+    )
+    return json_response(ret)
